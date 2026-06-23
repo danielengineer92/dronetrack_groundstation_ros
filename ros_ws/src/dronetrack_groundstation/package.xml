@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>dronetrack_groundstation</name>
+  <version>0.1.0</version>
+  <description>Laptop ground-station bringup for the split DroneTrack architecture: heartbeat publisher and launch files that tie YOLO and the web dashboard together.</description>
+  <maintainer email="danielgatesf@gmail.com">DroneTrack</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>drone_interfaces</depend>
+  <depend>dronetrack_msgs</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>dronetrack_perception</exec_depend>
+  <exec_depend>dronetrack_web_bridge</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

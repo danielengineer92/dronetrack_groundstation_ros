@@ -1,0 +1,79 @@
+# =============================================================================
+# Topic map for the split DroneTrack architecture (reference only).
+#
+# This file documents the boundary topics. It is NOT loaded by any node directly
+# (each node takes its own *_topic parameters from pi.yaml / groundstation.yaml).
+# Edit it together with those files if you rename a topic, so the map stays true.
+#
+# Direction legend:  PI->GS = Pi publishes, laptop subscribes
+#                    GS->PI = laptop publishes, Pi subscribes (UNTRUSTED, gated)
+#                    PI     = internal to the Pi (never leaves the drone)
+# =============================================================================
+
+boundary_topics:
+  # Camera stream out to the laptop (compressed for Wi-Fi efficiency).
+  - name: "/drone/camera/image_raw/compressed"
+    type: "sensor_msgs/CompressedImage"
+    direction: "PI->GS"
+    owner: "image_transport republish (Pi)"
+    qos: "best_effort, depth 1"
+
+  # Raw companion (Pi-local; not streamed unless you set yolo image_transport:=raw).
+  - name: "/drone/camera/image_raw"
+    type: "sensor_msgs/Image"
+    direction: "PI"
+    owner: "camera_node (Pi)"
+    qos: "best_effort (sensor data)"
+
+  # Detections produced on the laptop, sent back to the Pi. UNTRUSTED.
+  - name: "/groundstation/vision/detections"
+    type: "drone_interfaces/DetectionArray"
+    direction: "GS->PI"
+    owner: "yolo_node (laptop)"
+    qos: "best_effort, depth 1"
+    note: "Pi detection_gate_node validates before anything trusts it."
+
+  # Laptop liveness beacon.
+  - name: "/groundstation/heartbeat"
+    type: "dronetrack_msgs/GroundStationHeartbeat"
+    direction: "GS->PI"
+    owner: "groundstation_heartbeat_node (laptop)"
+    qos: "best_effort, depth 1"
+
+  # Pi's authoritative link verdict (for laptop dashboard + logging).
+  - name: "/drone/groundstation/link_status"
+    type: "dronetrack_msgs/LinkStatus"
+    direction: "PI->GS"
+    owner: "ground_station_watchdog_node (Pi)"
+    qos: "reliable, depth 5"
+  - name: "/drone/groundstation/ok"
+    type: "std_msgs/Bool"
+    direction: "PI->GS"
+    owner: "ground_station_watchdog_node (Pi)"
+
+  # Trusted, Pi-internal detections after the gate (existing tracker input).
+  - name: "/drone/vision/detections"
+    type: "drone_interfaces/DetectionArray"
+    direction: "PI"
+    owner: "detection_gate_node (Pi)"
+    qos: "reliable, depth 5"
+
+  # Telemetry out to the laptop dashboard.
+  - name: "/drone/telemetry"
+    type: "drone_interfaces/DroneTelemetry"
+    direction: "PI->GS"
+    owner: "telemetry_node (Pi)"
+
+# Operator request topics: the laptop dashboard MAY publish these; the Pi
+# re-validates them. They are advisory, never authoritative.
+operator_request_topics:
+  - name: "/drone/mission/request"          # std_msgs/Bool
+  - name: "/drone/autonomy/request"         # std_msgs/Bool
+  - name: "/drone/mavsdk/offboard_request"  # std_msgs/Bool
+  - name: "/drone/mavsdk/action_command"    # drone_interfaces/MavsdkActionCommand (gated by allow_mavsdk_actions)
+
+# Pi-OWNED approval topics. The laptop must NEVER publish these.
+pi_owned_topics:
+  - name: "/drone/autonomy/enabled"         # autonomy_manager_node only
+  - name: "/drone/mavsdk/offboard_enable"   # autonomy_manager_node only
+  - name: "/drone/control/command"          # control_node only

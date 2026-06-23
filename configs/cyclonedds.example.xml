@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CycloneDDS unicast-peer template for the split DroneTrack architecture.
+  THIS IS THE CONFIGURATION VERIFIED WORKING on the bench (Pi <-> WSL2 laptop).
+
+  Why this exact shape matters (all three are required over a travel router /
+  WSL2 mirrored networking, where multicast discovery does NOT work):
+
+    1. Pin the interface to THIS host's LAN IP (__IFACE_IP__) so Cyclone does not
+       bind the wrong adapter (WSL has several).
+    2. AllowMulticast=false  -> force unicast discovery.
+    3. List BOTH peers, INCLUDING this host itself. Listing self is required for
+       same-host participants (e.g. yolo + heartbeat + dashboard) to discover each
+       other once multicast is off.
+
+  scripts/run_pi.sh and scripts/run_groundstation.sh generate the concrete
+  cyclonedds.xml from this template using configs/network.yaml, substituting:
+      __IFACE_IP__   = this host's LAN IP (pi_ip on the Pi, laptop_ip on laptop)
+      __PI_IP__      = pi_ip
+      __LAPTOP_IP__  = laptop_ip
+  and then export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp + CYCLONEDDS_URI.
+
+  Both machines MUST use CycloneDDS (matching RMW) and the same ROS_DOMAIN_ID.
+-->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface address="__IFACE_IP__"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <Peers>
+        <Peer address="__PI_IP__"/>
+        <Peer address="__LAPTOP_IP__"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

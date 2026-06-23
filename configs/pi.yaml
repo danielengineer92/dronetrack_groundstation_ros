@@ -1,0 +1,199 @@
+# =============================================================================
+# Pi-side parameters (split DroneTrack architecture)
+#
+# This is the single authoritative config for everything that runs ON THE DRONE.
+# The reused sections (camera/tracker/telemetry/autonomy/mission/control/health)
+# are carried over verbatim from dronetrack_pi_ros full_system_params.yaml so the
+# Pi behaves identically. YOLO, visualizer, and dashboard sections were removed
+# because those now run on the laptop (see configs/groundstation.yaml).
+#
+# Topic names are kept compatible with dronetrack_pi_ros. See configs/topics.yaml
+# for the boundary topic map and configs/network.example.yaml for IP/DDS setup.
+# =============================================================================
+
+# ---- NEW: laptop perception trust boundary ----------------------------------
+detection_gate_node:
+  ros__parameters:
+    inbound_detections_topic: "/groundstation/vision/detections"   # untrusted, from laptop
+    outbound_detections_topic: "/drone/vision/detections"          # trusted, to Pi tracker
+    heartbeat_topic: "/groundstation/heartbeat"
+    max_detection_age_s: 0.5        # drop frames older than this (staleness)
+    max_heartbeat_age_s: 1.0        # link considered down past this
+    require_heartbeat: true         # no heartbeat yet => drop all detections
+    max_message_rate_hz: 60.0       # inbound flood / DoS cap
+    max_detections: 20              # absurd-payload cap
+    min_confidence: 0.10            # noise floor (tracker still has its own min_confidence)
+    clock_skew_tolerance_s: 0.25    # tolerate small future stamps from clock jitter
+    report_period_s: 5.0
+
+# ---- NEW: ground-station watchdog -------------------------------------------
+ground_station_watchdog_node:
+  ros__parameters:
+    heartbeat_topic: "/groundstation/heartbeat"
+    inbound_detections_topic: "/groundstation/vision/detections"
+    link_status_topic: "/drone/groundstation/link_status"
+    link_ok_topic: "/drone/groundstation/ok"
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    max_heartbeat_age_s: 1.0
+    max_detection_age_s: 1.0
+    check_rate_hz: 10.0
+    deassert_on_link_loss: true     # publish autonomy/offboard request=false on link loss
+    request_hold_on_link_loss: false  # also request MAVSDK HOLD (needs allow_mavsdk_actions on Pi)
+
+# ---- REUSED from dronetrack_pi_ros (must stay on the Pi) ---------------------
+camera_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw"
+    frame_id: "camera_optical_frame"
+    buffer_size: 1
+    camera_index: 0
+    frame_width: 640
+    frame_height: 480
+    fps: 30.0
+    camera_backend: "v4l2"
+
+tracker_node:
+  ros__parameters:
+    detections_topic: "/drone/vision/detections"   # gate republishes here
+    target_error_topic: "/drone/tracking/target_error"
+    target_class: "red_ball"
+    min_confidence: 0.25
+    detection_timeout: 1.5
+    reacquisition_timeout: 4.0
+    smoothing_alpha: 0.35
+    target_area_min: 0.002
+    target_area_max: 0.7
+    publish_rate: 30.0
+    proximity_threshold: 0.12
+    stale_detection_timeout: 2.5
+    missed_detection_threshold: 2
+    coast_timeout: 2.0
+    lock_confirm_frames: 1
+    estimate_distance: true
+    distance_calibration_k: 0.0
+    ball_diameter_m: 0.20
+    focal_length_px: 0.0
+    horizontal_fov_deg: 70.0
+    vertical_fov_deg: 55.0
+    image_width_px: 640
+    image_height_px: 480
+    min_distance_m: 0.25
+    max_distance_m: 12.0
+    distance_filter_alpha: 0.25
+
+telemetry_node:
+  ros__parameters:
+    telemetry_topic: "/drone/telemetry"
+    connection_url: "serial:///dev/ttyACM0:57600"
+    publish_rate: 10.0
+    reconnect_interval: 5.0
+    connection_timeout: 10.0
+    control_command_topic: "/drone/control/command"
+    offboard_enable_topic: "/drone/mavsdk/offboard_enable"
+    command_status_topic: "/drone/mavsdk/command_status"
+    action_command_topic: "/drone/mavsdk/action_command"
+    mavsdk_offboard_enabled: false
+    command_rate: 20.0
+    command_timeout: 0.5
+    require_armed_for_offboard: true
+    min_battery_percent: 20.0
+    max_yaw_rate_rad_s: 1.0
+    allow_translation_commands: false
+    stop_offboard_on_disable: true
+    allow_mavsdk_actions: false      # keep false for normal hardware bench work
+    action_command_timeout: 3.0
+
+autonomy_manager_node:
+  ros__parameters:
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    autonomy_enable_topic: "/drone/autonomy/enabled"
+    offboard_enable_topic: "/drone/mavsdk/offboard_enable"
+    autonomy_state_topic: "/drone/autonomy/state"
+    manager_enabled: true
+    initial_autonomy_request: false
+    initial_offboard_request: false
+    publish_rate: 10.0
+    target_timeout: 1.0
+    telemetry_timeout: 2.0
+    request_timeout: 0.0
+    enable_offboard_when_ready: true
+    require_connected: true
+    require_armed: true
+    require_health_all_ok: false
+    require_gps: false
+    required_flight_mode: ""
+    min_battery_percent: 20.0
+
+mission_executor_node:
+  ros__parameters:
+    mission_enabled: true
+    auto_start: false
+    mission_request_topic: "/drone/mission/request"
+    mission_command_topic: "/drone/mission/command"
+    mission_state_topic: "/drone/mission/state"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    publish_rate: 10.0
+    require_connected_for_mission: true
+    require_armed_for_mission: true
+    telemetry_timeout_s: 2.0
+    takeoff_altitude_m: 3.0
+    airborne_altitude_m: 2.7
+    takeoff_timeout_s: 20.0
+    offboard_prime_time_s: 1.5
+    track_center_timeout_s: 0.0
+    run_full_orbit_after_track_center: false
+    mission_plan_file: ""
+    event_log_enabled: true
+    event_log_directory: "~/drone_mission_logs"
+
+control_node:
+  ros__parameters:
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    control_command_topic: "/drone/control/command"
+    mission_command_topic: "/drone/mission/command"
+    autonomy_enabled: false
+    gain_yaw: 0.8
+    gain_down: 0.3
+    gain_forward: 1.0
+    gain_right: 1.0
+    deadband_x: 0.05
+    deadband_y: 0.05
+    max_velocity_forward: 2.0
+    max_velocity_right: 2.0
+    max_velocity_down: 0.5
+    max_yaw_rate: 1.0
+    max_accel_forward: 1.5
+    max_accel_right: 1.5
+    max_accel_down: 0.5
+    max_yaw_accel: 2.0
+    min_battery_percent: 25.0
+    require_gps: false
+    require_armed: true
+    min_altitude_m: 2.0
+    control_rate: 20.0
+    target_timeout: 1.0
+    mission_command_timeout: 1.0
+    telemetry_timeout: 2.0
+
+health_monitor_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw"
+    detections_topic: "/drone/vision/detections"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    control_command_topic: "/drone/control/command"
+    mavsdk_command_status_topic: "/drone/mavsdk/command_status"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    monitor_mavsdk_command_status: true
+    heartbeat_period: 2.0
+    stale_seconds: 2.0

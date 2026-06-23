@@ -1,0 +1,46 @@
+# =============================================================================
+# Laptop ground-station parameters (split DroneTrack architecture)
+#
+# Everything here runs on the laptop. None of it can fly or arm the drone.
+# Topic names are kept compatible with dronetrack_pi_ros where reused.
+# =============================================================================
+
+yolo_node:
+  ros__parameters:
+    # Subscribe the Pi's COMPRESSED stream by default (efficient over Wi-Fi).
+    image_transport: "compressed"                      # "compressed" | "raw"
+    compressed_image_topic: "/drone/camera/image_raw/compressed"
+    image_topic: "/drone/camera/image_raw"             # used only when transport == raw
+    detections_topic: "/groundstation/vision/detections"  # outbound to the Pi gate
+    model_path: "yolov8n.pt"          # override at launch; e.g. an ncnn/.pt model dir
+    target_class: ""                  # empty = all classes (matches default yolov8n COCO model)
+    confidence_threshold: 0.25
+    iou_threshold: 0.45
+    device: "cpu"                     # "cuda:0" (NVIDIA, verified ~3x faster) / "mps" (Apple) / "cpu"
+    input_size: 640
+    max_detections: 20
+    half_precision: false             # set true with device:=cuda:0 for a further GPU speedup
+    verbose: false
+    process_every_n_frames: 1
+
+groundstation_heartbeat_node:
+  ros__parameters:
+    heartbeat_topic: "/groundstation/heartbeat"
+    detections_topic: "/groundstation/vision/detections"
+    rate_hz: 5.0                      # must be faster than Pi watchdog max_heartbeat_age_s
+    station_id: ""                    # blank => hostname
+    software_version: "0.1.0"
+    perception_stale_s: 1.0
+
+web_dashboard_node:
+  ros__parameters:
+    host: "0.0.0.0"
+    port: 8080
+    link_status_topic: "/drone/groundstation/link_status"
+    heartbeat_topic: "/groundstation/heartbeat"
+    detections_topic: "/groundstation/vision/detections"
+    telemetry_topic: "/drone/telemetry"
+    mission_request_topic: "/drone/mission/request"
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"

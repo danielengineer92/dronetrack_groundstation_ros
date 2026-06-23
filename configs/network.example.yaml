@@ -1,0 +1,37 @@
+# =============================================================================
+# Network configuration EXAMPLE for the split DroneTrack architecture.
+#
+# Copy this to network.yaml and fill in your travel-router reservations.
+# This file is documentation + the source values for scripts/setup_*.sh and
+# scripts/run_*.sh, which export the matching environment variables.
+#
+# Design rule: use static/reserved IPs or stable hostnames on the router LAN.
+# Do NOT rely on a laptop hotspot. Both devices join the SAME travel router.
+# =============================================================================
+
+# Reserve these in the travel router's DHCP table (by MAC) or set them static.
+pi_ip: "10.0.0.10"
+laptop_ip: "10.0.0.20"
+
+# Optional stable hostnames (mDNS/.local or router DNS). If set, prefer these.
+pi_hostname: "dronepi.local"
+laptop_hostname: "groundstation.local"
+
+# Shared ROS 2 settings. BOTH machines must match ROS_DOMAIN_ID.
+ros_domain_id: 42
+
+# DDS middleware. CycloneDDS with explicit unicast peers is the most robust on
+# travel routers that block/limit multicast discovery.
+rmw_implementation: "rmw_cyclonedds_cpp"
+
+# When true, run_*.sh writes a CycloneDDS config from cyclonedds.example.xml with
+# the peer IPs above and exports CYCLONEDDS_URI. Set false to rely on default
+# multicast discovery (works only if the router passes multicast).
+use_cyclonedds_unicast: true
+
+# Ports (informational; DDS negotiates within ranges based on domain id).
+# Dashboard HTTP port served by the laptop.
+dashboard_port: 8080
+# Pi SSH port (for the sanity-check scripts).
+ssh_port: 22
+ssh_user: "robotpi"

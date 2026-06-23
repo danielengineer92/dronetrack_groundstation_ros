@@ -1,0 +1,10 @@
+# Force LF in the repo and on checkout. This project runs on Linux/WSL/Pi; the
+# shell scripts and ROS nodes break with CRLF line endings even when edited on
+# Windows. Keep everything LF regardless of the developer's core.autocrlf.
+* text=auto eol=lf
+
+# Explicitly binary (never normalize).
+*.pt binary
+*.onnx binary
+*.engine binary
+*.bin binary

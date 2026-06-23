@@ -1,0 +1,32 @@
+# ROS 2 / colcon
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+
+# Reused packages are copied in by scripts/setup_*.sh, not committed here.
+ros_ws/src/drone_interfaces/
+ros_ws/src/drone_camera/
+ros_ws/src/drone_tracker/
+ros_ws/src/drone_control/
+ros_ws/src/drone_telemetry/
+ros_ws/src/drone_diagnostics/
+
+# Generated / local-only
+configs/network.yaml
+configs/cyclonedds.xml
+ros_ws/src/*/config/
+models/
+
+# Model weights (downloaded at runtime, not source)
+*.pt
+*.onnx
+*.engine
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.vscode/
+.idea/
