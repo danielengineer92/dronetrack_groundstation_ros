@@ -14,6 +14,7 @@ endpoint. Differences for the split architecture:
 Endpoints:
     GET  /                 dashboard HTML
     GET  /api/status       latest status JSON
+    GET  /stream.mjpg      live camera stream with YOLO detection overlays
     POST /api/mission_request   {"enabled": true|false}
     POST /api/autonomy_request  {"enabled": true|false}
     POST /api/abort_hold        {"confirm": true}
@@ -28,9 +29,17 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # The raw MJPEG stream still works without overlay support.
+    cv2 = None
+    np = None
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
 from drone_interfaces.msg import DetectionArray, DroneTelemetry, MavsdkActionCommand
@@ -44,10 +53,18 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
   :root { color-scheme: dark; }
   body { margin:0; font-family: system-ui, sans-serif; background:#06101e; color:#e7f4ff; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
-  h1 { font-size: 22px; letter-spacing:-.02em; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 22px; margin:0; }
   .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap:14px; }
   .card { background:#0a1528; border:1px solid rgba(100,160,220,.18); border-radius:14px; padding:14px; }
+  .camera { margin-top:14px; background:#071326; border:1px solid rgba(100,160,220,.2); border-radius:14px; overflow:hidden; }
+  .camera-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-end; padding:14px; }
+  .camera-title { font-size:20px; font-weight:800; margin-top:3px; }
+  .frame { background:#02060c; aspect-ratio:16/9; display:grid; place-items:center; }
+  .frame img { width:100%; height:100%; object-fit:contain; display:block; }
+  .target-row { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:10px 14px 14px; border-top:1px solid rgba(100,160,220,.12); }
+  .target-list { color:#cfe6ff; }
+  .stale { color:#ffcc66; }
   .k { color:#83a3bd; font-size:11px; text-transform:uppercase; letter-spacing:.12em; }
   .v { font-size:24px; font-weight:800; margin-top:4px; }
   .ok { color:#50fa7b; } .warn { color:#ffcc66; } .bad { color:#ff5f75; }
@@ -60,6 +77,14 @@ DASHBOARD_HTML = """<!doctype html>
 <body><div class="wrap">
   <h1>DroneTrack &mdash; Ground Station</h1>
   <small id="updated">connecting...</small>
+  <section class="camera">
+    <div class="camera-head">
+      <div><div class="k">Camera</div><div class="camera-title">YOLO Targets</div></div>
+      <small id="stream_state">waiting for image...</small>
+    </div>
+    <div class="frame"><img id="stream" src="/stream.mjpg" alt="Live camera feed with YOLO target boxes"/></div>
+    <div class="target-row"><small class="target-list" id="targets">No targets</small><small id="frame_age"></small></div>
+  </section>
   <div class="grid" style="margin-top:14px">
     <div class="card"><div class="k">Link</div><div class="v" id="link">--</div><small id="link_reason"></small></div>
     <div class="card"><div class="k">Latency</div><div class="v" id="latency">--</div></div>
@@ -92,6 +117,13 @@ async function tick(){
     document.getElementById('fps').textContent = s.perception_fps>=0 ? s.perception_fps.toFixed(1) : '--';
     document.getElementById('det').textContent = s.detection_count;
     document.getElementById('conf').textContent = s.max_confidence>0 ? ('max conf '+s.max_confidence.toFixed(2)) : '';
+    document.getElementById('targets').textContent = s.target_summary || 'No targets';
+    const hasFrame = s.camera_frame_age_s >= 0;
+    document.getElementById('stream_state').textContent = hasFrame
+      ? (s.overlay_available ? 'overlay live' : 'camera live') : 'waiting for image...';
+    const frameAge = document.getElementById('frame_age');
+    frameAge.textContent = hasFrame ? ('frame age '+s.camera_frame_age_s.toFixed(1)+' s') : '';
+    frameAge.className = s.camera_frame_age_s > 1.5 ? 'stale' : '';
     const px4 = document.getElementById('px4');
     px4.textContent = s.px4_connected ? 'CONNECTED' : 'NO LINK'; cls(px4, s.px4_connected?'ok':'bad');
     document.getElementById('mode').textContent = s.flight_mode || '';
@@ -134,6 +166,7 @@ class WebDashboardNode(Node):
         self.declare_parameter("link_status_topic", "/drone/groundstation/link_status")
         self.declare_parameter("heartbeat_topic", "/groundstation/heartbeat")
         self.declare_parameter("detections_topic", "/groundstation/vision/detections")
+        self.declare_parameter("camera_topic", "/drone/camera/image_raw/compressed")
         self.declare_parameter("telemetry_topic", "/drone/telemetry")
         self.declare_parameter("mission_request_topic", "/drone/mission/request")
         self.declare_parameter("autonomy_request_topic", "/drone/autonomy/request")
@@ -148,8 +181,14 @@ class WebDashboardNode(Node):
             "link_ok": False, "link_reason": "no data", "latency_s": float("nan"),
             "perception_fps": -1.0, "detection_count": 0, "max_confidence": 0.0,
             "px4_connected": False, "flight_mode": "", "battery_percent": -1.0,
-            "rel_altitude_m": 0.0, "armed": False,
+            "rel_altitude_m": 0.0, "armed": False, "camera_frame_age_s": -1.0,
+            "target_summary": "", "overlay_available": cv2 is not None and np is not None,
         }
+        self._latest_jpeg: bytes | None = None
+        self._latest_frame_time = 0.0
+        self._latest_detections: list[dict] = []
+        self._latest_detection_size = (0, 0)
+        self._latest_detection_time = 0.0
         self._action_id = 0
 
         lossy = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -163,6 +202,8 @@ class WebDashboardNode(Node):
                                  self._on_heartbeat, lossy)
         self.create_subscription(DetectionArray, str(self.get_parameter("detections_topic").value),
                                  self._on_detections, lossy)
+        self.create_subscription(CompressedImage, str(self.get_parameter("camera_topic").value),
+                                 self._on_camera, lossy)
         self.create_subscription(DroneTelemetry, str(self.get_parameter("telemetry_topic").value),
                                  self._on_telemetry, lossy)
 
@@ -187,9 +228,34 @@ class WebDashboardNode(Node):
 
     def _on_detections(self, msg: DetectionArray) -> None:
         max_conf = max((d.confidence for d in msg.detections), default=0.0)
+        detections = [
+            {
+                "class_name": d.class_name,
+                "confidence": float(d.confidence),
+                "pixel_center_x": int(d.pixel_center_x),
+                "pixel_center_y": int(d.pixel_center_y),
+                "pixel_width": int(d.pixel_width),
+                "pixel_height": int(d.pixel_height),
+            }
+            for d in msg.detections
+        ]
+        target_summary = ", ".join(
+            f"{d['class_name']} {d['confidence']:.2f}" for d in detections[:3]
+        )
+        if len(detections) > 3:
+            target_summary += f", +{len(detections) - 3} more"
         with self._lock:
             self._state["detection_count"] = int(msg.count)
             self._state["max_confidence"] = float(max_conf)
+            self._state["target_summary"] = target_summary
+            self._latest_detections = detections
+            self._latest_detection_size = (int(msg.image_width), int(msg.image_height))
+            self._latest_detection_time = time.monotonic()
+
+    def _on_camera(self, msg: CompressedImage) -> None:
+        with self._lock:
+            self._latest_jpeg = bytes(msg.data)
+            self._latest_frame_time = time.monotonic()
 
     def _on_telemetry(self, msg: DroneTelemetry) -> None:
         with self._lock:
@@ -232,7 +298,95 @@ class WebDashboardNode(Node):
     # ---- http server -----------------------------------------------------
     def snapshot(self) -> dict:
         with self._lock:
-            return dict(self._state)
+            snap = dict(self._state)
+            if self._latest_frame_time > 0.0:
+                snap["camera_frame_age_s"] = time.monotonic() - self._latest_frame_time
+            return snap
+
+    def _latest_stream_frame(self) -> bytes | None:
+        now = time.monotonic()
+        with self._lock:
+            jpeg = self._latest_jpeg
+            detections = list(self._latest_detections)
+            detection_size = self._latest_detection_size
+            detections_fresh = self._latest_detection_time > 0.0 and now - self._latest_detection_time <= 1.0
+        if jpeg is None:
+            return None
+        if cv2 is None or np is None or not detections or not detections_fresh:
+            return jpeg
+        return self._draw_overlay(jpeg, detections, detection_size)
+
+    def _draw_overlay(self, jpeg: bytes, detections: list[dict], detection_size: tuple[int, int]) -> bytes:
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return jpeg
+
+        frame_h, frame_w = frame.shape[:2]
+        det_w, det_h = detection_size
+        scale_x = frame_w / det_w if det_w > 0 else 1.0
+        scale_y = frame_h / det_h if det_h > 0 else 1.0
+
+        for det in detections:
+            cx = det["pixel_center_x"] * scale_x
+            cy = det["pixel_center_y"] * scale_y
+            bw = det["pixel_width"] * scale_x
+            bh = det["pixel_height"] * scale_y
+            x1 = max(0, min(frame_w - 1, int(cx - bw / 2)))
+            y1 = max(0, min(frame_h - 1, int(cy - bh / 2)))
+            x2 = max(0, min(frame_w - 1, int(cx + bw / 2)))
+            y2 = max(0, min(frame_h - 1, int(cy + bh / 2)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            color = (80, 255, 120)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{det['class_name']} {det['confidence']:.2f}"
+            (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            label_y = max(label_h + baseline + 4, y1)
+            cv2.rectangle(
+                frame,
+                (x1, label_y - label_h - baseline - 6),
+                (min(frame_w - 1, x1 + label_w + 8), label_y + 2),
+                color,
+                -1,
+            )
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 4, label_y - baseline - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (1, 6, 12),
+                2,
+                cv2.LINE_AA,
+            )
+
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        return encoded.tobytes() if ok else jpeg
+
+    def stream_mjpeg(self, handler: BaseHTTPRequestHandler) -> None:
+        handler.send_response(200)
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        handler.send_header("Pragma", "no-cache")
+        handler.send_header("Connection", "close")
+        handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        handler.end_headers()
+
+        while True:
+            frame = self._latest_stream_frame()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            try:
+                handler.wfile.write(b"--frame\r\n")
+                handler.wfile.write(b"Content-Type: image/jpeg\r\n")
+                handler.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                handler.wfile.write(frame)
+                handler.wfile.write(b"\r\n")
+                handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            time.sleep(1.0 / 12.0)
 
     def _start_server(self) -> None:
         node = self
@@ -251,6 +405,8 @@ class WebDashboardNode(Node):
             def do_GET(self):
                 if self.path in ("/", "/index.html"):
                     self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                elif self.path == "/stream.mjpg":
+                    node.stream_mjpeg(self)
                 elif self.path == "/api/status":
                     self._send(200, json.dumps(node.snapshot()).encode("utf-8"))
                 else:
