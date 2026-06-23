@@ -40,6 +40,9 @@ def generate_launch_description() -> LaunchDescription:
     half_precision_arg = DeclareLaunchArgument(
         'half_precision', default_value='false',
         description='FP16 inference. Use true with device:=cuda:0 for a GPU speedup.')
+    max_fps_arg = DeclareLaunchArgument(
+        'max_fps', default_value='30.0',
+        description='Maximum YOLO processing FPS. Set 0 to disable the cap.')
     dashboard_arg = DeclareLaunchArgument(
         'dashboard', default_value='true',
         description='Run the web dashboard.')
@@ -56,6 +59,7 @@ def generate_launch_description() -> LaunchDescription:
             'target_class': LaunchConfiguration('target_class'),
             'device': LaunchConfiguration('device'),
             'half_precision': ParameterValue(LaunchConfiguration('half_precision'), value_type=bool),
+            'max_fps': ParameterValue(LaunchConfiguration('max_fps'), value_type=float),
         }],
         output='screen')
 
@@ -72,7 +76,7 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         params_file_arg, model_path_arg, target_class_arg, device_arg,
-        half_precision_arg, dashboard_arg, dashboard_port_arg,
+        half_precision_arg, max_fps_arg, dashboard_arg, dashboard_port_arg,
         LogInfo(msg='=== DRONETRACK GROUND STATION (laptop) ==='),
         LogInfo(msg=['Dashboard: http://127.0.0.1:', LaunchConfiguration('dashboard_port'), '/  (use 127.0.0.1 from Windows/WSL2)']),
         LogInfo(msg='Publishes detections + heartbeat to the Pi; the Pi validates everything.'),

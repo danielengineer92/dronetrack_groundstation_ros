@@ -22,6 +22,7 @@ yolo_node:
     half_precision: false             # set true with device:=cuda:0 for a further GPU speedup
     verbose: false
     process_every_n_frames: 1
+    max_fps: 30.0                     # cap YOLO processing/published detections; 0 disables
 
 groundstation_heartbeat_node:
   ros__parameters:

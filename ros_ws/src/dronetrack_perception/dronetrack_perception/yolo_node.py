@@ -51,6 +51,7 @@ class YoloNode(Node):
         self.declare_parameter("compressed_image_topic", "/drone/camera/image_raw/compressed")
         self.declare_parameter("detections_topic", "/groundstation/vision/detections")
         self.declare_parameter("process_every_n_frames", 1)
+        self.declare_parameter("max_fps", 30.0)
 
         self.model_path = str(self.get_parameter("model_path").value)
         self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
@@ -66,9 +67,13 @@ class YoloNode(Node):
         self.compressed_image_topic = str(self.get_parameter("compressed_image_topic").value)
         self.detections_topic = str(self.get_parameter("detections_topic").value)
         self.process_every_n_frames = max(1, int(self.get_parameter("process_every_n_frames").value))
+        self.max_fps = float(self.get_parameter("max_fps").value)
+        self.min_process_interval_s = 1.0 / self.max_fps if self.max_fps > 0.0 else 0.0
 
         self._received_frames = 0
         self._published_arrays = 0
+        self._last_process_start = 0.0
+        self._report_window_start = time.monotonic()
         self._target_class_ids: Optional[List[int]] = None
         self.bridge = CvBridge()
         self.model = None
@@ -99,7 +104,7 @@ class YoloNode(Node):
         self.get_logger().info(
             f"YOLO (ground station) up | transport={self.transport}, in={sub_topic}, "
             f"out={self.detections_topic}, model={self.model_path}, device={self.device}, "
-            f"target_class='{self.target_class or 'all'}'")
+            f"target_class='{self.target_class or 'all'}', max_fps={self.max_fps:g}")
 
     # ---- model -----------------------------------------------------------
     def _load_model(self) -> None:
@@ -156,6 +161,13 @@ class YoloNode(Node):
             return
         if self._received_frames % self.process_every_n_frames != 0:
             return
+        now = time.monotonic()
+        if (
+            self.min_process_interval_s > 0.0
+            and now - self._last_process_start < self.min_process_interval_s
+        ):
+            return
+        self._last_process_start = now
 
         try:
             img_h, img_w = frame.shape[:2]
@@ -211,12 +223,16 @@ class YoloNode(Node):
                 f"YOLO | no inferences yet, frames_received={self._received_frames}")
             return
         avg = self.total_inference_time / self.inference_count
-        fps = 1.0 / avg if avg > 0.0 else 0.0
+        capacity_fps = 1.0 / avg if avg > 0.0 else 0.0
+        elapsed = max(1e-6, time.monotonic() - self._report_window_start)
+        processed_fps = self.inference_count / elapsed
         self.get_logger().info(
-            f"YOLO | fps={fps:.1f}, avg_inference={avg*1000:.1f}ms, "
+            f"YOLO | processed_fps={processed_fps:.1f}, capacity_fps={capacity_fps:.1f}, "
+            f"avg_inference={avg*1000:.1f}ms, cap={self.max_fps:g}, "
             f"frames={self._received_frames}, arrays={self._published_arrays}")
         self.inference_count = 0
         self.total_inference_time = 0.0
+        self._report_window_start = time.monotonic()
 
 
 def main(args=None) -> None:
