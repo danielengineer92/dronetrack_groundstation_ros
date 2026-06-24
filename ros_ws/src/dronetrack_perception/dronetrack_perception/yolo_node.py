@@ -192,8 +192,11 @@ class YoloNode(Node):
                 for i in range(len(boxes)):
                     cls_id = int(boxes.cls[i].item())
                     class_name = self.model.names.get(cls_id, f"class_{cls_id}")
-                    if self.target_class and class_name.lower() != self.target_class:
-                        continue
+                    # Class filtering is handled at inference via `classes=` when the
+                    # target_class resolves to a model id. We deliberately do NOT
+                    # re-filter by name here: if target_class wasn't found in the
+                    # model we fall back to "all classes" (see _resolve_target_class_ids),
+                    # and a name re-filter would wrongly drop everything in that case.
                     x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                     pcx, pcy = int((x1 + x2) / 2.0), int((y1 + y2) / 2.0)
                     pw, ph = int(x2 - x1), int(y2 - y1)

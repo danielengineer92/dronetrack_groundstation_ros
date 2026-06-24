@@ -15,7 +15,7 @@ boundary_topics:
   - name: "/drone/camera/image_raw/compressed"
     type: "sensor_msgs/CompressedImage"
     direction: "PI->GS"
-    owner: "image_transport republish (Pi)"
+    owner: "camera_compressor_node (Pi)"
     qos: "best_effort, depth 1"
 
   # Raw companion (Pi-local; not streamed unless you set yolo image_transport:=raw).

@@ -24,6 +24,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
@@ -301,7 +302,14 @@ class WebDashboardNode(Node):
             snap = dict(self._state)
             if self._latest_frame_time > 0.0:
                 snap["camera_frame_age_s"] = time.monotonic() - self._latest_frame_time
-            return snap
+        # JSON has no NaN/Infinity literals, and the browser's JSON.parse rejects
+        # them — which would make every /api/status fetch throw (latency_s is NaN
+        # until the first LinkStatus arrives from the Pi). Emit null instead; the
+        # dashboard JS already renders a missing value as '--'.
+        return {
+            k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in snap.items()
+        }
 
     def _latest_stream_frame(self) -> bytes | None:
         now = time.monotonic()

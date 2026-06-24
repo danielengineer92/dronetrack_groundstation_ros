@@ -17,7 +17,8 @@ detection_gate_node:
     inbound_detections_topic: "/groundstation/vision/detections"   # untrusted, from laptop
     outbound_detections_topic: "/drone/vision/detections"          # trusted, to Pi tracker
     heartbeat_topic: "/groundstation/heartbeat"
-    max_detection_age_s: 0.5        # drop frames older than this (staleness)
+    max_detection_age_s: 1.5        # drop frames older than this (Pi->laptop->Pi round-trip;
+                                    # raised from 0.5 to tolerate weak-Wi-Fi latency + inference)
     max_heartbeat_age_s: 1.0        # link considered down past this
     require_heartbeat: true         # no heartbeat yet => drop all detections
     max_message_rate_hz: 60.0       # inbound flood / DoS cap
@@ -41,6 +42,13 @@ ground_station_watchdog_node:
     check_rate_hz: 10.0
     deassert_on_link_loss: true     # publish autonomy/offboard request=false on link loss
     request_hold_on_link_loss: false  # also request MAVSDK HOLD (needs allow_mavsdk_actions on Pi)
+
+camera_compressor_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw"
+    compressed_image_topic: "/drone/camera/image_raw/compressed"
+    jpeg_quality: 80
+    report_period_s: 5.0
 
 # ---- REUSED from dronetrack_pi_ros (must stay on the Pi) ---------------------
 camera_node:

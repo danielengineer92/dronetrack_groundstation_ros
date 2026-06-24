@@ -225,8 +225,7 @@ Expected tail: `SELFTEST: ALL PASS` (exit 0).
 **Still needs real hardware/SITL testing (not validated yet):**
 - Two-machine run over the actual travel-router LAN (DDS discovery / CycloneDDS
   unicast, `ROS_DOMAIN_ID` match) — the self-test above ran both sides on one host.
-- Compressed `image_transport republish` topic names on your ROS build (verify
-  with check #4) and real camera frames.
+- Compressed camera stream discovery/delivery with real camera frames.
 - End-to-end latency under real Wi-Fi, and clock sync via chrony.
 - The link-loss → hold behavior on the actual airframe with PX4 connected (test
   on the bench first, props off, `allow_mavsdk_actions:=false`).

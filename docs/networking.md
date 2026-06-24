@@ -115,7 +115,7 @@ true`) all cross correctly.
 
 Stream **compressed** camera only. Raw `640x480 bgr8 @ 30 Hz` is ~26 MB/s and
 will saturate Wi-Fi; JPEG-compressed is typically <1 MB/s. The Pi launch runs
-`image_transport republish raw compressed` and the laptop YOLO subscribes to the
+`camera_compressor_node` and the laptop YOLO subscribes to the
 `/compressed` topic by default. Drop `frame_width/height/fps` in `configs/pi.yaml`
 if the link is weak.
 

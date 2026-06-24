@@ -25,6 +25,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            'camera_compressor_node = dronetrack_pi.camera_compressor_node:main',
             'detection_gate_node = dronetrack_pi.detection_gate_node:main',
             'ground_station_watchdog_node = dronetrack_pi.ground_station_watchdog_node:main',
         ],

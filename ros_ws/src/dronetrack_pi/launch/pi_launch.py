@@ -2,7 +2,7 @@
 
 Runs everything that MUST stay on the drone:
   - camera publisher                      (reused: drone_camera)
-  - compressed republish for Wi-Fi        (image_transport republish)
+  - compressed camera stream for Wi-Fi    (dronetrack_pi compressor)
   - tracker / target selection            (reused: drone_tracker)
   - mission / autonomy / control          (reused: drone_control)
   - MAVSDK / PX4 bridge + action gate     (reused: drone_telemetry)
@@ -22,7 +22,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo
+from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -55,7 +55,7 @@ def generate_launch_description() -> LaunchDescription:
         description='Launch camera/tracker/control/telemetry/health from dronetrack_pi_ros.')
     compress_arg = DeclareLaunchArgument(
         'compress', default_value='true',
-        description='Run image_transport republish raw->compressed for the laptop.')
+        description='Run the dronetrack_pi camera compressor raw->compressed for the laptop.')
 
     params = LaunchConfiguration('params_file')
 
@@ -69,13 +69,16 @@ def generate_launch_description() -> LaunchDescription:
         name='ground_station_watchdog_node', parameters=[params], output='screen')
 
     # ---- Compressed camera stream for Wi-Fi ------------------------------
-    # Avoids raw full-res Image spam across the LAN. Requires the
-    # compressed_image_transport plugin (apt: ros-jazzy-compressed-image-transport).
-    compress = ExecuteProcess(
-        cmd=['ros2', 'run', 'image_transport', 'republish', 'raw', 'compressed',
-             '--ros-args',
-             '-r', ['in:=', LaunchConfiguration('raw_image_topic')],
-             '-r', ['out/compressed:=', LaunchConfiguration('compressed_image_topic')]],
+    # Keep this as a normal package-owned node instead of shelling out to
+    # image_transport republish. It gives us explicit sensor-data QoS and avoids
+    # remap/plugin ambiguity across machines.
+    compress = Node(
+        package='dronetrack_pi', executable='camera_compressor_node',
+        name='camera_compressor_node',
+        parameters=[params, {
+            'image_topic': LaunchConfiguration('raw_image_topic'),
+            'compressed_image_topic': LaunchConfiguration('compressed_image_topic'),
+        }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('compress')))
 

@@ -30,6 +30,7 @@ existing Pi control stack holds position on its own.
 from __future__ import annotations
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -75,7 +76,7 @@ class DetectionGateNode(Node):
         self._last_heartbeat_time = None        # node clock (sec) when last heartbeat accepted
         self._last_heartbeat_seq = None
         self._last_passed_stamp = None          # last accepted detection stamp (sec, from header)
-        self._last_inbound_wall = 0.0           # for rate limiting (monotonic)
+        self._last_inbound_mono = 0.0           # for rate limiting (time.monotonic)
 
         # Counters for the heartbeat report
         self._received = 0
@@ -153,14 +154,15 @@ class DetectionGateNode(Node):
         self._received += 1
         now = self._now_s()
 
-        # 1) Rate limit (flood protection) using monotonic clock.
-        mono = self.get_clock().now().nanoseconds * 1e-9
+        # 1) Rate limit (flood protection) using a TRUE monotonic clock, so an NTP
+        #    step on the Pi can't wedge the limiter or let a burst through.
+        mono = time.monotonic()
         if self.max_message_rate_hz > 0.0:
             min_dt = 1.0 / self.max_message_rate_hz
-            if (mono - self._last_inbound_wall) < min_dt:
+            if (mono - self._last_inbound_mono) < min_dt:
                 self._dropped_rate += 1
                 return
-        self._last_inbound_wall = mono
+        self._last_inbound_mono = mono
 
         # 2) Link must be alive.
         if not self._heartbeat_fresh():

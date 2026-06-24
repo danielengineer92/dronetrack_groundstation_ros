@@ -66,3 +66,41 @@ copy_reused_pkg() {
     echo "  ${pkg}: NOT FOUND in ${PI_ROS_SRC} (skip; set the matching launch toggle to false)"
   fi
 }
+
+# ---- Pi connection helpers (robust over flaky Wi-Fi) ---------------------
+# SSH defaults: auto-accept new host keys (the Pi's IP changes on subnet drift),
+# bounded connect timeout, retry the TCP connect, and keepalives so a dead link
+# is detected (instead of hanging) within ~30s.
+PI_SSH_OPTS=(
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=accept-new
+  -o ConnectTimeout=10
+  -o ConnectionAttempts=2
+  -o ServerAliveInterval=10
+  -o ServerAliveCountMax=3
+)
+
+# user@ip for the Pi, read live from network.yaml (kept current by discover_ips.sh).
+pi_target() {
+  local u ip
+  u="$(yaml_get ssh_user)"; ip="$(yaml_get pi_ip)"
+  echo "${u:-robotpi}@${ip}"
+}
+
+# Run a command on the Pi, retrying transient SSH drops. Tune with PI_SSH_TRIES.
+pi_run() {
+  local target tries i
+  target="$(pi_target)"
+  tries="${PI_SSH_TRIES:-4}"
+  for ((i = 1; i <= tries; i++)); do
+    if ssh "${PI_SSH_OPTS[@]}" "$target" "$@"; then
+      return 0
+    fi
+    if [ "$i" -lt "$tries" ]; then
+      echo "  [ssh ${i}/${tries}] ${target} unreachable; retrying in 3s ..." >&2
+      sleep 3
+    fi
+  done
+  echo "ERROR: could not reach ${target} after ${tries} attempts (try: bash scripts/discover_ips.sh)" >&2
+  return 1
+}

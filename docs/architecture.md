@@ -55,7 +55,7 @@ the original topic name, **no existing Pi node changes** — `tracker_node`,
 | Responsibility | Node | Package | Machine | Source |
 |---|---|---|---|---|
 | Camera capture | `camera_node` | drone_camera | Pi | reused |
-| Compress for Wi-Fi | `image_transport republish` | (ros) | Pi | new wiring |
+| Compress for Wi-Fi | `camera_compressor_node` | dronetrack_pi | Pi | new wiring |
 | **Detection gate / validator** | `detection_gate_node` | dronetrack_pi | Pi | **new** |
 | **Ground-station watchdog** | `ground_station_watchdog_node` | dronetrack_pi | Pi | **new** |
 | Target selection / lock | `tracker_node` | drone_tracker | Pi | reused |
