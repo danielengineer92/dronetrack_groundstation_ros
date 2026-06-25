@@ -75,18 +75,31 @@ sleep 5
 fail=0
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; fail=1; }
+read_link_status() {
+  local out="" i
+  for i in 1 2 3 4 5; do
+    out="$(timeout 8 ros2 topic echo --once --qos-reliability reliable --qos-history keep_last --qos-depth 5 /drone/groundstation/link_status 2>&1)"
+    if echo "${out}" | grep -q "^link_ok:"; then
+      echo "${out}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${out}"
+  return 1
+}
 
 echo "PHASE 1 (healthy link):"
 hz1="$(timeout 4 ros2 topic hz /drone/vision/detections 2>&1 | grep -oE 'average rate: [0-9.]+' | head -1)"
 [ -n "${hz1}" ] && pass "gate republishes trusted detections (${hz1})" || fail "no trusted output on /drone/vision/detections"
-ls1="$(timeout 4 ros2 topic echo --once /drone/groundstation/link_status 2>&1)"
+ls1="$(read_link_status)"
 echo "${ls1}" | grep -q "link_ok: true" && pass "link_ok=true" || fail "link_ok not true"
 echo "${ls1}" | grep -q "reason: OK" && pass "reason=OK" || fail "reason not OK"
 
 echo "PHASE 2 (kill heartbeat + publisher):"
 pkill -9 -f heartbeat_node; pkill -9 -f "${PUB}"
 sleep 4
-ls2="$(timeout 4 ros2 topic echo --once /drone/groundstation/link_status 2>&1)"
+ls2="$(read_link_status)"
 echo "${ls2}" | grep -q "link_ok: false" && pass "link_ok=false" || fail "link_ok not false"
 echo "${ls2}" | grep -q "reason: HEARTBEAT_STALE" && pass "reason=HEARTBEAT_STALE" || fail "reason not HEARTBEAT_STALE"
 grep -q "data: false" "${L}/areq.log" && pass "autonomy/request de-asserted to false" || fail "autonomy/request not de-asserted"

@@ -112,6 +112,8 @@ telemetry_node:
     stop_offboard_on_disable: true
     allow_mavsdk_actions: false      # keep false for normal hardware bench work
     action_command_timeout: 3.0
+    action_telemetry_timeout: 2.0
+    action_airborne_altitude_m: 0.5
 
 autonomy_manager_node:
   ros__parameters:

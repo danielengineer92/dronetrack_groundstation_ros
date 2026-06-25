@@ -31,7 +31,7 @@ can still re-arm/recover deliberately once the link returns.
 
 from __future__ import annotations
 
-import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -118,8 +118,12 @@ class GroundStationWatchdogNode(Node):
         )
 
     # ---- helpers ---------------------------------------------------------
-    def _now_s(self) -> float:
+    def _ros_now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    @staticmethod
+    def _monotonic_s() -> float:
+        return time.monotonic()
 
     @staticmethod
     def _stamp_to_s(stamp) -> float:
@@ -141,15 +145,15 @@ class GroundStationWatchdogNode(Node):
                     "treating as ground-station restart."
                 )
         self._last_heartbeat_seq = seq
-        self._last_heartbeat_time = self._now_s()
+        self._last_heartbeat_time = self._monotonic_s()
         self._last_heartbeat_stamp_s = self._stamp_to_s(msg.stamp)
 
     def _on_detections(self, msg: DetectionArray) -> None:
-        self._last_detection_time = self._now_s()
+        self._last_detection_time = self._monotonic_s()
 
     # ---- main loop -------------------------------------------------------
     def _tick(self) -> None:
-        now = self._now_s()
+        now = self._monotonic_s()
 
         hb_age = -1.0 if self._last_heartbeat_time is None else now - self._last_heartbeat_time
         det_age = -1.0 if self._last_detection_time is None else now - self._last_detection_time
@@ -177,7 +181,7 @@ class GroundStationWatchdogNode(Node):
         # Latency estimate (needs clock sync to be meaningful).
         latency = float("nan")
         if self._last_heartbeat_stamp_s is not None and heartbeat_ok:
-            latency = max(0.0, now - self._last_heartbeat_stamp_s)
+            latency = max(0.0, self._ros_now_s() - self._last_heartbeat_stamp_s)
 
         status = LinkStatus()
         status.stamp = self.get_clock().now().to_msg()

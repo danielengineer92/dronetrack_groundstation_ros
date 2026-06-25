@@ -73,7 +73,7 @@ class DetectionGateNode(Node):
         self.report_period_s = float(self.get_parameter("report_period_s").value)
 
         # State
-        self._last_heartbeat_time = None        # node clock (sec) when last heartbeat accepted
+        self._last_heartbeat_time = None        # monotonic receipt time (sec) when last heartbeat accepted
         self._last_heartbeat_seq = None
         self._last_passed_stamp = None          # last accepted detection stamp (sec, from header)
         self._last_inbound_mono = 0.0           # for rate limiting (time.monotonic)
@@ -118,8 +118,12 @@ class DetectionGateNode(Node):
         )
 
     # ---- helpers ---------------------------------------------------------
-    def _now_s(self) -> float:
+    def _ros_now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    @staticmethod
+    def _monotonic_s() -> float:
+        return time.monotonic()
 
     @staticmethod
     def _stamp_to_s(stamp) -> float:
@@ -128,7 +132,7 @@ class DetectionGateNode(Node):
     def _heartbeat_fresh(self) -> bool:
         if self._last_heartbeat_time is None:
             return not self.require_heartbeat
-        return (self._now_s() - self._last_heartbeat_time) <= self.max_heartbeat_age_s
+        return (self._monotonic_s() - self._last_heartbeat_time) <= self.max_heartbeat_age_s
 
     # ---- callbacks -------------------------------------------------------
     def _on_heartbeat(self, msg: GroundStationHeartbeat) -> None:
@@ -148,11 +152,11 @@ class DetectionGateNode(Node):
                     "treating as ground-station restart."
                 )
         self._last_heartbeat_seq = seq
-        self._last_heartbeat_time = self._now_s()
+        self._last_heartbeat_time = self._monotonic_s()
 
     def _on_detections(self, msg: DetectionArray) -> None:
         self._received += 1
-        now = self._now_s()
+        ros_now = self._ros_now_s()
 
         # 1) Rate limit (flood protection) using a TRUE monotonic clock, so an NTP
         #    step on the Pi can't wedge the limiter or let a burst through.
@@ -175,7 +179,7 @@ class DetectionGateNode(Node):
 
         # 3) Stamp freshness + monotonicity.
         stamp_s = self._stamp_to_s(msg.stamp)
-        age = now - stamp_s
+        age = ros_now - stamp_s
         if age > self.max_detection_age_s:
             self._dropped_stale += 1
             self.get_logger().warning(
