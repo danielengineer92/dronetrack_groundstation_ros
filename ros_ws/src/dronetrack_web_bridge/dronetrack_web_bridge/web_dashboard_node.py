@@ -274,10 +274,14 @@ class WebDashboardNode(Node):
         self.autonomy_pub.publish(Bool(data=enabled))
 
     def _send_action(self, action: str, note: str) -> None:
-        self._action_id += 1
+        # Called from HTTP handler threads; guard the counter so concurrent
+        # button presses can't collide on a command_id.
+        with self._lock:
+            self._action_id += 1
+            action_id = self._action_id
         cmd = MavsdkActionCommand()
         cmd.stamp = self.get_clock().now().to_msg()
-        cmd.command_id = self._action_id
+        cmd.command_id = action_id
         cmd.action = action
         cmd.execute = True
         cmd.note = note

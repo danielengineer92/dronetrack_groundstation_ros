@@ -26,6 +26,7 @@ from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -89,7 +90,13 @@ def generate_launch_description() -> LaunchDescription:
     tracker = Node(package='drone_tracker', executable='tracker_node', name='tracker_node',
                    parameters=[params], output='screen', condition=reused)
     telemetry = Node(package='drone_telemetry', executable='telemetry_node', name='telemetry_node',
-                     parameters=[params, {'connection_url': LaunchConfiguration('connection_url')}],
+                     parameters=[params, {
+                         'connection_url': LaunchConfiguration('connection_url'),
+                         # Wire the launch arg through so allow_mavsdk_actions:=true
+                         # actually opens the action gate (was silently dropped).
+                         'allow_mavsdk_actions': ParameterValue(
+                             LaunchConfiguration('allow_mavsdk_actions'), value_type=bool),
+                     }],
                      output='screen', condition=reused)
     autonomy_manager = Node(package='drone_control', executable='autonomy_manager_node',
                             name='autonomy_manager_node', parameters=[params],

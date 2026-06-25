@@ -50,7 +50,7 @@ class DetectionGateNode(Node):
         self.declare_parameter("heartbeat_topic", "/groundstation/heartbeat")
 
         # Validation knobs
-        self.declare_parameter("max_detection_age_s", 0.5)      # drop frames older than this
+        self.declare_parameter("max_detection_age_s", 1.5)      # drop frames older than this (Pi->laptop->Pi round-trip)
         self.declare_parameter("max_heartbeat_age_s", 1.0)      # link considered down past this
         self.declare_parameter("require_heartbeat", True)       # drop detections if no heartbeat yet
         self.declare_parameter("max_message_rate_hz", 60.0)     # inbound flood cap
@@ -220,13 +220,27 @@ class DetectionGateNode(Node):
     def _detection_valid(self, det: Detection, img_w: int, img_h: int) -> bool:
         if not math.isfinite(det.confidence) or det.confidence < self.min_confidence:
             return False
+        # Normalized geometry must be finite and in [0, 1].
         for v in (det.center_x, det.center_y, det.width, det.height):
             if not math.isfinite(v) or v < 0.0 or v > 1.0:
                 return False
-        if img_w > 0 and not (0 <= det.pixel_center_x <= img_w):
+        # Pixel box must be non-negative and fit inside the image. The tracker
+        # uses pixel_width/height for its distance estimate, so reject malformed
+        # boxes here at the trust boundary rather than letting them skew range.
+        if det.pixel_width < 0 or det.pixel_height < 0:
             return False
-        if img_h > 0 and not (0 <= det.pixel_center_y <= img_h):
-            return False
+        if img_w > 0:
+            if not (0 <= det.pixel_center_x <= img_w) or det.pixel_width > img_w:
+                return False
+            if det.pixel_center_x - det.pixel_width / 2 < -1 or \
+               det.pixel_center_x + det.pixel_width / 2 > img_w + 1:
+                return False
+        if img_h > 0:
+            if not (0 <= det.pixel_center_y <= img_h) or det.pixel_height > img_h:
+                return False
+            if det.pixel_center_y - det.pixel_height / 2 < -1 or \
+               det.pixel_center_y + det.pixel_height / 2 > img_h + 1:
+                return False
         return True
 
     def _report(self) -> None:

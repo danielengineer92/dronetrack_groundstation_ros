@@ -56,6 +56,9 @@ class CameraCompressorNode(Node):
 
     def _on_image(self, msg: Image) -> None:
         self.frames_in += 1
+        # No laptop subscribed -> don't waste Pi CPU JPEG-encoding frames nobody reads.
+        if self.pub.get_subscription_count() == 0:
+            return
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             ok, encoded = cv2.imencode(
