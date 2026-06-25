@@ -1,0 +1,10 @@
+# Minimal mission: take off, prime Offboard, yaw-center the target indefinitely.
+#
+# This reproduces the conservative default behavior (no orbit, no translation).
+# track_center with until: none holds and yaw-tracks until the mission is stopped.
+mission:
+  name: example_min
+  steps:
+    - {type: takeoff}
+    - {type: prime_offboard}
+    - {type: track_center, until: none}

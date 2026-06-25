@@ -1,0 +1,22 @@
+# Orbit-the-target mission.
+#
+# Take off, prime PX4 Offboard, yaw-center the YOLO target, then orbit it once
+# via PX4 MAV_CMD_DO_ORBIT, and land.
+#
+# Requires (same gates as before, this plan does not bypass them):
+#   - allow_mavsdk_actions:=true        (TAKEOFF / DO_ORBIT / LAND are real actions)
+#   - GPS / valid global position       (orbit center is lat/lon)
+#   - a valid distance estimate          (distance_valid from the tracker)
+#
+# Step verbs: takeoff, prime_offboard, track_center, approach, orbit, rtl, land, hold.
+# Optional per-step keys: until (centered|locked|airborne|approach_done|none),
+# timeout_s, and verb-specific overrides (altitude_m, hold_s, radius_m, speed_m_s,
+# revolutions). Anything omitted falls back to the node's parameters.
+mission:
+  name: orbit_red_ball
+  steps:
+    - {type: takeoff, altitude_m: 3.0}
+    - {type: prime_offboard, hold_s: 1.5}
+    - {type: track_center, until: centered, timeout_s: 20}
+    - {type: orbit, radius_m: 2.0, speed_m_s: 0.4, revolutions: 1}
+    - {type: land}

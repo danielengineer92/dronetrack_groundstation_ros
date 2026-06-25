@@ -3,13 +3,9 @@ ros_ws/build/
 ros_ws/install/
 ros_ws/log/
 
-# Reused packages are copied in by scripts/setup_*.sh, not committed here.
-ros_ws/src/drone_interfaces/
-ros_ws/src/drone_camera/
-ros_ws/src/drone_tracker/
-ros_ws/src/drone_control/
-ros_ws/src/drone_telemetry/
-ros_ws/src/drone_diagnostics/
+# Flight packages are now VENDORED + version-controlled here as the single source
+# of truth (originally derived from dronetrack_pi_ros). setup_*.sh still no-op
+# copies them only if absent, so existing setup flows keep working.
 
 # Generated / local-only
 configs/network.yaml
@@ -30,3 +26,10 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+
+# Backups / scratch
+*.bak
+*.bak_*
+*.backup*
+*.orig
+*~
