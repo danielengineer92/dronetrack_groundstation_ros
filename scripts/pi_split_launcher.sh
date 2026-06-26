@@ -6,6 +6,7 @@
 # Env overrides (set before invoking):
 #   PI_CONN           MAVSDK connection URL   (default serial:///dev/ttyACM0:57600)
 #   PI_ALLOW_ACTIONS  allow MAVSDK actions    (default false -- keep false on the bench)
+#   PI_NATIVE_MJPEG   use native MJPEG camera (default true)
 set -eo pipefail  # not -u: ROS setup.bash references unbound vars
 
 cd "$HOME/drone_ws"
@@ -19,4 +20,5 @@ export CYCLONEDDS_URI="file://$HOME/cyclonedds_pi.xml"
 
 exec ros2 launch dronetrack_pi pi_launch.py \
   connection_url:="${PI_CONN:-serial:///dev/ttyACM0:57600}" \
-  allow_mavsdk_actions:="${PI_ALLOW_ACTIONS:-false}"
+  allow_mavsdk_actions:="${PI_ALLOW_ACTIONS:-false}" \
+  native_mjpeg:="${PI_NATIVE_MJPEG:-true}"

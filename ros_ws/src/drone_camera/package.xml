@@ -13,6 +13,7 @@
   <depend>cv_bridge</depend>
 
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>v4l-utils</exec_depend>
   <depend>drone_diagnostics</depend>
 
   <export>
