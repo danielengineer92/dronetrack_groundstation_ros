@@ -10,7 +10,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 
 from drone_interfaces.msg import ControlCommand, DetectionArray, DroneTelemetry, TargetError
@@ -58,6 +58,7 @@ class HealthMonitorNode(Node):
     def __init__(self) -> None:
         super().__init__('health_monitor_node')
 
+        self.declare_parameter('image_is_compressed', False)
         self.declare_parameter('image_topic', '/drone/camera/image_raw')
         self.declare_parameter('detections_topic', '/drone/vision/detections')
         self.declare_parameter('target_error_topic', '/drone/tracking/target_error')
@@ -68,6 +69,7 @@ class HealthMonitorNode(Node):
         self.declare_parameter('heartbeat_period', 2.0)
         self.declare_parameter('stale_seconds', 2.0)
 
+        self._image_is_compressed = bool(self.get_parameter('image_is_compressed').value)
         self._image_topic = str(self.get_parameter('image_topic').value)
         self._detections_topic = str(self.get_parameter('detections_topic').value)
         self._target_error_topic = str(self.get_parameter('target_error_topic').value)
@@ -97,12 +99,20 @@ class HealthMonitorNode(Node):
                 self._mavsdk_command_status_topic, 'mavsdk_command_status', self._stale_seconds
             )
 
-        self._image_sub = self.create_subscription(
-            Image,
-            self._image_topic,
-            self._image_callback,
-            qos_profile_sensor_data,
-        )
+        if self._image_is_compressed:
+            self._image_sub = self.create_subscription(
+                CompressedImage,
+                self._image_topic,
+                self._compressed_image_callback,
+                qos_profile_sensor_data,
+            )
+        else:
+            self._image_sub = self.create_subscription(
+                Image,
+                self._image_topic,
+                self._image_callback,
+                qos_profile_sensor_data,
+            )
         self._detections_sub = self.create_subscription(
             DetectionArray,
             self._detections_topic,
@@ -141,6 +151,7 @@ class HealthMonitorNode(Node):
         self.get_logger().info(
             'Health monitor started | '
             f'image={self._image_topic}, detections={self._detections_topic}, '
+            f'image_is_compressed={self._image_is_compressed}, '
             f'target_error={self._target_error_topic}, telemetry={self._telemetry_topic}, '
             f'control_command={self._control_command_topic}, '
             f'mavsdk_command_status={self._mavsdk_command_status_topic if self._monitor_mavsdk_command_status else "disabled"}, '
@@ -150,6 +161,11 @@ class HealthMonitorNode(Node):
     def _image_callback(self, msg: Image) -> None:
         self._topics[self._image_topic].mark(
             f'{msg.width}x{msg.height}, frame_id={msg.header.frame_id or "none"}'
+        )
+
+    def _compressed_image_callback(self, msg: CompressedImage) -> None:
+        self._topics[self._image_topic].mark(
+            f'compressed {len(msg.data)} bytes, format={msg.format or "none"}, frame_id={msg.header.frame_id or "none"}'
         )
 
     def _detections_callback(self, msg: DetectionArray) -> None:

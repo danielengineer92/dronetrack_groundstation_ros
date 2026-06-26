@@ -24,7 +24,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -57,8 +57,12 @@ def generate_launch_description() -> LaunchDescription:
     compress_arg = DeclareLaunchArgument(
         'compress', default_value='true',
         description='Run the dronetrack_pi camera compressor raw->compressed for the laptop.')
+    native_mjpeg_arg = DeclareLaunchArgument(
+        'native_mjpeg', default_value='true',
+        description='Publish native V4L2 MJPEG directly as CompressedImage; disables raw camera + compressor path.')
 
     params = LaunchConfiguration('params_file')
+    truthy = ('1', 'true', 'yes', 'on')
 
     # ---- New boundary nodes (this package) -------------------------------
     detection_gate = Node(
@@ -69,10 +73,32 @@ def generate_launch_description() -> LaunchDescription:
         package='dronetrack_pi', executable='ground_station_watchdog_node',
         name='ground_station_watchdog_node', parameters=[params], output='screen')
 
+    native_condition = IfCondition(PythonExpression([
+        "'", LaunchConfiguration('reused_pi_nodes'), "'.lower() in ", str(truthy),
+        " and '", LaunchConfiguration('native_mjpeg'), "'.lower() in ", str(truthy),
+    ]))
+    opencv_condition = IfCondition(PythonExpression([
+        "'", LaunchConfiguration('reused_pi_nodes'), "'.lower() in ", str(truthy),
+        " and '", LaunchConfiguration('native_mjpeg'), "'.lower() not in ", str(truthy),
+    ]))
+    compress_condition = IfCondition(PythonExpression([
+        "'", LaunchConfiguration('compress'), "'.lower() in ", str(truthy),
+        " and '", LaunchConfiguration('native_mjpeg'), "'.lower() not in ", str(truthy),
+    ]))
+
     # ---- Compressed camera stream for Wi-Fi ------------------------------
-    # Keep this as a normal package-owned node instead of shelling out to
-    # image_transport republish. It gives us explicit sensor-data QoS and avoids
-    # remap/plugin ambiguity across machines.
+    native_camera = Node(
+        package='drone_camera',
+        executable='native_mjpeg_camera_node',
+        name='native_mjpeg_camera_node',
+        parameters=[params, {
+            'compressed_image_topic': LaunchConfiguration('compressed_image_topic'),
+        }],
+        output='screen',
+        condition=native_condition)
+
+    # Fallback path: camera_node publishes raw Image, then this node JPEG-encodes
+    # it. Leave available for debug, but native_mjpeg is much faster on hardware.
     compress = Node(
         package='dronetrack_pi', executable='camera_compressor_node',
         name='camera_compressor_node',
@@ -81,12 +107,12 @@ def generate_launch_description() -> LaunchDescription:
             'compressed_image_topic': LaunchConfiguration('compressed_image_topic'),
         }],
         output='screen',
-        condition=IfCondition(LaunchConfiguration('compress')))
+        condition=compress_condition)
 
     # ---- Reused safety-critical Pi nodes (from dronetrack_pi_ros) ---------
     reused = IfCondition(LaunchConfiguration('reused_pi_nodes'))
     camera = Node(package='drone_camera', executable='camera_node', name='camera_node',
-                  parameters=[params], output='screen', condition=reused)
+                  parameters=[params], output='screen', condition=opencv_condition)
     tracker = Node(package='drone_tracker', executable='tracker_node', name='tracker_node',
                    parameters=[params], output='screen', condition=reused)
     telemetry = Node(package='drone_telemetry', executable='telemetry_node', name='telemetry_node',
@@ -111,12 +137,13 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         params_file_arg, raw_image_topic_arg, compressed_image_topic_arg,
-        connection_url_arg, allow_mavsdk_actions_arg, reused_pi_nodes_arg, compress_arg,
+        connection_url_arg, allow_mavsdk_actions_arg, reused_pi_nodes_arg, compress_arg, native_mjpeg_arg,
         LogInfo(msg='=== DRONETRACK PI (on-drone) — safety-critical stack ==='),
         LogInfo(msg='YOLO + dashboard run on the LAPTOP ground station.'),
         LogInfo(msg=['Streaming compressed camera on ', LaunchConfiguration('compressed_image_topic')]),
         detection_gate,
         watchdog,
+        native_camera,
         compress,
         camera,
         tracker,

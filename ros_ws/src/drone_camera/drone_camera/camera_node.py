@@ -23,7 +23,8 @@ class CameraNode(Node):
         self.camera_index = self._get_int_param("camera_index", 0, aliases=("device_id",))
         self.frame_width = self._get_int_param("frame_width", 640, aliases=("width",))
         self.frame_height = self._get_int_param("frame_height", 480, aliases=("height",))
-        self.fps = self._get_int_param("fps", 30, aliases=("frame_rate",))
+        self.fps = self._get_int_param("fps", 60, aliases=("frame_rate",))
+        self.fourcc = self._get_str_param("fourcc", "MJPG").strip().upper()
         self.frame_id = self._get_str_param("frame_id", "camera_optical_frame")
         self.image_topic = self._get_str_param("image_topic", "/drone/camera/image_raw")
         self.camera_backend = self._get_str_param("camera_backend", "v4l2").strip().lower()
@@ -68,6 +69,9 @@ class CameraNode(Node):
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera index {self.camera_index}")
 
+        if len(self.fourcc) == 4:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
+
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.frame_width))
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.frame_height))
         self.cap.set(cv2.CAP_PROP_FPS, int(self.fps))
@@ -78,6 +82,8 @@ class CameraNode(Node):
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        fourcc_raw = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        actual_fourcc = "".join([chr((fourcc_raw >> 8 * i) & 0xFF) for i in range(4)])
 
         self.publisher = self.create_publisher(
             Image,
@@ -100,8 +106,8 @@ class CameraNode(Node):
         self.get_logger().info(
             f"Camera node started | topic={self.image_topic}, "
             f"index={self.camera_index}, "
-            f"requested={self.frame_width}x{self.frame_height}@{self.fps}, "
-            f"actual={actual_w}x{actual_h}@{actual_fps:.1f}, "
+            f"requested={self.frame_width}x{self.frame_height}@{self.fps} {self.fourcc}, "
+            f"actual={actual_w}x{actual_h}@{actual_fps:.1f} {actual_fourcc}, "
             f"backend={self.camera_backend}, "
             f"buffer_size={self.buffer_size}"
         )

@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node = drone_camera.camera_node:main',
+            'native_mjpeg_camera_node = drone_camera.native_mjpeg_camera_node:main',
         ],
     },
 )

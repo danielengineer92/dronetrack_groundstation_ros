@@ -43,6 +43,19 @@ ground_station_watchdog_node:
     deassert_on_link_loss: true     # publish autonomy/offboard request=false on link loss
     request_hold_on_link_loss: false  # also request MAVSDK HOLD (needs allow_mavsdk_actions on Pi)
 
+native_mjpeg_camera_node:
+  ros__parameters:
+    compressed_image_topic: "/drone/camera/image_raw/compressed"
+    frame_id: "camera_optical_frame"
+    camera_device: "/dev/video0"
+    camera_index: 0
+    frame_width: 640
+    frame_height: 480
+    fps: 60.0
+    fourcc: "MJPG"
+    buffer_count: 4
+    report_period_s: 5.0
+
 camera_compressor_node:
   ros__parameters:
     image_topic: "/drone/camera/image_raw"
@@ -59,8 +72,9 @@ camera_node:
     camera_index: 0
     frame_width: 640
     frame_height: 480
-    fps: 30.0
+    fps: 60.0
     camera_backend: "v4l2"
+    fourcc: "MJPG"
 
 tracker_node:
   ros__parameters:
@@ -197,7 +211,8 @@ control_node:
 
 health_monitor_node:
   ros__parameters:
-    image_topic: "/drone/camera/image_raw"
+    image_topic: "/drone/camera/image_raw/compressed"
+    image_is_compressed: true
     detections_topic: "/drone/vision/detections"
     target_error_topic: "/drone/tracking/target_error"
     telemetry_topic: "/drone/telemetry"
