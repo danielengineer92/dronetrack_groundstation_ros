@@ -14,6 +14,7 @@ endpoint. Differences for the split architecture:
 Endpoints:
     GET  /                 dashboard HTML
     GET  /api/status       latest status JSON
+    GET  /api/missions     local mission plan previews (display only)
     GET  /stream.mjpg      live camera stream with YOLO detection overlays
     POST /api/mission_request   {"enabled": true|false}
     POST /api/autonomy_request  {"enabled": true|false}
@@ -43,8 +44,9 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
-from drone_interfaces.msg import DetectionArray, DroneTelemetry, MavsdkActionCommand
+from drone_interfaces.msg import DetectionArray, DroneTelemetry, MavsdkActionCommand, MissionCommand
 from dronetrack_msgs.msg import GroundStationHeartbeat, LinkStatus
+from dronetrack_web_bridge.mission_preview import load_mission_catalog
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -57,8 +59,8 @@ DASHBOARD_HTML = """<!doctype html>
   .wrap { max-width: 1240px; margin: 0 auto; padding: 20px; }
   h1 { font-size: 22px; margin:0; }
   .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap:14px; }
-  .card { background:#0a1528; border:1px solid rgba(100,160,220,.18); border-radius:14px; padding:14px; }
-  .camera { margin-top:14px; background:#071326; border:1px solid rgba(100,160,220,.2); border-radius:14px; overflow:hidden; }
+  .card { background:#0a1528; border:1px solid rgba(100,160,220,.18); border-radius:8px; padding:14px; }
+  .camera, .planner { margin-top:14px; background:#071326; border:1px solid rgba(100,160,220,.2); border-radius:8px; overflow:hidden; }
   .camera-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-end; padding:14px; }
   .camera-title { font-size:20px; font-weight:800; margin-top:3px; }
   .frame { background:#02060c; aspect-ratio:16/9; display:grid; place-items:center; }
@@ -70,9 +72,19 @@ DASHBOARD_HTML = """<!doctype html>
   .v { font-size:24px; font-weight:800; margin-top:4px; }
   .ok { color:#50fa7b; } .warn { color:#ffcc66; } .bad { color:#ff5f75; }
   .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
-  button { font:inherit; font-weight:700; border:0; border-radius:10px; padding:12px 16px; cursor:pointer; }
+  button { font:inherit; font-weight:700; border:0; border-radius:8px; padding:12px 16px; cursor:pointer; }
   .start { background:#1f6feb; color:#fff; } .ready { background:#236; color:#cfe; }
   .hold { background:#7a5; color:#012; } .land { background:#ff5f75; color:#210; }
+  select { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; min-width:230px; }
+  .planner-head { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:14px; align-items:flex-end; }
+  .plan-body { display:grid; grid-template-columns:minmax(220px,320px) 1fr; gap:14px; padding:0 14px 14px; }
+  .plan-meta { color:#cfe6ff; word-break:break-word; }
+  .steps { display:grid; gap:8px; }
+  .step { display:grid; grid-template-columns:34px minmax(0,1fr); gap:10px; align-items:start; padding:9px; background:#09182d; border:1px solid rgba(100,160,220,.14); border-radius:8px; }
+  .step-num { color:#83a3bd; font-weight:800; }
+  .step-type { font-weight:800; }
+  .warnings { color:#ffcc66; margin-top:10px; display:grid; gap:4px; }
+  @media (max-width: 760px) { .plan-body { grid-template-columns:1fr; } }
   small { color:#83a3bd; }
 </style></head>
 <body><div class="wrap">
@@ -95,7 +107,24 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="k">Battery</div><div class="v" id="batt">--</div></div>
     <div class="card"><div class="k">Rel. Altitude</div><div class="v" id="alt">--</div></div>
     <div class="card"><div class="k">Armed</div><div class="v" id="armed">--</div></div>
+    <div class="card"><div class="k">Mission</div><div class="v" id="mission">--</div><small id="mission_detail"></small></div>
+    <div class="card"><div class="k">Step</div><div class="v" id="mission_step">--</div><small id="mission_step_detail"></small></div>
+    <div class="card"><div class="k">Autonomy</div><div class="v" id="autonomy">--</div><small id="autonomy_detail"></small></div>
   </div>
+  <section class="planner">
+    <div class="planner-head">
+      <div><div class="k">Mission Plans</div><div class="camera-title">Preview</div></div>
+      <select id="mission_select" onchange="renderMissionPreview()"></select>
+    </div>
+    <div class="plan-body">
+      <div>
+        <div class="k">Selected</div>
+        <div class="plan-meta" id="plan_meta">No mission plans found</div>
+        <div class="warnings" id="plan_warnings"></div>
+      </div>
+      <div class="steps" id="plan_steps"></div>
+    </div>
+  </section>
   <div class="row">
     <button class="ready" onclick="post('autonomy_request',{enabled:true})">System Ready</button>
     <button class="start" onclick="post('mission_request',{enabled:true})">Start Mission</button>
@@ -107,6 +136,18 @@ DASHBOARD_HTML = """<!doctype html>
 </div>
 <script>
 function cls(el,c){el.className='v '+c;}
+let missionCatalog = [];
+function finite(n){ return typeof n === 'number' && Number.isFinite(n); }
+function missionMain(text){
+  const s = (text || '').trim();
+  const idx = s.indexOf(':');
+  return idx >= 0 ? s.slice(0, idx).trim() : s;
+}
+function missionDetail(text){
+  const s = (text || '').trim();
+  const idx = s.indexOf(':');
+  return idx >= 0 ? s.slice(idx + 1).trim() : '';
+}
 async function tick(){
   try{
     const r = await fetch('/api/status'); const s = await r.json();
@@ -114,7 +155,7 @@ async function tick(){
     link.textContent = s.link_ok ? 'UP' : 'DOWN'; cls(link, s.link_ok?'ok':'bad');
     document.getElementById('link_reason').textContent = s.link_reason || '';
     document.getElementById('latency').textContent =
-      (s.latency_s>=0 && s.latency_s===s.latency_s) ? (s.latency_s*1000).toFixed(0)+' ms' : '--';
+      (finite(s.latency_s) && s.latency_s>=0) ? (s.latency_s*1000).toFixed(0)+' ms' : '--';
     document.getElementById('fps').textContent = s.perception_fps>=0 ? s.perception_fps.toFixed(1) : '--';
     document.getElementById('det').textContent = s.detection_count;
     document.getElementById('conf').textContent = s.max_confidence>0 ? ('max conf '+s.max_confidence.toFixed(2)) : '';
@@ -132,14 +173,74 @@ async function tick(){
     document.getElementById('alt').textContent = s.rel_altitude_m.toFixed(1)+' m';
     const armed = document.getElementById('armed');
     armed.textContent = s.armed ? 'ARMED' : 'disarmed'; cls(armed, s.armed?'warn':'ok');
+    const mission = document.getElementById('mission');
+    const rawMission = s.mission_state || (s.mission_requested ? 'REQUESTED' : 'IDLE');
+    const ms = missionMain(rawMission);
+    mission.textContent = ms; cls(mission, ms==='IDLE'||ms==='COMPLETE'||ms==='DISABLED'?'ok':ms==='ABORTED'?'bad':'warn');
+    document.getElementById('mission_detail').textContent = missionDetail(rawMission) || (s.mission_requested?'operator requested':'');
+    const step = document.getElementById('mission_step');
+    const stepName = s.mission_step_name || '--';
+    step.textContent = stepName; cls(step, stepName==='--'?'ok':'warn');
+    document.getElementById('mission_step_detail').textContent =
+      s.mission_command_mode ? (s.mission_command_mode + ' | ' + (s.mission_command_status || '')) : '';
+    const auton = document.getElementById('autonomy');
+    const ae = s.autonomy_effective || (s.autonomy_requested ? 'REQUESTED' : 'OFF');
+    auton.textContent = ae; cls(auton, ae==='OFF'||ae==='DISABLED'?'ok':ae==='ENABLED'||ae==='READY'?'warn':'ok');
+    document.getElementById('autonomy_detail').textContent = s.autonomy_requested?'operator requested':'';
     document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
   }catch(e){ document.getElementById('updated').textContent='status fetch failed'; }
+}
+async function loadMissions(){
+  try{
+    const r = await fetch('/api/missions'); const data = await r.json();
+    missionCatalog = data.missions || [];
+    const sel = document.getElementById('mission_select');
+    sel.innerHTML = '';
+    missionCatalog.forEach((m, i) => {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = (m.valid ? '' : '! ') + (m.name || m.filename);
+      sel.appendChild(opt);
+    });
+    renderMissionPreview();
+  }catch(e){
+    document.getElementById('plan_meta').textContent = 'Mission preview unavailable';
+  }
+}
+function renderMissionPreview(){
+  const sel = document.getElementById('mission_select');
+  const m = missionCatalog[Number(sel.value || 0)];
+  const meta = document.getElementById('plan_meta');
+  const warnings = document.getElementById('plan_warnings');
+  const steps = document.getElementById('plan_steps');
+  warnings.innerHTML = ''; steps.innerHTML = '';
+  if(!m){
+    meta.textContent = 'No mission plans found';
+    return;
+  }
+  meta.textContent = m.valid
+    ? ((m.path || m.filename) + ' | ' + (m.pi_param_hint || 'set mission_plan_file on the Pi before Start Mission'))
+    : ((m.path || m.filename) + ' | ' + (m.error || 'invalid mission'));
+  (m.warnings || []).forEach(w => {
+    const div = document.createElement('small');
+    div.textContent = w;
+    warnings.appendChild(div);
+  });
+  (m.steps || []).forEach(st => {
+    const item = document.createElement('div'); item.className = 'step';
+    const num = document.createElement('div'); num.className = 'step-num'; num.textContent = String((st.index || 0) + 1);
+    const body = document.createElement('div');
+    const typ = document.createElement('div'); typ.className = 'step-type'; typ.textContent = st.type || '';
+    const label = document.createElement('small'); label.textContent = st.label || '';
+    body.appendChild(typ); body.appendChild(label);
+    item.appendChild(num); item.appendChild(body); steps.appendChild(item);
+  });
 }
 async function post(path, body){
   await fetch('/api/'+path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   tick();
 }
-setInterval(tick, 500); tick();
+setInterval(tick, 500); tick(); loadMissions();
 </script>
 </body></html>"""
 
@@ -173,9 +274,17 @@ class WebDashboardNode(Node):
         self.declare_parameter("autonomy_request_topic", "/drone/autonomy/request")
         self.declare_parameter("offboard_request_topic", "/drone/mavsdk/offboard_request")
         self.declare_parameter("mavsdk_action_topic", "/drone/mavsdk/action_command")
+        self.declare_parameter("mission_state_topic", "/drone/mission/state")
+        self.declare_parameter("mission_command_topic", "/drone/mission/command")
+        self.declare_parameter("autonomy_state_topic", "/drone/autonomy/state")
+        self.declare_parameter("mission_catalog_paths", "")
 
         self.host = str(self.get_parameter("host").value)
         self.port = int(self.get_parameter("port").value)
+        self.mission_catalog = load_mission_catalog(
+            self.get_parameter("mission_catalog_paths").value,
+            module_file=__file__,
+        )
 
         self._lock = threading.Lock()
         self._state = {
@@ -184,6 +293,10 @@ class WebDashboardNode(Node):
             "px4_connected": False, "flight_mode": "", "battery_percent": -1.0,
             "rel_altitude_m": 0.0, "armed": False, "camera_frame_age_s": -1.0,
             "target_summary": "", "overlay_available": cv2 is not None and np is not None,
+            "autonomy_requested": False, "mission_requested": False,
+            "autonomy_effective": "", "mission_state": "",
+            "mission_command_mode": "", "mission_step_index": -1,
+            "mission_step_name": "", "mission_command_status": "",
         }
         self._latest_jpeg: bytes | None = None
         self._latest_frame_time = 0.0
@@ -207,6 +320,12 @@ class WebDashboardNode(Node):
                                  self._on_camera, lossy)
         self.create_subscription(DroneTelemetry, str(self.get_parameter("telemetry_topic").value),
                                  self._on_telemetry, lossy)
+        self.create_subscription(String, str(self.get_parameter("mission_state_topic").value),
+                                 self._on_mission_state, reliable)
+        self.create_subscription(MissionCommand, str(self.get_parameter("mission_command_topic").value),
+                                 self._on_mission_command, reliable)
+        self.create_subscription(String, str(self.get_parameter("autonomy_state_topic").value),
+                                 self._on_autonomy_state, reliable)
 
         self.mission_pub = self.create_publisher(Bool, str(self.get_parameter("mission_request_topic").value), reliable)
         self.autonomy_pub = self.create_publisher(Bool, str(self.get_parameter("autonomy_request_topic").value), reliable)
@@ -214,7 +333,10 @@ class WebDashboardNode(Node):
         self.action_pub = self.create_publisher(MavsdkActionCommand, str(self.get_parameter("mavsdk_action_topic").value), reliable)
 
         self._start_server()
-        self.get_logger().info(f"Dashboard serving on http://{self.host}:{self.port}/")
+        self.get_logger().info(
+            f"Dashboard serving on http://{self.host}:{self.port}/ | "
+            f"mission previews={len(self.mission_catalog)}"
+        )
 
     # ---- subscriptions ---------------------------------------------------
     def _on_link(self, msg: LinkStatus) -> None:
@@ -266,12 +388,31 @@ class WebDashboardNode(Node):
             self._state["rel_altitude_m"] = float(msg.relative_altitude)
             self._state["armed"] = bool(msg.armed)
 
+    def _on_mission_state(self, msg: String) -> None:
+        with self._lock:
+            self._state["mission_state"] = msg.data
+
+    def _on_mission_command(self, msg: MissionCommand) -> None:
+        with self._lock:
+            self._state["mission_command_mode"] = str(msg.mode)
+            self._state["mission_step_index"] = int(msg.step_index)
+            self._state["mission_step_name"] = str(msg.step_name)
+            self._state["mission_command_status"] = str(msg.status)
+
+    def _on_autonomy_state(self, msg: String) -> None:
+        with self._lock:
+            self._state["autonomy_effective"] = msg.data
+
     # ---- operator actions ------------------------------------------------
     def publish_mission_request(self, enabled: bool) -> None:
         self.mission_pub.publish(Bool(data=enabled))
+        with self._lock:
+            self._state["mission_requested"] = enabled
 
     def publish_autonomy_request(self, enabled: bool) -> None:
         self.autonomy_pub.publish(Bool(data=enabled))
+        with self._lock:
+            self._state["autonomy_requested"] = enabled
 
     def _send_action(self, action: str, note: str) -> None:
         # Called from HTTP handler threads; guard the counter so concurrent
@@ -288,16 +429,21 @@ class WebDashboardNode(Node):
         self.action_pub.publish(cmd)
 
     def abort_hold(self) -> None:
-        # De-assert requests, then ask the Pi-owned action gate for HOLD.
         self.autonomy_pub.publish(Bool(data=False))
         self.offboard_pub.publish(Bool(data=False))
         self.mission_pub.publish(Bool(data=False))
+        with self._lock:
+            self._state["autonomy_requested"] = False
+            self._state["mission_requested"] = False
         self._send_action("HOLD", "dashboard abort/hold")
 
     def land(self) -> None:
         self.autonomy_pub.publish(Bool(data=False))
         self.offboard_pub.publish(Bool(data=False))
         self.mission_pub.publish(Bool(data=False))
+        with self._lock:
+            self._state["autonomy_requested"] = False
+            self._state["mission_requested"] = False
         self._send_action("LAND", "dashboard land")
 
     # ---- http server -----------------------------------------------------
@@ -313,6 +459,16 @@ class WebDashboardNode(Node):
         return {
             k: (None if isinstance(v, float) and not math.isfinite(v) else v)
             for k, v in snap.items()
+        }
+
+    def mission_catalog_snapshot(self) -> dict:
+        return {
+            "mode": "preview_only",
+            "trust_boundary": (
+                "Mission selection stays on the Pi: set mission_executor_node.mission_plan_file "
+                "there before starting a mission. The dashboard only previews local YAML."
+            ),
+            "missions": self.mission_catalog,
         }
 
     def _latest_stream_frame(self) -> bytes | None:
@@ -421,6 +577,8 @@ class WebDashboardNode(Node):
                     node.stream_mjpeg(self)
                 elif self.path == "/api/status":
                     self._send(200, json.dumps(node.snapshot()).encode("utf-8"))
+                elif self.path == "/api/missions":
+                    self._send(200, json.dumps(node.mission_catalog_snapshot()).encode("utf-8"))
                 else:
                     self._send(404, b'{"error":"not found"}')
 

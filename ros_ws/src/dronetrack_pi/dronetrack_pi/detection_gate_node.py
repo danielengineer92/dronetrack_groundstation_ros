@@ -87,6 +87,10 @@ class DetectionGateNode(Node):
         self._dropped_no_link = 0
         self._dropped_detections = 0
 
+        # Edge-triggered drop reasons: log once on transition, not every message
+        self._dropping_no_link = False
+        self._dropping_stale = False
+
         # The laptop link is lossy Wi-Fi: BEST_EFFORT inbound so we never block on
         # a missing subscriber and always act on the freshest frame.
         inbound_qos = QoSProfile(
@@ -171,30 +175,34 @@ class DetectionGateNode(Node):
         # 2) Link must be alive.
         if not self._heartbeat_fresh():
             self._dropped_no_link += 1
-            self.get_logger().warning(
-                "Dropping detections: ground-station heartbeat stale/absent.",
-                throttle_duration_sec=2.0,
-            )
+            if not self._dropping_no_link:
+                self._dropping_no_link = True
+                self.get_logger().warning("Dropping detections: ground-station heartbeat stale/absent.")
             return
+        if self._dropping_no_link:
+            self._dropping_no_link = False
+            self.get_logger().info("Heartbeat recovered; accepting detections again.")
 
         # 3) Stamp freshness + monotonicity.
         stamp_s = self._stamp_to_s(msg.stamp)
         age = ros_now - stamp_s
         if age > self.max_detection_age_s:
             self._dropped_stale += 1
-            self.get_logger().warning(
-                f"Dropping stale detections: age={age:.3f}s > {self.max_detection_age_s}s",
-                throttle_duration_sec=2.0,
-            )
+            if not self._dropping_stale:
+                self._dropping_stale = True
+                self.get_logger().warning(
+                    f"Dropping stale detections: age={age:.3f}s > {self.max_detection_age_s}s")
             return
         if age < -self.clock_skew_tolerance_s:
-            # Stamp is too far in the future -> bad clock or spoofed frame.
             self._dropped_stale += 1
-            self.get_logger().warning(
-                f"Dropping future-stamped detections: age={age:.3f}s (check clock sync)",
-                throttle_duration_sec=2.0,
-            )
+            if not self._dropping_stale:
+                self._dropping_stale = True
+                self.get_logger().warning(
+                    f"Dropping future-stamped detections: age={age:.3f}s (check clock sync)")
             return
+        if self._dropping_stale:
+            self._dropping_stale = False
+            self.get_logger().info("Detection timestamps recovered; accepting again.")
         if self._last_passed_stamp is not None and stamp_s <= self._last_passed_stamp:
             self._dropped_order += 1
             return

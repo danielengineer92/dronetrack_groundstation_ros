@@ -2,9 +2,9 @@
 Declarative mission plan model and loader for the mission executor.
 
 A mission plan is an ordered list of step "verbs" (takeoff, prime_offboard,
-track_center, approach, orbit, rtl, land, hold). The mission executor walks the
-plan instead of a hardcoded state chain, so a flight script can be reordered or
-swapped between runs by editing/selecting a YAML file instead of editing code.
+scan, track_center, approach, orbit, rtl, land, hold). The mission executor walks
+the plan instead of a hardcoded state chain, so a flight script can be reordered
+or swapped between runs by editing/selecting a YAML file instead of editing code.
 
 This module is intentionally free of any rclpy/ROS imports so it can be unit
 tested with plain Python and validated offline.
@@ -26,6 +26,7 @@ Per-step params override the executor's existing parameter defaults
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,7 @@ from typing import Optional
 STEP_TYPE_TO_STATE: dict[str, str] = {
     "takeoff": "TAKEOFF",
     "prime_offboard": "PRIME_OFFBOARD",
+    "scan": "SCAN",
     "track_center": "TRACK_CENTER",
     "approach": "APPROACH_TARGET",
     "orbit": "DO_ORBIT",
@@ -55,10 +57,22 @@ VALID_UNTIL: frozenset[str] = frozenset(
 )
 
 # Step verbs that command vehicle motion / Offboard. Used only for lint warnings:
-# these should normally come after a prime_offboard step.
+# these should normally come after a prime_offboard step. `scan` yaw-sweeps in
+# Offboard (position-held), so it belongs here too.
 MOTION_STEP_TYPES: frozenset[str] = frozenset(
-    {"track_center", "approach", "orbit"}
+    {"scan", "track_center", "approach", "orbit"}
 )
+
+# Verbs that run open-loop or search for a bounded time. A plan author should give
+# each one a timeout so a lost/never-seen target cannot wedge the mission forever.
+# (track_center is deliberately excluded: until=none + no timeout is its supported
+# "hold and yaw-track indefinitely" mode.)
+TIMEOUT_RECOMMENDED_STEP_TYPES: frozenset[str] = frozenset(
+    {"scan", "approach", "orbit"}
+)
+
+# Allowed sweep directions for a `scan` step (counter-clockwise / clockwise yaw).
+VALID_SCAN_DIRECTIONS: frozenset[str] = frozenset({"ccw", "cw"})
 
 
 @dataclass
@@ -85,6 +99,11 @@ class MissionStep:
     def get_float(self, key: str, default: float) -> float:
         value = self.params.get(key)
         return float(default) if value is None else float(value)
+
+    @property
+    def scan_direction(self) -> str:
+        """Sweep direction for a scan step ('ccw' or 'cw'); defaults to 'ccw'."""
+        return str(self.params.get("direction", "ccw")).lower()
 
 
 @dataclass
@@ -177,11 +196,43 @@ def _parse_step(raw: object, index: int, mission_name: str) -> MissionStep:
 
     if "timeout_s" in params:
         try:
-            float(params["timeout_s"])
+            timeout_val = float(params["timeout_s"])
         except (TypeError, ValueError):
             raise MissionPlanError(f"{where} timeout_s must be a number, got {params['timeout_s']!r}")
+        if timeout_val < 0.0:
+            raise MissionPlanError(f"{where} timeout_s must be >= 0, got {timeout_val}")
+
+    if step_type == "scan":
+        _validate_scan_params(params, where)
 
     return MissionStep(step_type, params)
+
+
+def _validate_scan_params(params: dict, where: str) -> None:
+    """Validate the scan-specific keys: direction, yaw_deg, yaw_rate_deg_s.
+
+    These describe a bounded yaw sweep (hold position, rotate up to yaw_deg at
+    yaw_rate_deg_s). Bad values are rejected at load time so a malformed scan can
+    never be dispatched to the vehicle.
+    """
+    direction = str(params.get("direction", "ccw")).lower()
+    if direction not in VALID_SCAN_DIRECTIONS:
+        valid = ", ".join(sorted(VALID_SCAN_DIRECTIONS))
+        raise MissionPlanError(
+            f"{where} (type 'scan') has unknown direction '{params.get('direction')}'. Valid: {valid}"
+        )
+
+    for key, must_be_positive in (("yaw_deg", True), ("yaw_rate_deg_s", True)):
+        if key not in params:
+            continue
+        try:
+            value = float(params[key])
+        except (TypeError, ValueError):
+            raise MissionPlanError(f"{where} (type 'scan') {key} must be a number, got {params[key]!r}")
+        if not math.isfinite(value):
+            raise MissionPlanError(f"{where} (type 'scan') {key} must be finite, got {value}")
+        if must_be_positive and value <= 0.0:
+            raise MissionPlanError(f"{where} (type 'scan') {key} must be > 0, got {value}")
 
 
 def lint_plan(plan: MissionPlan) -> list[str]:
@@ -192,14 +243,40 @@ def lint_plan(plan: MissionPlan) -> list[str]:
     """
     warnings: list[str] = []
     primed = False
+    has_motion = False
+    has_prime = any(s.type == "prime_offboard" for s in plan.steps)
     for index, step in enumerate(plan.steps):
         if step.type == "prime_offboard":
             primed = True
-        elif step.type in MOTION_STEP_TYPES and not primed:
+        elif step.type in MOTION_STEP_TYPES:
+            has_motion = True
+            if not primed:
+                warnings.append(
+                    f"step {index} '{step.type}' runs before any 'prime_offboard'; "
+                    "Offboard may not be active yet"
+                )
+
+        # Bounded/search steps should carry a timeout so a lost or never-seen
+        # target cannot wedge the mission forever.
+        if step.type in TIMEOUT_RECOMMENDED_STEP_TYPES and step.timeout_s is None:
             warnings.append(
-                f"step {index} '{step.type}' runs before any 'prime_offboard'; "
-                "Offboard may not be active yet"
+                f"step {index} '{step.type}' has no timeout_s; add one so the step "
+                "cannot run indefinitely if its exit condition is never met"
             )
+
+        # A scan that never auto-advances and has no timeout would sweep forever.
+        if step.type == "scan" and step.until in (None, "none") and step.timeout_s is None:
+            warnings.append(
+                f"step {index} 'scan' has neither 'until' nor 'timeout_s'; "
+                "it should exit on 'until: locked' and/or a timeout_s"
+            )
+
+    if has_motion and not has_prime:
+        warnings.append(
+            "plan contains motion steps but no 'prime_offboard' step; "
+            "Offboard is never primed"
+        )
+
     return warnings
 
 

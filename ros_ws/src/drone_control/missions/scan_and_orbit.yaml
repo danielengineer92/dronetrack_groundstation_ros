@@ -1,0 +1,36 @@
+# Scan-find-approach-orbit mission.
+#
+# Take off, prime PX4 Offboard, yaw-sweep counter-clockwise to find the target,
+# center on it, approach to 2 m, orbit it once, return to launch, and land.
+#
+# This is the "professional" full-sequence example. It does NOT bypass any Pi
+# safety gate; the same requirements as orbit_red_ball.yaml apply:
+#   - allow_mavsdk_actions:=true        (TAKEOFF / DO_ORBIT / RTL / LAND are real actions)
+#   - GPS / valid global position       (orbit center + RTL are global)
+#   - a valid distance estimate          (distance_valid from the tracker)
+#
+# Approach translation is additionally gated by, and OFF unless you set, BOTH:
+#   control_node.enable_approach_translation:=true   AND
+#   telemetry_node.allow_translation_commands:=true
+# With the defaults, the approach step holds position and yaw-centers (safe) and
+# the orbit step is what closes/circles via PX4 DO_ORBIT.
+#
+# Step verbs: takeoff, prime_offboard, scan, track_center, approach, orbit, rtl,
+# land, hold. scan keys: direction (ccw|cw), yaw_deg, yaw_rate_deg_s, until
+# (locked|none), timeout_s. approach key: distance_m. Anything omitted falls back
+# to the node's parameters.
+mission:
+  name: scan_and_orbit
+  steps:
+    - {type: takeoff, altitude_m: 3.0}
+    - {type: prime_offboard, hold_s: 1.5}
+    # Sweep CCW up to 180 deg; bail out early the moment the target locks, and
+    # never sweep longer than 12 s even if nothing is found.
+    - {type: scan, direction: ccw, yaw_deg: 180, yaw_rate_deg_s: 20, until: locked, timeout_s: 12}
+    # Center on whatever the scan found before moving.
+    - {type: track_center, until: centered, timeout_s: 15}
+    # Close to 2 m (holds + centers unless approach translation is enabled).
+    - {type: approach, distance_m: 2.0, until: approach_done, timeout_s: 20}
+    - {type: orbit, radius_m: 2.0, speed_m_s: 0.4, revolutions: 1, timeout_s: 45}
+    - {type: rtl, timeout_s: 15}
+    - {type: land}

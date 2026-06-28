@@ -146,6 +146,12 @@ autonomy_manager_node:
     telemetry_timeout: 2.0
     request_timeout: 0.0
     enable_offboard_when_ready: true
+    # Opt-in (default OFF): allow pre-lock, yaw-only autonomy during a SCAN step so
+    # the drone can yaw-sweep to search. Movement stays yaw-only (control_node holds
+    # position in SCAN mode). Leave false on hardware unless you want search sweeps.
+    allow_scan_without_lock: false
+    mission_command_topic: "/drone/mission/command"
+    mission_command_timeout: 1.0
     require_connected: true
     require_armed: true
     require_health_all_ok: false
@@ -175,6 +181,10 @@ mission_executor_node:
     offboard_prime_time_s: 1.5
     track_center_timeout_s: 0.0
     run_full_orbit_after_track_center: false
+    # Scan-for-target defaults (overridable per scan step in the mission YAML).
+    scan_yaw_deg: 180.0
+    scan_yaw_rate_deg_s: 20.0
+    scan_timeout_s: 12.0
     mission_plan_file: ""
     event_log_enabled: true
     event_log_directory: "~/drone_mission_logs"
@@ -208,6 +218,10 @@ control_node:
     target_timeout: 1.0
     mission_command_timeout: 1.0
     telemetry_timeout: 2.0
+    # APPROACH translation stays OFF by default. Even if set true, the resulting
+    # VELOCITY command is still gated by telemetry_node.allow_translation_commands.
+    enable_approach_translation: false
+    approach_distance_deadband_m: 0.15
 
 health_monitor_node:
   ros__parameters:

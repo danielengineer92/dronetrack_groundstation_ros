@@ -19,7 +19,7 @@ source "${HERE}/_common.sh"
 : "${INSTALL_DIR:=$HOME/dronetrack_gs/install}"
 export INSTALL_DIR
 
-GS_DEFAULTS=(model_path:=yolo26s.pt device:=cuda:0 half_precision:=True max_fps:=30.0)
+GS_DEFAULTS=(model_path:=red_ball_yolo26s.pt target_class:=red_ball device:=cuda:0 half_precision:=True max_fps:=60.0)
 GS_ARGS=("$@"); [ "${#GS_ARGS[@]}" -gt 0 ] || GS_ARGS=("${GS_DEFAULTS[@]}")
 
 echo "==> [1/5] Discovering laptop + Pi IPs (subnet-agnostic) ..."

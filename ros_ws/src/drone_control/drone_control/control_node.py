@@ -31,6 +31,7 @@ from std_msgs.msg import Bool
 
 from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
+from drone_control.control_math import approach_forward_velocity
 
 
 CMD_IDLE = "IDLE"
@@ -110,6 +111,14 @@ class ControlNode(Node):
         self.declare_parameter("target_area_goal", 0.08)
         self.declare_parameter("orbit_speed_m_s", 0.30)
 
+        # APPROACH translation is opt-in and OFF by default. Even when true, the
+        # resulting VELOCITY command is still gated downstream by
+        # telemetry_node.allow_translation_commands (also false by default), so
+        # enabling this alone does not move the vehicle. When false, APPROACH_TARGET
+        # behaves exactly like TRACK_CENTER (position-hold + yaw only).
+        self.declare_parameter("enable_approach_translation", False)
+        self.declare_parameter("approach_distance_deadband_m", 0.15)
+
         autonomy_param = bool(self.get_parameter("autonomy_enabled").value)
         legacy_autonomous_param = bool(self.get_parameter("autonomous_enabled").value)
         self.autonomy_enabled = autonomy_param or legacy_autonomous_param
@@ -150,6 +159,8 @@ class ControlNode(Node):
         self.distance_gain_forward = float(self.get_parameter("distance_gain_forward").value)
         self.target_area_goal = float(self.get_parameter("target_area_goal").value)
         self.orbit_speed_m_s = float(self.get_parameter("orbit_speed_m_s").value)
+        self.enable_approach_translation = bool(self.get_parameter("enable_approach_translation").value)
+        self.approach_distance_deadband_m = float(self.get_parameter("approach_distance_deadband_m").value)
 
         self.validate_parameters()
         self.control_period = 1.0 / self.control_rate
@@ -698,6 +709,56 @@ class ControlNode(Node):
             ),
         )
 
+    def publish_velocity(
+        self,
+        status: str,
+        velocity_forward: float = 0.0,
+        velocity_right: float = 0.0,
+        velocity_down: float = 0.0,
+        yaw_rate: float = 0.0,
+        source_error_x: float = 0.0,
+        source_error_y: float = 0.0,
+    ) -> None:
+        # Body-frame VELOCITY setpoint. Only reached for opt-in APPROACH
+        # translation; translation is still gated downstream by
+        # telemetry_node.allow_translation_commands. Local position must be valid
+        # so we fail safe (PX4 holds) if the EKF/GPS drops out mid-approach.
+        if not self.local_position_ready():
+            self.reset_position_hold_anchor()
+            self.publish_idle(STATUS_BLOCKED_NO_LOCAL_POSITION)
+            return
+
+        down = self.clamp_descent_to_altitude_floor(float(velocity_down))
+        command = self.make_command(
+            CMD_VELOCITY,
+            status,
+            executed=True,
+            velocity_forward=float(velocity_forward),
+            velocity_right=float(velocity_right),
+            velocity_down=down,
+            yaw_rate=float(yaw_rate),
+            position_valid=False,
+            source_error_x=source_error_x,
+            source_error_y=source_error_y,
+        )
+
+        self.last_command_forward = float(velocity_forward)
+        self.last_command_right = float(velocity_right)
+        self.last_command_down = down
+        self.last_command_yaw = float(yaw_rate)
+
+        self.command_pub.publish(command)
+        self.command_count += 1
+        self.executed_command_count += 1
+
+        self.diagnostics.mark_published(
+            self.control_command_topic,
+            summary=(
+                f"commands={self.command_count}, executed={self.executed_command_count}, "
+                f"type={CMD_VELOCITY}, fwd={velocity_forward:.3f}, yaw_rate={yaw_rate:.3f}, status={status}"
+            ),
+        )
+
     def publish_idle(
         self,
         status: str,
@@ -793,6 +854,17 @@ class ControlNode(Node):
             self.publish_position_hold("POSITION_HOLD_TRANSLATION_DISABLED_FOR_STAGE1", yaw_rate=0.0, update_yaw=False)
             return
 
+        if mission_mode == "SCAN":
+            # Open-loop yaw sweep: hold the captured local-NED anchor and rotate
+            # in place at the executor-commanded yaw rate. No target is required
+            # and no translation is ever commanded, so this stays inside the
+            # existing position-hold+yaw safety envelope. yaw_rate is clamped and
+            # rate-limited by limit_motion like any other yaw command.
+            commanded_yaw = float(mission.yaw_rate) if mission is not None else 0.0
+            _, _, _, yaw = self.limit_motion(0.0, 0.0, 0.0, commanded_yaw)
+            self.publish_position_hold("MISSION_SCAN", yaw_rate=yaw, update_yaw=True)
+            return
+
         if self.last_target_error is None:
             self.publish_position_hold(STATUS_NO_TARGET, yaw_rate=0.0, update_yaw=False)
             return
@@ -825,6 +897,32 @@ class ControlNode(Node):
                 source_error_x=float(target.error_x),
                 source_error_y=float(target.error_y),
                 update_yaw=False,
+            )
+            return
+
+        # Opt-in APPROACH translation (default OFF, double-gated): command forward
+        # velocity from the distance estimate while keeping the yaw centering.
+        # Disabled -> falls through to the position-hold+yaw behavior below.
+        if mission_mode == "APPROACH_TARGET" and self.enable_approach_translation:
+            desired_distance_m = (
+                float(mission.desired_distance_m) if mission is not None else self.desired_distance_m
+            )
+            forward_cmd = approach_forward_velocity(
+                distance_valid=bool(getattr(target, "distance_valid", False)),
+                distance_m=float(getattr(target, "distance_m", 0.0)),
+                desired_distance_m=desired_distance_m,
+                gain=self.distance_gain_forward,
+                max_speed=self.max_velocity_forward,
+                deadband_m=self.approach_distance_deadband_m,
+                target_locked=True,  # target is verified visible + LOCKED above
+            )
+            forward, _, _, yaw = self.limit_motion(forward_cmd, 0.0, 0.0, desired_yaw)
+            self.publish_velocity(
+                f"APPROACH_TRANSLATION(d={desired_distance_m:.2f}m)",
+                velocity_forward=forward,
+                yaw_rate=yaw,
+                source_error_x=float(target.error_x),
+                source_error_y=float(target.error_y),
             )
             return
 

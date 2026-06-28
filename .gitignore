@@ -33,3 +33,6 @@ __pycache__/
 *.backup*
 *.orig
 *~
+
+# Top-level colcon build logs (COLCON_IGNORE marker dir)
+/log/

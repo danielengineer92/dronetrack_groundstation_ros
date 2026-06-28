@@ -54,6 +54,7 @@ class MissionState(Enum):
     PREFLIGHT = "PREFLIGHT"
     TAKEOFF = "TAKEOFF"
     PRIME_OFFBOARD = "PRIME_OFFBOARD"
+    SCAN = "SCAN"
     TRACK_CENTER = "TRACK_CENTER"
     APPROACH_TARGET = "APPROACH_TARGET"
     DO_ORBIT = "DO_ORBIT"
@@ -67,11 +68,12 @@ STEP_NAMES = {
     MissionState.PREFLIGHT: "0_preflight",
     MissionState.TAKEOFF: "1_takeoff_if_needed",
     MissionState.PRIME_OFFBOARD: "2_prime_offboard",
-    MissionState.TRACK_CENTER: "3_track_center_yaw",
-    MissionState.APPROACH_TARGET: "4_approach_ball_later",
-    MissionState.DO_ORBIT: "5_orbit_ball_later",
-    MissionState.RETURN_TO_LAUNCH: "6_return_home_later",
-    MissionState.LAND: "7_land",
+    MissionState.SCAN: "3_scan_for_target",
+    MissionState.TRACK_CENTER: "4_track_center_yaw",
+    MissionState.APPROACH_TARGET: "5_approach_target",
+    MissionState.DO_ORBIT: "6_orbit_target",
+    MissionState.RETURN_TO_LAUNCH: "7_return_home",
+    MissionState.LAND: "8_land",
 }
 
 
@@ -101,6 +103,11 @@ class MissionExecutorNode(Node):
         self.declare_parameter("offboard_prime_time_s", 1.5)
         self.declare_parameter("track_center_timeout_s", 0.0)  # 0 = keep yaw tracking until stopped.
         self.declare_parameter("run_full_orbit_after_track_center", False)
+
+        # Scan-for-target defaults (used when a scan step omits the key).
+        self.declare_parameter("scan_yaw_deg", 180.0)
+        self.declare_parameter("scan_yaw_rate_deg_s", 20.0)
+        self.declare_parameter("scan_timeout_s", 12.0)
 
         # Optional external YAML mission plan. Empty = use the built-in default plan,
         # which reproduces the original hardcoded sequence (backward compatible).
@@ -145,6 +152,9 @@ class MissionExecutorNode(Node):
         self.offboard_prime_time_s = float(self.get_parameter("offboard_prime_time_s").value)
         self.track_center_timeout_s = float(self.get_parameter("track_center_timeout_s").value)
         self.run_full_orbit_after_track_center = bool(self.get_parameter("run_full_orbit_after_track_center").value)
+        self.scan_yaw_deg = float(self.get_parameter("scan_yaw_deg").value)
+        self.scan_yaw_rate_deg_s = float(self.get_parameter("scan_yaw_rate_deg_s").value)
+        self.scan_timeout_s = float(self.get_parameter("scan_timeout_s").value)
         self.mission_plan_file = str(self.get_parameter("mission_plan_file").value).strip()
 
         self.target_timeout_s = float(self.get_parameter("target_timeout_s").value)
@@ -215,6 +225,7 @@ class MissionExecutorNode(Node):
         self._step_handlers = {
             "takeoff": self._step_takeoff,
             "prime_offboard": self._step_prime_offboard,
+            "scan": self._step_scan,
             "track_center": self._step_track_center,
             "approach": self._step_approach,
             "orbit": self._step_orbit,
@@ -529,10 +540,11 @@ class MissionExecutorNode(Node):
             return False
         return abs(float(self.last_target.error_x)) <= self.center_error_threshold
 
-    def approach_done(self) -> bool:
+    def approach_done(self, desired_distance_m: Optional[float] = None) -> bool:
         if not self.target_distance_ready() or self.last_target is None:
             return False
-        return abs(float(self.last_target.distance_m) - self.desired_approach_distance_m) <= self.approach_distance_tolerance_m
+        desired = self.desired_approach_distance_m if desired_distance_m is None else float(desired_distance_m)
+        return abs(float(self.last_target.distance_m) - desired) <= self.approach_distance_tolerance_m
 
     def send_action_once(
         self,
@@ -613,7 +625,10 @@ class MissionExecutorNode(Node):
         self.state_pub.publish(msg)
         self.diagnostics.mark_published(self.mission_state_topic, summary=msg.data)
 
-    def publish_mission_command(self, mode: str, active: bool, status: str) -> None:
+    def publish_mission_command(
+        self, mode: str, active: bool, status: str, *, yaw_rate: float = 0.0,
+        desired_distance_m: Optional[float] = None,
+    ) -> None:
         msg = MissionCommand()
         msg.stamp = self.get_clock().now().to_msg()
         msg.mode = mode
@@ -621,8 +636,10 @@ class MissionExecutorNode(Node):
         msg.velocity_forward = 0.0
         msg.velocity_right = 0.0
         msg.velocity_down = 0.0
-        msg.yaw_rate = 0.0
-        msg.desired_distance_m = float(self.desired_approach_distance_m)
+        msg.yaw_rate = float(yaw_rate)
+        msg.desired_distance_m = float(
+            self.desired_approach_distance_m if desired_distance_m is None else desired_distance_m
+        )
         msg.orbit_radius_m = float(self.orbit_radius_m)
         msg.orbit_speed_m_s = float(self.orbit_speed_m_s)
         msg.step_index = self.step_index_for_state(self.state)
@@ -652,6 +669,7 @@ class MissionExecutorNode(Node):
             MissionState.PREFLIGHT,
             MissionState.TAKEOFF,
             MissionState.PRIME_OFFBOARD,
+            MissionState.SCAN,
             MissionState.TRACK_CENTER,
             MissionState.APPROACH_TARGET,
             MissionState.DO_ORBIT,
@@ -752,7 +770,7 @@ class MissionExecutorNode(Node):
         if until == "locked":
             return self.target_is_fresh_locked()
         if until == "approach_done":
-            return self.approach_done()
+            return self.approach_done(step.get_float("distance_m", self.desired_approach_distance_m))
         return False  # "none" or unset -> never auto-advance on a condition
 
     def _orbit_default_timeout(self, radius_m: float, speed_m_s: float, revolutions: float) -> float:
@@ -805,6 +823,54 @@ class MissionExecutorNode(Node):
         self.publish_state(f"priming offboard, age={age:.1f}/{hold_s:.1f}s")
         return age >= hold_s
 
+    def _step_scan(self, step) -> bool:
+        """Hold position and yaw-sweep to search for the target.
+
+        Safety: this only commands yaw (the control node holds the captured local
+        NED anchor and rotates in place — no translation). It exits early as soon
+        as the target locks (until: locked), after sweeping the requested
+        yaw_deg, or on timeout. On timeout it returns True so the plan advances to
+        its next step (e.g. a hold or land), never wedging on a missing target.
+        """
+        if not self._check_preflight_or_hold("scan"):
+            return False
+        self.publish_offboard_request(True)
+
+        yaw_deg = step.get_float("yaw_deg", self.scan_yaw_deg)
+        yaw_rate_deg_s = step.get_float("yaw_rate_deg_s", self.scan_yaw_rate_deg_s)
+        # Convention: ccw (counter-clockwise viewed from above) = negative NED yaw
+        # rate; cw = positive. The control node integrates this into its yaw target.
+        sign = -1.0 if step.scan_direction == "ccw" else 1.0
+        yaw_rate_rad_s = sign * math.radians(max(0.0, yaw_rate_deg_s))
+
+        locked = self.target_is_fresh_locked()
+        age = self.step_age()
+        swept_deg = abs(yaw_rate_deg_s) * age
+
+        # Stop yawing once we have locked (exit will advance) so we don't sweep
+        # past a freshly found target; otherwise keep sweeping.
+        commanded_rate = 0.0 if locked else yaw_rate_rad_s
+        self.publish_mission_command(
+            "SCAN", True,
+            f"scan {step.scan_direction} {yaw_deg:.0f}deg @ {yaw_rate_deg_s:.0f}deg/s",
+            yaw_rate=commanded_rate,
+        )
+
+        # Exit early when the target locks (until: locked) or any other satisfied
+        # predicate, when the full sweep is done, or on timeout.
+        if self._until_satisfied(step, default="locked"):
+            self.publish_state(f"scan locked target, swept={swept_deg:.0f}/{yaw_deg:.0f}deg")
+            return True
+        if swept_deg >= yaw_deg:
+            self.publish_state(f"scan complete, swept full {yaw_deg:.0f}deg, locked={locked}")
+            return True
+        timeout = step.timeout_s if step.timeout_s is not None else self.scan_timeout_s
+        self.publish_state(
+            f"scanning {step.scan_direction}, swept={swept_deg:.0f}/{yaw_deg:.0f}deg, "
+            f"locked={locked}, age={age:.1f}/{timeout:.1f}s"
+        )
+        return timeout > 0.0 and age > timeout
+
     def _step_track_center(self, step) -> bool:
         if not self._check_preflight_or_hold("track"):
             return False
@@ -823,13 +889,18 @@ class MissionExecutorNode(Node):
             self.publish_offboard_request(False)
             return False
         self.publish_offboard_request(True)
-        self.publish_mission_command("APPROACH_TARGET", True, "approach using distance estimate")
+        desired = step.get_float("distance_m", self.desired_approach_distance_m)
+        self.publish_mission_command(
+            "APPROACH_TARGET", True,
+            f"approach to {desired:.2f}m using distance estimate",
+            desired_distance_m=desired,
+        )
         dist_text = "none"
         if self.last_target is not None and bool(getattr(self.last_target, "distance_valid", False)):
             dist_text = f"{self.last_target.distance_m:.2f}m"
         age = self.step_age()
-        self.publish_state(f"approaching, distance={dist_text}, age={age:.1f}s")
-        if self.approach_done():
+        self.publish_state(f"approaching, distance={dist_text}, desired={desired:.2f}m, age={age:.1f}s")
+        if self.approach_done(desired):
             return True
         timeout = step.timeout_s if step.timeout_s is not None else self.approach_timeout_s
         return age > timeout

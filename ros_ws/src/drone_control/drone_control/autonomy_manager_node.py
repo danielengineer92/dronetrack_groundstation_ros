@@ -21,10 +21,14 @@ Mission states:
     - PREFLIGHT_BLOCKED: autonomy is requested, but safety preconditions are not met
     - READY: request is on and vehicle is safe, but target is not locked yet
     - TRACKING: request is on, vehicle is safe, target is locked/fresh
+    - SCANNING: request is on, vehicle is safe, no lock yet, but the mission is in
+      a SCAN step and allow_scan_without_lock is enabled (pre-lock, yaw-only search)
     - TARGET_LOST: request is on, vehicle is safe, but target was lost/stale
     - FAILSAFE: autonomy was already ready/active, then a safety check failed
 
-Only TRACKING publishes /drone/autonomy/enabled true.
+TRACKING and (opt-in) SCANNING publish /drone/autonomy/enabled true. SCANNING is
+yaw-only in practice: while the mission mode is SCAN, control_node holds position
+and only rotates, so this never authorizes translation.
 This node intentionally does not publish /drone/mission/state; mission_executor_node owns that topic.
 READY/TRACKING/TARGET_LOST can publish /drone/mavsdk/offboard_enable true, but only
 after the operator explicitly requests MAVSDK Offboard on /drone/mavsdk/offboard_request.
@@ -43,7 +47,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
-from drone_interfaces.msg import DroneTelemetry, TargetError
+from drone_interfaces.msg import DroneTelemetry, MissionCommand, TargetError
+from drone_control.autonomy_logic import scan_yaw_authorized
 
 
 class MissionState(str, Enum):
@@ -51,6 +56,7 @@ class MissionState(str, Enum):
     PREFLIGHT_BLOCKED = "PREFLIGHT_BLOCKED"
     READY = "READY"
     TRACKING = "TRACKING"
+    SCANNING = "SCANNING"
     TARGET_LOST = "TARGET_LOST"
     FAILSAFE = "FAILSAFE"
 
@@ -70,6 +76,7 @@ class AutonomyManagerNode(Node):
         self.declare_parameter("offboard_request_topic", "/drone/mavsdk/offboard_request")
         self.declare_parameter("target_error_topic", "/drone/tracking/target_error")
         self.declare_parameter("telemetry_topic", "/drone/telemetry")
+        self.declare_parameter("mission_command_topic", "/drone/mission/command")
         self.declare_parameter("autonomy_enable_topic", "/drone/autonomy/enabled")
         self.declare_parameter("offboard_enable_topic", "/drone/mavsdk/offboard_enable")
         self.declare_parameter("autonomy_state_topic", "/drone/autonomy/state")
@@ -84,6 +91,12 @@ class AutonomyManagerNode(Node):
         self.declare_parameter("request_timeout", 0.0)  # 0 disables request staleness checking
         self.declare_parameter("enable_offboard_when_ready", True)
 
+        # Opt-in (default OFF): allow pre-lock, yaw-only autonomy while the mission
+        # is in a SCAN step, so the drone can yaw-sweep to search for a target.
+        # Yaw-only is enforced by control_node's SCAN behavior (position-hold + yaw).
+        self.declare_parameter("allow_scan_without_lock", False)
+        self.declare_parameter("mission_command_timeout", 1.0)  # SCAN command freshness
+
         # Safety requirements
         self.declare_parameter("require_connected", True)
         self.declare_parameter("require_armed", True)
@@ -96,6 +109,7 @@ class AutonomyManagerNode(Node):
         self.offboard_request_topic = str(self.get_parameter("offboard_request_topic").value)
         self.target_error_topic = str(self.get_parameter("target_error_topic").value)
         self.telemetry_topic = str(self.get_parameter("telemetry_topic").value)
+        self.mission_command_topic = str(self.get_parameter("mission_command_topic").value)
         self.autonomy_enable_topic = str(self.get_parameter("autonomy_enable_topic").value)
         self.offboard_enable_topic = str(self.get_parameter("offboard_enable_topic").value)
         self.autonomy_state_topic = str(self.get_parameter("autonomy_state_topic").value)
@@ -108,6 +122,8 @@ class AutonomyManagerNode(Node):
         self.telemetry_timeout = float(self.get_parameter("telemetry_timeout").value)
         self.request_timeout = float(self.get_parameter("request_timeout").value)
         self.enable_offboard_when_ready = bool(self.get_parameter("enable_offboard_when_ready").value)
+        self.allow_scan_without_lock = bool(self.get_parameter("allow_scan_without_lock").value)
+        self.mission_command_timeout = float(self.get_parameter("mission_command_timeout").value)
 
         self.require_connected = bool(self.get_parameter("require_connected").value)
         self.require_armed = bool(self.get_parameter("require_armed").value)
@@ -129,6 +145,9 @@ class AutonomyManagerNode(Node):
         self.last_telemetry: Optional[DroneTelemetry] = None
         self.last_telemetry_time = 0.0
         self.last_request_time = time.monotonic() if self.autonomy_requested else 0.0
+        self.last_mission_mode = ""
+        self.last_mission_active = False
+        self.last_mission_command_time = 0.0
 
         self.request_count = 0
         self.offboard_request_count = 0
@@ -166,6 +185,14 @@ class AutonomyManagerNode(Node):
             DroneTelemetry,
             self.telemetry_topic,
             self.telemetry_callback,
+            qos,
+        )
+        # Read the mission command only to know whether the active step is a SCAN
+        # (for the opt-in pre-lock yaw allowance). This node never publishes it.
+        self.mission_command_sub = self.create_subscription(
+            MissionCommand,
+            self.mission_command_topic,
+            self.mission_command_callback,
             qos,
         )
 
@@ -267,6 +294,18 @@ class AutonomyManagerNode(Node):
             ),
         )
 
+    def mission_command_callback(self, msg: MissionCommand) -> None:
+        self.last_mission_mode = str(msg.mode).strip().upper()
+        self.last_mission_active = bool(msg.active)
+        self.last_mission_command_time = time.monotonic()
+
+    def _mission_is_scan(self, now: float) -> bool:
+        if self.last_mission_command_time <= 0.0:
+            return False
+        if now - self.last_mission_command_time > self.mission_command_timeout:
+            return False
+        return self.last_mission_active and self.last_mission_mode == "SCAN"
+
     def _request_is_fresh(self, now: float) -> bool:
         if not self.autonomy_requested:
             return False
@@ -334,6 +373,7 @@ class AutonomyManagerNode(Node):
             if self.had_safe_autonomy or self.state in (
                 MissionState.READY,
                 MissionState.TRACKING,
+                MissionState.SCANNING,
                 MissionState.TARGET_LOST,
             ):
                 return MissionState.FAILSAFE, safety_reason
@@ -342,26 +382,40 @@ class AutonomyManagerNode(Node):
         if self._target_locked(now):
             return MissionState.TRACKING, "TARGET_LOCKED"
 
+        # Opt-in pre-lock yaw-only autonomy while the mission is in a SCAN step.
+        # We are past the request-fresh, safety-ok, and not-locked checks here.
+        if scan_yaw_authorized(
+            allow_scan_without_lock=self.allow_scan_without_lock,
+            mission_is_scan=self._mission_is_scan(now),
+            request_fresh=True,
+            safety_ok=True,
+            target_locked=False,
+        ):
+            return MissionState.SCANNING, "SCAN_YAW_NO_LOCK"
+
         if self.had_target_lock:
             return MissionState.TARGET_LOST, "TARGET_LOST_OR_STALE"
 
         return MissionState.READY, "WAITING_FOR_TARGET_LOCK"
 
     def _publish_gates(self, state: MissionState, reason: str) -> None:
-        # Only TRACKING allows control_node to generate real movement commands.
-        autonomy_enabled = state == MissionState.TRACKING
+        # TRACKING allows full control; SCANNING (opt-in) allows yaw-only control
+        # because control_node holds position and only rotates in SCAN mode.
+        autonomy_enabled = state in (MissionState.TRACKING, MissionState.SCANNING)
 
         # Let the MAVSDK executor be ready while requested and safe, but keep actual
-        # movement blocked by /drone/autonomy/enabled until TRACKING. PREFLIGHT_BLOCKED is not safe yet.
-        offboard_ready = False
+        # movement blocked by /drone/autonomy/enabled until TRACKING/SCANNING.
+        # PREFLIGHT_BLOCKED is not safe yet. SCANNING needs offboard so its yaw
+        # setpoints reach PX4.
         if self.enable_offboard_when_ready:
             offboard_ready = state in (
                 MissionState.READY,
                 MissionState.TRACKING,
+                MissionState.SCANNING,
                 MissionState.TARGET_LOST,
             )
         else:
-            offboard_ready = state == MissionState.TRACKING
+            offboard_ready = state in (MissionState.TRACKING, MissionState.SCANNING)
         offboard_enabled = bool(self.offboard_requested and offboard_ready)
 
         autonomy_msg = Bool()
@@ -397,7 +451,12 @@ class AutonomyManagerNode(Node):
         self.state = new_state
         self.state_reason = reason
 
-        if self.state in (MissionState.READY, MissionState.TRACKING, MissionState.TARGET_LOST):
+        if self.state in (
+            MissionState.READY,
+            MissionState.TRACKING,
+            MissionState.SCANNING,
+            MissionState.TARGET_LOST,
+        ):
             self.had_safe_autonomy = True
         elif self.state == MissionState.STANDBY:
             self.had_safe_autonomy = False

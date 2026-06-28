@@ -45,3 +45,7 @@ web_dashboard_node:
     autonomy_request_topic: "/drone/autonomy/request"
     offboard_request_topic: "/drone/mavsdk/offboard_request"
     mavsdk_action_topic: "/drone/mavsdk/action_command"
+    mission_state_topic: "/drone/mission/state"
+    mission_command_topic: "/drone/mission/command"
+    autonomy_state_topic: "/drone/autonomy/state"
+    mission_catalog_paths: ""          # empty = auto-discover sibling drone_control/missions when present
