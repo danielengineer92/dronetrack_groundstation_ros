@@ -47,6 +47,11 @@ from std_msgs.msg import Bool, String
 from drone_interfaces.msg import DetectionArray, DroneTelemetry, MavsdkActionCommand, MissionCommand
 from dronetrack_msgs.msg import GroundStationHeartbeat, LinkStatus
 from dronetrack_web_bridge.mission_preview import load_mission_catalog
+from dronetrack_web_bridge.mission_plan_model import (
+    get_step_schema, create_default_step, validate_step,
+    steps_to_yaml, lint_steps, sanitize_filename, CATEGORY_COLORS,
+)
+from dronetrack_web_bridge.mission_preview_ext import plan_from_steps
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -278,6 +283,8 @@ class WebDashboardNode(Node):
         self.declare_parameter("mission_command_topic", "/drone/mission/command")
         self.declare_parameter("autonomy_state_topic", "/drone/autonomy/state")
         self.declare_parameter("mission_catalog_paths", "")
+        self.declare_parameter("mission_plans_dir", "~/drone_mission_plans/")
+        self.declare_parameter("mission_plan_topic", "/drone/mission/plan")
 
         self.host = str(self.get_parameter("host").value)
         self.port = int(self.get_parameter("port").value)

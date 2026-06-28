@@ -71,6 +71,13 @@ operator_request_topics:
   - name: "/drone/autonomy/request"         # std_msgs/Bool
   - name: "/drone/mavsdk/offboard_request"  # std_msgs/Bool
   - name: "/drone/mavsdk/action_command"    # drone_interfaces/MavsdkActionCommand (gated by allow_mavsdk_actions)
+  - name: "/drone/mission/plan"
+    type: "std_msgs/String"
+    direction: "laptop→Pi"
+    owner: "web_dashboard_node (pub) / mission_executor_node (sub)"
+    qos: "reliable, depth 5"
+    note: "Advisory mission plan payload (YAML string). Pi validates with parse_mission_plan() before accepting. Rejected while mission is active."
+    trust_boundary: true
 
 # Pi-OWNED approval topics. The laptop must NEVER publish these.
 pi_owned_topics:

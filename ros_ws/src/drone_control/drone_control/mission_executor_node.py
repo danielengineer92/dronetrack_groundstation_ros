@@ -103,8 +103,7 @@ class MissionExecutorNode(Node):
         self.declare_parameter("offboard_prime_time_s", 1.5)
         self.declare_parameter("track_center_timeout_s", 0.0)  # 0 = keep yaw tracking until stopped.
         self.declare_parameter("run_full_orbit_after_track_center", False)
-
-        # Scan-for-target defaults (used when a scan step omits the key).
+        self.declare_parameter("mission_plan_topic", "/drone/mission/plan")
         self.declare_parameter("scan_yaw_deg", 180.0)
         self.declare_parameter("scan_yaw_rate_deg_s", 20.0)
         self.declare_parameter("scan_timeout_s", 12.0)
@@ -203,9 +202,13 @@ class MissionExecutorNode(Node):
         self.autonomy_request_pub = self.create_publisher(Bool, self.autonomy_request_topic, qos)
         self.offboard_request_pub = self.create_publisher(Bool, self.offboard_request_topic, qos)
 
+        self.mission_plan_topic = str(self.get_parameter("mission_plan_topic").value)
+        self.plan_sub = self.create_subscription(String, self.mission_plan_topic, self._on_plan_received, qos)
+
         self.timer = self.create_timer(1.0 / self.publish_rate, self.loop)
         self.diagnostics = NodeDiagnostics(self, heartbeat_period=5.0, stale_seconds=2.0)
         self.diagnostics.add_input(self.mission_request_topic, "mission_request", stale_seconds=60.0)
+        self.diagnostics.add_input(self.mission_plan_topic, "mission_plan_receiver", stale_seconds=3600.0)
         self.diagnostics.add_input(self.target_error_topic, "target_error", stale_seconds=self.target_timeout_s)
         self.diagnostics.add_input(self.telemetry_topic, "telemetry", stale_seconds=self.telemetry_timeout_s)
         self.diagnostics.add_output(self.mission_command_topic, "mission_command")
@@ -403,6 +406,42 @@ class MissionExecutorNode(Node):
             self.publish_autonomy_request(False)
             self.transition(MissionState.IDLE if self.mission_enabled else MissionState.DISABLED)
         self.diagnostics.mark_received(self.mission_request_topic, summary=f"request={requested}, active={self.mission_active}")
+
+    def _on_plan_received(self, msg: String) -> None:
+        """Accept a YAML mission plan from the dashboard (advisory, validated before use)."""
+        if self.mission_active:
+            self.get_logger().warning(
+                f"Ignoring /drone/mission/plan: a mission is active (state={self.state.name})"
+            )
+            self.diagnostics.mark_received(
+                self.mission_plan_topic, summary=f"rejected_during_mission (state={self.state.name})"
+            )
+            return
+
+        import yaml
+        from drone_control.mission_plan import parse_mission_plan, lint_plan, MissionPlanError
+        try:
+            data = yaml.safe_load(msg.data)
+            plan = parse_mission_plan(data)
+        except (MissionPlanError, yaml.YAMLError, Exception) as exc:
+            self.get_logger().error(f"Invalid mission plan from dashboard: {exc}")
+            self.log_event("mission_plan_rejected", source="dashboard", error=str(exc))
+            self.diagnostics.mark_received(self.mission_plan_topic, summary=f"rejected_parse_error ({exc})")
+            return
+
+        warnings = lint_plan(plan)
+        for w in warnings:
+            self.get_logger().warning(f"Mission plan lint: {w}")
+
+        self.plan = plan
+        self.step_index = 0
+        self.step_enter_time = time.monotonic()
+        self.get_logger().info(f"Accepted mission plan '{plan.name}' from dashboard | {len(plan.steps)} steps")
+        self.log_event("mission_plan_received", source="dashboard", plan=plan.name, steps=[s.type for s in plan.steps])
+        self.publish_state()
+        self.diagnostics.mark_received(
+            self.mission_plan_topic, summary=f"accepted: {plan.name} ({len(plan.steps)} steps)"
+        )
 
     def target_callback(self, msg: TargetError) -> None:
         self.last_target = msg
