@@ -97,6 +97,27 @@ DASHBOARD_HTML = """<!doctype html>
   .warnings { color:#ffcc66; margin-top:10px; display:grid; gap:4px; }
   @media (max-width: 760px) { .plan-body { grid-template-columns:1fr; } }
   small { color:#83a3bd; }
+  .danger { background:#ff5f75; color:#fff; }
+  .badge { font-size:11px; font-weight:800; border-radius:4px; padding:2px 7px; text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+  .badge-action { background:#2ea043; color:#fff; }
+  .badge-preflight { background:#1f6feb; color:#fff; }
+  .badge-motion { background:#c06a00; color:#fff; }
+  .step-card { background:#09182d; border:1px solid rgba(100,160,220,.14); border-radius:8px; padding:10px 12px; cursor:pointer; transition:border-color .15s; }
+  .step-card.selected { border-color:#1f6feb; }
+  .step-card-head { display:flex; gap:8px; align-items:center; }
+  .step-summary { flex:1; font-size:13px; color:#cfe6ff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .step-actions { display:flex; gap:4px; flex-shrink:0; }
+  .step-actions button { padding:4px 8px; font-size:12px; border-radius:5px; }
+  .param-editor { margin-top:8px; display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; padding-top:8px; border-top:1px solid rgba(100,160,220,.1); }
+  .param-editor label { display:grid; gap:3px; font-size:12px; color:#83a3bd; }
+  .param-editor input, .param-editor select { font:inherit; color:#e7f4ff; background:#06101e; border:1px solid rgba(100,160,220,.28); border-radius:5px; padding:5px 7px; width:100%; box-sizing:border-box; }
+  .add-bar { display:flex; gap:6px; flex-wrap:wrap; }
+  .add-bar button { font-size:12px; padding:6px 10px; background:#09182d; color:#cfe6ff; border:1px solid rgba(100,160,220,.28); border-radius:6px; }
+  .add-bar button:hover { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  .planner-toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:14px; border-bottom:1px solid rgba(100,160,220,.1); }
+  .planner-toolbar input[type=text] { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; min-width:150px; }
+  .status-bar { display:flex; gap:14px; font-size:12px; color:#83a3bd; padding:8px 14px; border-top:1px solid rgba(100,160,220,.1); }
+  .status-ok { color:#50fa7b; } .status-bad { color:#ff5f75; }
 </style></head>
 <body><div class="wrap">
   <h1>DroneTrack &mdash; Ground Station</h1>
@@ -123,18 +144,22 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="k">Autonomy</div><div class="v" id="autonomy">--</div><small id="autonomy_detail"></small></div>
   </div>
   <section class="planner">
-    <div class="planner-head">
-      <div><div class="k">Mission Plans</div><div class="camera-title">Preview</div></div>
-      <select id="mission_select" onchange="renderMissionPreview()"></select>
+    <div class="planner-toolbar">
+      <div><div class="k">Mission Planner</div><div class="camera-title" style="font-size:16px">Builder</div></div>
+      <input id="plan_name" type="text" placeholder="Plan name..." value="untitled"/>
+      <button class="start" onclick="savePlan()">Save</button>
+      <select id="load_select"><option value="">-- Load plan --</option></select>
+      <button class="ready" onclick="loadSelectedPlan()">Load</button>
+      <button onclick="clearPlan()" style="background:#09182d;color:#cfe6ff;border:1px solid rgba(100,160,220,.28);border-radius:8px;padding:12px 16px">Clear</button>
+      <button class="start" onclick="sendPlan()">Send to Drone</button>
     </div>
-    <div class="plan-body">
-      <div>
-        <div class="k">Selected</div>
-        <div class="plan-meta" id="plan_meta">No mission plans found</div>
-        <div class="warnings" id="plan_warnings"></div>
-      </div>
-      <div class="steps" id="plan_steps"></div>
+    <div style="padding:14px">
+      <div class="k" style="margin-bottom:6px">Add Step</div>
+      <div class="add-bar" id="add_bar"></div>
+      <div id="step_list" style="margin-top:10px;display:grid;gap:6px"></div>
+      <div class="warnings" id="plan_warnings" style="margin-top:8px"></div>
     </div>
+    <div class="status-bar" id="status_bar"><span>0 steps</span></div>
   </section>
   <div class="row">
     <button class="ready" onclick="post('autonomy_request',{enabled:true})">System Ready</button>
@@ -147,8 +172,13 @@ DASHBOARD_HTML = """<!doctype html>
 </div>
 <script>
 function cls(el,c){el.className='v '+c;}
-let missionCatalog = [];
 function finite(n){ return typeof n === 'number' && Number.isFinite(n); }
+let planSteps = [], selectedStep = null, stepSchema = {};
+const VERB_CAT = {
+  prime_offboard:'preflight', takeoff:'action', land:'action', rtl:'action',
+  hold:'action', scan:'motion', approach:'motion', orbit:'motion', track_center:'motion'
+};
+const ADD_VERBS = ['takeoff','prime_offboard','scan','track_center','approach','orbit','rtl','land','hold'];
 function missionMain(text){
   const s = (text || '').trim();
   const idx = s.indexOf(':');
@@ -201,57 +231,229 @@ async function tick(){
     document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
   }catch(e){ document.getElementById('updated').textContent='status fetch failed'; }
 }
-async function loadMissions(){
-  try{
-    const r = await fetch('/api/missions'); const data = await r.json();
-    missionCatalog = data.missions || [];
-    const sel = document.getElementById('mission_select');
-    sel.innerHTML = '';
-    missionCatalog.forEach((m, i) => {
-      const opt = document.createElement('option');
-      opt.value = String(i);
-      opt.textContent = (m.valid ? '' : '! ') + (m.name || m.filename);
-      sel.appendChild(opt);
-    });
-    renderMissionPreview();
-  }catch(e){
-    document.getElementById('plan_meta').textContent = 'Mission preview unavailable';
+async function initPlanner() {
+  try {
+    const r = await fetch('/api/mission-step-schema');
+    const d = await r.json();
+    stepSchema = d.verbs || {};
+  } catch(e) {}
+  const bar = document.getElementById('add_bar');
+  ADD_VERBS.forEach(v => {
+    const btn = document.createElement('button');
+    btn.textContent = '+ ' + v;
+    btn.onclick = () => addStep(v);
+    bar.appendChild(btn);
+  });
+  await refreshLoadDropdown();
+  const saved = localStorage.getItem('dronetrack_plan');
+  if (saved) {
+    try {
+      const d = JSON.parse(saved);
+      planSteps = d.steps || [];
+      document.getElementById('plan_name').value = d.name || 'untitled';
+    } catch(e) {}
   }
+  renderSteps();
 }
-function renderMissionPreview(){
-  const sel = document.getElementById('mission_select');
-  const m = missionCatalog[Number(sel.value || 0)];
-  const meta = document.getElementById('plan_meta');
-  const warnings = document.getElementById('plan_warnings');
-  const steps = document.getElementById('plan_steps');
-  warnings.innerHTML = ''; steps.innerHTML = '';
-  if(!m){
-    meta.textContent = 'No mission plans found';
-    return;
+
+async function refreshLoadDropdown() {
+  try {
+    const r = await fetch('/api/mission-plans');
+    const d = await r.json();
+    const sel = document.getElementById('load_select');
+    sel.innerHTML = '<option value="">-- Load plan --</option>';
+    (d.plans || []).forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.filename;
+      o.textContent = p.name + (p.is_template ? ' [template]' : '') + ' (' + (p.step_count||0) + ')';
+      sel.appendChild(o);
+    });
+  } catch(e) {}
+}
+
+function addStep(verb) {
+  const sc = stepSchema[verb] || {};
+  const params = {};
+  (sc.params || []).forEach(p => { if (p.default !== undefined) params[p.name] = p.default; });
+  planSteps.push({type: verb, params});
+  selectedStep = planSteps.length - 1;
+  autosave(); renderSteps();
+}
+
+function deleteStep(i) {
+  planSteps.splice(i, 1);
+  if (selectedStep === i) selectedStep = null;
+  else if (selectedStep !== null && selectedStep > i) selectedStep--;
+  autosave(); renderSteps();
+}
+
+function moveStep(i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= planSteps.length) return;
+  [planSteps[i], planSteps[j]] = [planSteps[j], planSteps[i]];
+  if (selectedStep === i) selectedStep = j;
+  else if (selectedStep === j) selectedStep = i;
+  autosave(); renderSteps();
+}
+
+function selectStep(i) {
+  selectedStep = selectedStep === i ? null : i;
+  renderSteps();
+}
+
+function verbCat(verb) { return VERB_CAT[verb] || 'action'; }
+
+function stepSummary(step) {
+  const p = step.params || {};
+  const kv = Object.entries(p).slice(0,3).map(([k,v]) => k+'='+v);
+  return kv.length ? kv.join(', ') : '';
+}
+
+function renderSteps() {
+  const list = document.getElementById('step_list');
+  list.innerHTML = '';
+  planSteps.forEach((step, i) => {
+    const card = document.createElement('div');
+    card.className = 'step-card' + (selectedStep === i ? ' selected' : '');
+    const head = document.createElement('div');
+    head.className = 'step-card-head';
+    head.onclick = () => selectStep(i);
+    const num = document.createElement('span');
+    num.style.cssText = 'color:#83a3bd;font-weight:800;font-size:13px;min-width:22px;flex-shrink:0';
+    num.textContent = (i+1)+'.';
+    const badge = document.createElement('span');
+    badge.className = 'badge badge-' + verbCat(step.type);
+    badge.textContent = step.type;
+    const sumEl = document.createElement('span');
+    sumEl.className = 'step-summary';
+    sumEl.textContent = stepSummary(step);
+    const acts = document.createElement('div');
+    acts.className = 'step-actions';
+    acts.onclick = e => e.stopPropagation();
+    const upB = document.createElement('button');
+    upB.textContent = '▲'; upB.title = 'Move up';
+    upB.style.cssText = 'background:#09182d;color:#cfe6ff;border:1px solid rgba(100,160,220,.28)';
+    upB.onclick = e => { e.stopPropagation(); moveStep(i,-1); };
+    const dnB = document.createElement('button');
+    dnB.textContent = '▼'; dnB.title = 'Move down';
+    dnB.style.cssText = 'background:#09182d;color:#cfe6ff;border:1px solid rgba(100,160,220,.28)';
+    dnB.onclick = e => { e.stopPropagation(); moveStep(i,1); };
+    const delB = document.createElement('button');
+    delB.textContent = '✕'; delB.title = 'Delete'; delB.className = 'danger';
+    delB.onclick = e => { e.stopPropagation(); deleteStep(i); };
+    acts.append(upB, dnB, delB);
+    head.append(num, badge, sumEl, acts);
+    card.appendChild(head);
+    if (selectedStep === i) {
+      const sc = stepSchema[step.type] || {};
+      const pDefs = sc.params || [];
+      if (pDefs.length) {
+        const ed = document.createElement('div');
+        ed.className = 'param-editor';
+        pDefs.forEach(pd => {
+          const lbl = document.createElement('label');
+          lbl.textContent = pd.name + (pd.unit ? ' ('+pd.unit+')' : '');
+          let inp;
+          if (pd.type === 'enum' && pd.choices) {
+            inp = document.createElement('select');
+            pd.choices.forEach(c => {
+              const o = document.createElement('option');
+              o.value = c; o.textContent = c;
+              const cur = step.params[pd.name];
+              if (cur === c || (cur === undefined && pd.default === c)) o.selected = true;
+              inp.appendChild(o);
+            });
+          } else {
+            inp = document.createElement('input');
+            inp.type = 'number'; inp.step = 'any';
+            const cur = step.params[pd.name];
+            inp.value = cur !== undefined ? cur : (pd.default !== undefined ? pd.default : '');
+          }
+          inp.onchange = () => {
+            planSteps[i].params[pd.name] = inp.tagName === 'SELECT' ? inp.value : parseFloat(inp.value);
+            sumEl.textContent = stepSummary(planSteps[i]);
+            autosave();
+          };
+          lbl.appendChild(inp);
+          ed.appendChild(lbl);
+        });
+        card.appendChild(ed);
+      }
+    }
+    list.appendChild(card);
+  });
+  updateWarnings();
+  updateStatusBar();
+}
+
+function updateWarnings() {
+  const w = document.getElementById('plan_warnings');
+  w.innerHTML = '';
+  planSteps.forEach((s, i) => {
+    if (!s.type) {
+      const d = document.createElement('small');
+      d.textContent = '⚠ Step '+(i+1)+': missing type';
+      w.appendChild(d);
+    }
+  });
+}
+
+function updateStatusBar() {
+  const bar = document.getElementById('status_bar');
+  const n = planSteps.length;
+  bar.innerHTML = '<span>'+n+' step'+(n===1?'':'s')+'</span><span class="'+(n>0?'status-ok':'status-bad')+'">'+(n>0?'ready to send':'plan empty')+'</span>';
+}
+
+function autosave() {
+  const name = document.getElementById('plan_name').value || 'untitled';
+  localStorage.setItem('dronetrack_plan', JSON.stringify({name, steps: planSteps}));
+}
+
+function clearPlan() {
+  planSteps = []; selectedStep = null;
+  document.getElementById('plan_name').value = 'untitled';
+  autosave(); renderSteps();
+}
+
+async function savePlan() {
+  const name = document.getElementById('plan_name').value || 'untitled';
+  const doSave = async (overwrite) => {
+    const r = await fetch('/api/mission-plans/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, steps:planSteps, overwrite})});
+    return r.json();
+  };
+  let d = await doSave(false);
+  if (d.conflict) {
+    if (!confirm('Plan "'+name+'" already exists. Overwrite?')) return;
+    d = await doSave(true);
   }
-  meta.textContent = m.valid
-    ? ((m.path || m.filename) + ' | ' + (m.pi_param_hint || 'set mission_plan_file on the Pi before Start Mission'))
-    : ((m.path || m.filename) + ' | ' + (m.error || 'invalid mission'));
-  (m.warnings || []).forEach(w => {
-    const div = document.createElement('small');
-    div.textContent = w;
-    warnings.appendChild(div);
-  });
-  (m.steps || []).forEach(st => {
-    const item = document.createElement('div'); item.className = 'step';
-    const num = document.createElement('div'); num.className = 'step-num'; num.textContent = String((st.index || 0) + 1);
-    const body = document.createElement('div');
-    const typ = document.createElement('div'); typ.className = 'step-type'; typ.textContent = st.type || '';
-    const label = document.createElement('small'); label.textContent = st.label || '';
-    body.appendChild(typ); body.appendChild(label);
-    item.appendChild(num); item.appendChild(body); steps.appendChild(item);
-  });
+  if (d.ok) { await refreshLoadDropdown(); }
+  else { alert('Save failed: '+(d.errors||[]).join(', ')); }
+}
+
+async function loadSelectedPlan() {
+  const filename = document.getElementById('load_select').value;
+  if (!filename) return;
+  const r = await fetch('/api/mission-plans/'+encodeURIComponent(filename));
+  if (!r.ok) { alert('Load failed'); return; }
+  const d = await r.json();
+  planSteps = d.steps || [];
+  document.getElementById('plan_name').value = d.name || filename.replace('.yaml','');
+  selectedStep = null;
+  autosave(); renderSteps();
+}
+
+async function sendPlan() {
+  const name = document.getElementById('plan_name').value || 'untitled';
+  if (!planSteps.length) { alert('Plan is empty'); return; }
+  const r = await fetch('/api/mission-plans/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, steps:planSteps})});
+  const d = await r.json();
+  if (!d.ok) alert('Send failed: '+(d.errors||[]).join(', '));
 }
 async function post(path, body){
   await fetch('/api/'+path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   tick();
 }
-setInterval(tick, 500); tick(); loadMissions();
+setInterval(tick, 500); tick(); initPlanner();
 </script>
 </body></html>"""
 
