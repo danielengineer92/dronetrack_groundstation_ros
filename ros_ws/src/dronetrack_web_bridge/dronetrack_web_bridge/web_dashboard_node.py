@@ -138,6 +138,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="k">Drone Link</div><div class="v" id="px4">--</div><small id="mode"></small></div>
     <div class="card"><div class="k">Battery</div><div class="v" id="batt">--</div></div>
     <div class="card"><div class="k">Rel. Altitude</div><div class="v" id="alt">--</div></div>
+    <div class="card"><div class="k">Local NED</div><div class="v" id="ned">--</div></div>
     <div class="card"><div class="k">Armed</div><div class="v" id="armed">--</div></div>
     <div class="card"><div class="k">Mission</div><div class="v" id="mission">--</div><small id="mission_detail"></small></div>
     <div class="card"><div class="k">Step</div><div class="v" id="mission_step">--</div><small id="mission_step_detail"></small></div>
@@ -213,6 +214,10 @@ async function tick(){
     document.getElementById('mode').textContent = s.flight_mode || '';
     document.getElementById('batt').textContent = s.battery_percent>=0 ? s.battery_percent.toFixed(0)+'%' : '--';
     document.getElementById('alt').textContent = s.rel_altitude_m.toFixed(1)+' m';
+    const nedEl = document.getElementById('ned');
+    if (s.local_ned && s.local_ned.length === 3) {
+      nedEl.textContent = s.local_ned[0].toFixed(1)+', '+s.local_ned[1].toFixed(1)+', '+s.local_ned[2].toFixed(1);
+    } else { nedEl.textContent = '--'; }
     const armed = document.getElementById('armed');
     armed.textContent = s.armed ? 'ARMED' : 'disarmed'; cls(armed, s.armed?'warn':'ok');
     const mission = document.getElementById('mission');
@@ -517,7 +522,8 @@ class WebDashboardNode(Node):
             "link_ok": False, "link_reason": "no data", "latency_s": float("nan"),
             "perception_fps": -1.0, "detection_count": 0, "max_confidence": 0.0,
             "px4_connected": False, "flight_mode": "", "battery_percent": -1.0,
-            "rel_altitude_m": 0.0, "armed": False, "camera_frame_age_s": -1.0,
+            "rel_altitude_m": 0.0, "armed": False, "landed_state": "",
+            "local_ned": None, "camera_frame_age_s": -1.0,
             "target_summary": "", "overlay_available": cv2 is not None and np is not None,
             "autonomy_requested": False, "mission_requested": False,
             "autonomy_effective": "", "mission_state": "",
@@ -616,6 +622,13 @@ class WebDashboardNode(Node):
             self._state["battery_percent"] = float(msg.battery_remaining_percent)
             self._state["rel_altitude_m"] = float(msg.relative_altitude)
             self._state["armed"] = bool(msg.armed)
+            self._state["landed_state"] = msg.landed_state
+            if bool(msg.local_position_valid):
+                self._state["local_ned"] = [
+                    round(float(msg.local_position_north), 2),
+                    round(float(msg.local_position_east), 2),
+                    round(float(msg.local_position_down), 2),
+                ]
 
     def _on_mission_state(self, msg: String) -> None:
         with self._lock:
