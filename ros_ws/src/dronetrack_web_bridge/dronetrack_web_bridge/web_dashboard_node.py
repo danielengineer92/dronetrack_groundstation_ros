@@ -338,6 +338,9 @@ class WebDashboardNode(Node):
         self.autonomy_pub = self.create_publisher(Bool, str(self.get_parameter("autonomy_request_topic").value), reliable)
         self.offboard_pub = self.create_publisher(Bool, str(self.get_parameter("offboard_request_topic").value), reliable)
         self.action_pub = self.create_publisher(MavsdkActionCommand, str(self.get_parameter("mavsdk_action_topic").value), reliable)
+        self.plan_pub = self.create_publisher(String, str(self.get_parameter("mission_plan_topic").value), reliable)
+
+        self.mission_plans_dir = str(self.get_parameter("mission_plans_dir").value)
 
         self._start_server()
         self.get_logger().info(
@@ -578,18 +581,41 @@ class WebDashboardNode(Node):
                 self.wfile.write(body)
 
             def do_GET(self):
-                if self.path in ("/", "/index.html"):
+                path = self.path.split("?", 1)[0]  # strip query params
+                if path in ("/", "/index.html"):
                     self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
-                elif self.path == "/stream.mjpg":
+                elif path == "/stream.mjpg":
                     node.stream_mjpeg(self)
-                elif self.path == "/api/status":
+                elif path == "/api/status":
                     self._send(200, json.dumps(node.snapshot()).encode("utf-8"))
-                elif self.path == "/api/missions":
+                elif path == "/api/missions":
                     self._send(200, json.dumps(node.mission_catalog_snapshot()).encode("utf-8"))
+                elif path == "/api/mission-step-schema":
+                    self._send(200, json.dumps({"verbs": get_step_schema()}).encode("utf-8"))
+                elif path == "/api/mission-plans":
+                    self._send(200, json.dumps(node._list_mission_plans()).encode("utf-8"))
+                elif path.startswith("/api/mission-plans/"):
+                    filename = path[len("/api/mission-plans/"):]
+                    from urllib.parse import unquote
+                    result = node._load_mission_plan(unquote(filename))
+                    if result is None:
+                        self._send(404, b'{"error":"plan not found"}')
+                    else:
+                        self._send(200, json.dumps(result).encode("utf-8"))
+                else:
+                    self._send(404, b'{"error":"not found"}')
+
+            def do_DELETE(self):
+                if self.path.startswith("/api/mission-plans/"):
+                    from urllib.parse import unquote
+                    filename = unquote(self.path[len("/api/mission-plans/"):])
+                    result = node._delete_mission_plan(filename)
+                    self._send(200 if result else 404, json.dumps(result).encode("utf-8"))
                 else:
                     self._send(404, b'{"error":"not found"}')
 
             def do_POST(self):
+                path = self.path.split("?", 1)[0]
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
@@ -598,20 +624,31 @@ class WebDashboardNode(Node):
                     self._send(400, b'{"error":"bad json"}')
                     return
                 try:
-                    if self.path == "/api/mission_request":
+                    if path == "/api/mission_request":
                         node.publish_mission_request(bool(payload.get("enabled", False)))
-                    elif self.path == "/api/autonomy_request":
+                    elif path == "/api/autonomy_request":
                         node.publish_autonomy_request(bool(payload.get("enabled", False)))
-                    elif self.path == "/api/abort_hold":
+                    elif path == "/api/abort_hold":
                         if payload.get("confirm"):
                             node.abort_hold()
-                    elif self.path == "/api/land":
+                    elif path == "/api/land":
                         if payload.get("confirm"):
                             node.land()
+                    elif path == "/api/mission-plans/save":
+                        result = node._save_mission_plan(payload)
+                        if result.get("conflict"):
+                            self._send(409, json.dumps(result).encode("utf-8"))
+                            return
+                        self._send(200, json.dumps(result).encode("utf-8"))
+                    elif path == "/api/mission-plans/send":
+                        result = node._send_mission_plan(payload)
+                        if "errors" in result and result["errors"]:
+                            self._send(400, json.dumps(result).encode("utf-8"))
+                            return
+                        self._send(200, json.dumps(result).encode("utf-8"))
                     else:
                         self._send(404, b'{"error":"not found"}')
                         return
-                    self._send(200, b'{"ok":true}')
                 except Exception as exc:  # noqa: BLE001
                     self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"))
 
@@ -629,6 +666,112 @@ class WebDashboardNode(Node):
             self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
+
+    def _list_mission_plans(self) -> dict:
+        """List saved plans + templates for the Load dropdown."""
+        import os as _os
+        from pathlib import Path as _Path
+        plans_dir = _Path(self.mission_plans_dir).expanduser()
+        plans = []
+        if plans_dir.exists():
+            for f in sorted(plans_dir.glob("*.yaml")):
+                try:
+                    import yaml
+                    data = yaml.safe_load(f.read_text())
+                    mission = data.get("mission", data)
+                    steps = mission.get("steps", [])
+                    plans.append({
+                        "name": mission.get("name", f.stem),
+                        "filename": f.name,
+                        "modified": _os.path.getmtime(str(f)),
+                        "step_count": len(steps),
+                        "valid": True,
+                        "is_template": False,
+                    })
+                except Exception:
+                    plans.append({"name": f.stem, "filename": f.name, "modified": 0, "step_count": 0, "valid": False, "is_template": False})
+        # Templates from drone_control/missions
+        templates = []
+        mission_src = _Path(__file__).resolve().parent.parent.parent / "drone_control" / "missions"
+        if mission_src.exists():
+            for f in sorted(mission_src.glob("*.yaml")):
+                templates.append({
+                    "name": f.stem, "filename": f.name, "is_template": True,
+                    "step_count": 0, "valid": True, "modified": 0,
+                })
+        return {"plans": plans + templates}
+
+    def _load_mission_plan(self, filename: str) -> dict | None:
+        """Load a specific plan by filename."""
+        from pathlib import Path as _Path
+        plans_dir = _Path(self.mission_plans_dir).expanduser()
+        paths = [plans_dir / filename]
+        mission_src = _Path(__file__).resolve().parent.parent.parent / "drone_control" / "missions"
+        if mission_src.exists():
+            paths.append(mission_src / filename)
+        for fp in paths:
+            if fp.exists():
+                try:
+                    import yaml
+                    data = yaml.safe_load(fp.read_text())
+                    mission = data.get("mission", data)
+                    steps = mission.get("steps", [])
+                    named_steps = []
+                    for s in steps:
+                        if isinstance(s, str):
+                            named_steps.append({"type": s, "params": {}})
+                        elif isinstance(s, dict):
+                            tp = s.pop("type", "")
+                            named_steps.append({"type": tp, "params": {k: v for k, v in s.items()}})
+                    return {
+                        "name": mission.get("name", filename),
+                        "steps": named_steps,
+                        "warnings": lint_steps(named_steps),
+                        "filename": filename,
+                    }
+                except Exception as e:
+                    return {"name": filename, "steps": [], "warnings": [str(e)], "filename": filename}
+        return None
+
+    def _save_mission_plan(self, payload: dict) -> dict:
+        """Save a plan to disk. Returns {ok, filename, warnings} or {conflict: True}."""
+        name = payload.get("name", "untitled")
+        steps = payload.get("steps", [])
+        overwrite = payload.get("overwrite", False)
+        filename = sanitize_filename(name) + ".yaml"
+        from pathlib import Path as _Path
+        plans_dir = _Path(self.mission_plans_dir).expanduser()
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        fp = plans_dir / filename
+        if fp.exists() and not overwrite:
+            return {"ok": False, "conflict": True, "filename": filename}
+        yaml_str = steps_to_yaml(name, steps)
+        fp.write_text(yaml_str)
+        return {"ok": True, "filename": filename, "warnings": lint_steps(steps)}
+
+    def _delete_mission_plan(self, filename: str) -> dict | None:
+        """Delete a saved plan. Returns {ok: True} or None if not found."""
+        from pathlib import Path as _Path
+        fp = _Path(self.mission_plans_dir).expanduser() / filename
+        if fp.exists():
+            fp.unlink()
+            return {"ok": True}
+        return None
+
+    def _send_mission_plan(self, payload: dict) -> dict:
+        """Validate, serialize, and publish a plan. Returns {ok, yaml, warnings} or {errors}."""
+        name = payload.get("name", "untitled")
+        steps = payload.get("steps", [])
+        errors = []
+        for s in steps:
+            errors.extend(validate_step(s))
+        if errors:
+            return {"ok": False, "errors": errors}
+        yaml_str = steps_to_yaml(name, steps)
+        msg = String(data=yaml_str)
+        self.plan_pub.publish(msg)
+        self.get_logger().info(f"Published mission plan '{name}' ({len(steps)} steps) to {self.get_parameter('mission_plan_topic').value}")
+        return {"ok": True, "yaml": yaml_str, "warnings": lint_steps(steps)}
 
     def destroy_node(self) -> None:
         try:
