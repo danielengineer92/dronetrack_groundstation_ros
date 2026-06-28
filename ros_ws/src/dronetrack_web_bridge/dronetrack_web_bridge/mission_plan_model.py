@@ -5,6 +5,7 @@ dashboard can validate, serialise, and lint mission plans without importing
 the Pi-side package.
 """
 
+import math
 import re
 from typing import Any
 
@@ -89,11 +90,6 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
                 "type": "float", "default": 2.0, "min": 0.3, "step": 0.5,
                 "label": "Approach Distance (m)",
             },
-            "until": {
-                "type": "enum", "default": "approach_done",
-                "options": ["approach_done", "none"],
-                "label": "Exit Condition",
-            },
             "timeout_s": {
                 "type": "float", "default": 20.0, "min": 0.0, "step": 1.0,
                 "label": "Timeout (s)",
@@ -138,13 +134,22 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     "land": {
         "label": "Land",
         "description": "Command immediate landing",
-        "params": {},
+        "params": {
+            "timeout_s": {
+                "type": "float", "default": 10.0, "min": 0.0, "step": 1.0,
+                "label": "Timeout (s)",
+            },
+        },
         "category": "action",
     },
     "hold": {
         "label": "Hold",
         "description": "Hold position (offboard hover)",
         "params": {
+            "status": {
+                "type": "str", "default": "holding position",
+                "label": "Status",
+            },
             "timeout_s": {
                 "type": "float", "default": 0.0, "min": 0.0, "step": 1.0,
                 "label": "Timeout (s, 0=forever)",
@@ -206,12 +211,18 @@ def validate_step(step: dict) -> list[str]:
                 errors.append(f"param '{key}' must be a number, got {type(val).__name__}")
                 continue
             val = float(val)
+            if not math.isfinite(val):
+                errors.append(f"param '{key}' must be finite, got {val}")
+                continue
             if "min" in spec and val < spec["min"]:
                 errors.append(f"param '{key}'={val} below minimum {spec['min']}")
             if "max" in spec and val > spec["max"]:
                 errors.append(f"param '{key}'={val} above maximum {spec['max']}")
-        elif ptype == "enum":
-            if val not in spec.get("options", []):
+        elif ptype in ("enum", "str"):
+            if not isinstance(val, str):
+                errors.append(f"param '{key}' must be a string, got {type(val).__name__}")
+                continue
+            if ptype == "enum" and val not in spec.get("options", []):
                 errors.append(f"param '{key}'={val!r} not in options {spec['options']}")
 
     return errors
@@ -228,9 +239,12 @@ def steps_to_yaml(plan_name: str, steps: list[dict]) -> str:
         }
     }
     for step in steps:
-        entry: dict[str, Any] = {"type": step["type"]}
+        verb = step["type"]
+        if verb not in STEP_SCHEMA:
+            raise ValueError(f"Unknown verb: {verb!r}")
+        entry: dict[str, Any] = {"type": verb}
         for key, val in step.get("params", {}).items():
-            schema = STEP_SCHEMA.get(step["type"], {}).get("params", {}).get(key, {})
+            schema = STEP_SCHEMA[verb].get("params", {}).get(key, {})
             default = schema.get("default")
             # only emit params that differ from defaults
             if val != default:

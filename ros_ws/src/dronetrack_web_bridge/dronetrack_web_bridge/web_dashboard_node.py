@@ -12,14 +12,20 @@ endpoint. Differences for the split architecture:
     dashboard never publishes control, enable, or arming topics.
 
 Endpoints:
-    GET  /                 dashboard HTML
-    GET  /api/status       latest status JSON
-    GET  /api/missions     local mission plan previews (display only)
-    GET  /stream.mjpg      live camera stream with YOLO detection overlays
-    POST /api/mission_request   {"enabled": true|false}
-    POST /api/autonomy_request  {"enabled": true|false}
-    POST /api/abort_hold        {"confirm": true}
-    POST /api/land              {"confirm": true}
+    GET    /                            dashboard HTML
+    GET    /api/status                  latest status JSON
+    GET    /api/missions                local mission plan previews (display only)
+    GET    /stream.mjpg                 live camera stream with YOLO detection overlays
+    GET    /api/mission-plans           list saved plans + templates
+    GET    /api/mission-plans/<file>    load a plan by filename
+    POST   /api/mission-plans/save      save a plan to disk  (JSON body: {name, steps, overwrite?})
+    POST   /api/mission-plans/send      validate & publish a plan (JSON body: {name, steps})
+    DELETE /api/mission-plans/<file>    delete a saved plan
+    GET    /api/mission-step-schema     step verb + parameter definitions for the UI
+    POST   /api/mission_request         {"enabled": true|false}
+    POST   /api/autonomy_request        {"enabled": true|false}
+    POST   /api/abort_hold              {"confirm": true}
+    POST   /api/land                    {"confirm": true}
 """
 
 from __future__ import annotations
@@ -575,6 +581,9 @@ class WebDashboardNode(Node):
 
             def _send(self, code, body, ctype="application/json"):
                 self.send_response(code)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -596,6 +605,9 @@ class WebDashboardNode(Node):
                     self._send(200, json.dumps(node._list_mission_plans()).encode("utf-8"))
                 elif path.startswith("/api/mission-plans/"):
                     filename = path[len("/api/mission-plans/"):]
+                    if not filename or not node._safe_filename(filename):
+                        self._send(400, b'{"error":"invalid filename"}')
+                        return
                     from urllib.parse import unquote
                     result = node._load_mission_plan(unquote(filename))
                     if result is None:
@@ -607,12 +619,25 @@ class WebDashboardNode(Node):
 
             def do_DELETE(self):
                 if self.path.startswith("/api/mission-plans/"):
+                    filename = self.path[len("/api/mission-plans/"):]
+                    if not filename or not node._safe_filename(filename):
+                        self._send(400, b'{"error":"invalid filename"}')
+                        return
                     from urllib.parse import unquote
-                    filename = unquote(self.path[len("/api/mission-plans/"):])
-                    result = node._delete_mission_plan(filename)
-                    self._send(200 if result else 404, json.dumps(result).encode("utf-8"))
+                    result = node._delete_mission_plan(unquote(filename))
+                    if result is None:
+                        self._send(404, b'{"error":"plan not found"}')
+                    else:
+                        self._send(200, json.dumps(result).encode("utf-8"))
                 else:
                     self._send(404, b'{"error":"not found"}')
+
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.end_headers()
 
             def do_POST(self):
                 path = self.path.split("?", 1)[0]
@@ -638,6 +663,9 @@ class WebDashboardNode(Node):
                         result = node._save_mission_plan(payload)
                         if result.get("conflict"):
                             self._send(409, json.dumps(result).encode("utf-8"))
+                            return
+                        if "errors" in result and result["errors"]:
+                            self._send(400, json.dumps(result).encode("utf-8"))
                             return
                         self._send(200, json.dumps(result).encode("utf-8"))
                     elif path == "/api/mission-plans/send":
@@ -666,6 +694,15 @@ class WebDashboardNode(Node):
             self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
+
+    @staticmethod
+    def _safe_filename(filename: str) -> bool:
+        """Reject path-traversal and empty filenames before passing to Path."""
+        if not filename or ".." in filename:
+            return False
+        if filename.startswith("/") or "\\" in filename:
+            return False
+        return True
 
     def _list_mission_plans(self) -> dict:
         """List saved plans + templates for the Load dropdown."""
@@ -703,14 +740,26 @@ class WebDashboardNode(Node):
 
     def _load_mission_plan(self, filename: str) -> dict | None:
         """Load a specific plan by filename."""
+        if not self._safe_filename(filename):
+            return None
         from pathlib import Path as _Path
         plans_dir = _Path(self.mission_plans_dir).expanduser()
+        resolved_plans_dir = plans_dir.resolve()
         paths = [plans_dir / filename]
         mission_src = _Path(__file__).resolve().parent.parent.parent / "drone_control" / "missions"
         if mission_src.exists():
+            resolved_mission_src = mission_src.resolve()
             paths.append(mission_src / filename)
         for fp in paths:
             if fp.exists():
+                # Extra defence: confirm the resolved path stays within its base
+                try:
+                    resolved = fp.resolve()
+                except OSError:
+                    continue
+                if not any(str(resolved).startswith(str(base)) for base in
+                           ([resolved_plans_dir, resolved_mission_src] if mission_src.exists() else [resolved_plans_dir])):
+                    continue
                 try:
                     import yaml
                     data = yaml.safe_load(fp.read_text())
@@ -721,8 +770,8 @@ class WebDashboardNode(Node):
                         if isinstance(s, str):
                             named_steps.append({"type": s, "params": {}})
                         elif isinstance(s, dict):
-                            tp = s.pop("type", "")
-                            named_steps.append({"type": tp, "params": {k: v for k, v in s.items()}})
+                            tp = s.get("type", "")
+                            named_steps.append({"type": tp, "params": {k: v for k, v in s.items() if k != "type"}})
                     return {
                         "name": mission.get("name", filename),
                         "steps": named_steps,
@@ -738,6 +787,11 @@ class WebDashboardNode(Node):
         name = payload.get("name", "untitled")
         steps = payload.get("steps", [])
         overwrite = payload.get("overwrite", False)
+        errors = []
+        for s in steps:
+            errors.extend(validate_step(s))
+        if errors:
+            return {"ok": False, "errors": errors}
         filename = sanitize_filename(name) + ".yaml"
         from pathlib import Path as _Path
         plans_dir = _Path(self.mission_plans_dir).expanduser()
@@ -751,8 +805,15 @@ class WebDashboardNode(Node):
 
     def _delete_mission_plan(self, filename: str) -> dict | None:
         """Delete a saved plan. Returns {ok: True} or None if not found."""
+        if not self._safe_filename(filename):
+            return None
         from pathlib import Path as _Path
         fp = _Path(self.mission_plans_dir).expanduser() / filename
+        try:
+            if not str(fp.resolve()).startswith(str(_Path(self.mission_plans_dir).expanduser().resolve())):
+                return None
+        except OSError:
+            return None
         if fp.exists():
             fp.unlink()
             return {"ok": True}
