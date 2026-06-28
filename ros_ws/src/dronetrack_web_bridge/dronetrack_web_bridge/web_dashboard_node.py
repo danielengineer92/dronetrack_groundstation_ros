@@ -642,6 +642,9 @@ class WebDashboardNode(Node):
             def do_POST(self):
                 path = self.path.split("?", 1)[0]
                 length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > 1_000_000:
+                    self._send(413, b'{"error":"payload too large"}')
+                    return
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     payload = json.loads(raw or b"{}")
@@ -677,8 +680,9 @@ class WebDashboardNode(Node):
                     else:
                         self._send(404, b'{"error":"not found"}')
                         return
-                except Exception as exc:  # noqa: BLE001
-                    self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"))
+                except Exception:
+                    node.get_logger().exception("POST handler error")
+                    self._send(500, b'{"error":"internal error"}')
 
         # Bind dual-stack (IPv4+IPv6) when listening on all interfaces, so the
         # page is reachable as both http://127.0.0.1 and http://localhost. Under
@@ -757,8 +761,10 @@ class WebDashboardNode(Node):
                     resolved = fp.resolve()
                 except OSError:
                     continue
-                if not any(str(resolved).startswith(str(base)) for base in
-                           ([resolved_plans_dir, resolved_mission_src] if mission_src.exists() else [resolved_plans_dir])):
+                bases = [resolved_plans_dir]
+                if mission_src.exists():
+                    bases.append(resolved_mission_src)
+                if not any(resolved.is_relative_to(base) for base in bases):
                     continue
                 try:
                     import yaml
@@ -810,7 +816,7 @@ class WebDashboardNode(Node):
         from pathlib import Path as _Path
         fp = _Path(self.mission_plans_dir).expanduser() / filename
         try:
-            if not str(fp.resolve()).startswith(str(_Path(self.mission_plans_dir).expanduser().resolve())):
+            if not fp.resolve().is_relative_to(_Path(self.mission_plans_dir).expanduser().resolve()):
                 return None
         except OSError:
             return None

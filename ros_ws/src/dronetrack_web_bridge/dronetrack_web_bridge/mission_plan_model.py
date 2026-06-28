@@ -239,9 +239,9 @@ def steps_to_yaml(plan_name: str, steps: list[dict]) -> str:
         }
     }
     for step in steps:
-        verb = step["type"]
-        if verb not in STEP_SCHEMA:
-            raise ValueError(f"Unknown verb: {verb!r}")
+        verb = step.get("type")
+        if not isinstance(verb, str) or verb not in STEP_SCHEMA:
+            raise ValueError(f"Unknown or missing step type: {verb!r}")
         entry: dict[str, Any] = {"type": verb}
         for key, val in step.get("params", {}).items():
             schema = STEP_SCHEMA[verb].get("params", {}).get(key, {})
@@ -282,18 +282,18 @@ def lint_steps(steps: list[dict]) -> list[str]:
         if verb == "prime_offboard":
             seen_prime = True
 
-        timeout = step.get("params", {}).get("timeout_s", 0)
-        if verb in {"scan", "approach", "orbit"} and (timeout is None or timeout == 0):
+        timeout = step.get("params", {}).get("timeout_s")
+        if verb in {"scan", "approach", "orbit"} and timeout is None:
             warnings.append(
                 f"Step {i+1} ({verb}): no timeout set — step may run indefinitely"
             )
 
         if verb == "scan":
-            until = step.get("params", {}).get("until", "")
-            if until not in ("locked",):
+            until = step.get("params", {}).get("until")
+            if until in (None, "none") and timeout is None:
                 warnings.append(
-                    f"Step {i+1} (scan): no exit condition set — "
-                    "consider setting 'until: locked'"
+                    f"Step {i+1} (scan): has neither 'until' nor 'timeout_s' — "
+                    "the step could run indefinitely"
                 )
 
     if has_motion and not has_prime:

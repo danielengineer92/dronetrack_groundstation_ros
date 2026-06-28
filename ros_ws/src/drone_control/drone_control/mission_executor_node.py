@@ -419,11 +419,11 @@ class MissionExecutorNode(Node):
             return
 
         import yaml
-        from drone_control.mission_plan import parse_mission_plan, lint_plan, MissionPlanError
+        from drone_control.mission_plan import parse_mission_plan
         try:
             data = yaml.safe_load(msg.data)
             plan = parse_mission_plan(data)
-        except (MissionPlanError, yaml.YAMLError, Exception) as exc:
+        except (MissionPlanError, yaml.YAMLError, ImportError) as exc:
             self.get_logger().error(f"Invalid mission plan from dashboard: {exc}")
             self.log_event("mission_plan_rejected", source="dashboard", error=str(exc))
             self.diagnostics.mark_received(self.mission_plan_topic, summary=f"rejected_parse_error ({exc})")
@@ -438,7 +438,7 @@ class MissionExecutorNode(Node):
         self.step_enter_time = time.monotonic()
         self.get_logger().info(f"Accepted mission plan '{plan.name}' from dashboard | {len(plan.steps)} steps")
         self.log_event("mission_plan_received", source="dashboard", plan=plan.name, steps=[s.type for s in plan.steps])
-        self.publish_state()
+        self.publish_state(f"plan received: {plan.name}")
         self.diagnostics.mark_received(
             self.mission_plan_topic, summary=f"accepted: {plan.name} ({len(plan.steps)} steps)"
         )
