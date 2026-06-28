@@ -44,6 +44,8 @@ STEP_TYPE_TO_STATE: dict[str, str] = {
     "rtl": "RETURN_TO_LAUNCH",
     "land": "LAND",
     "hold": "HOLD",
+    "goto_relative": "GOTO_RELATIVE",
+    "goto_absolute": "GOTO_ABSOLUTE",
     "complete": "COMPLETE",
 }
 
@@ -60,7 +62,7 @@ VALID_UNTIL: frozenset[str] = frozenset(
 # these should normally come after a prime_offboard step. `scan` yaw-sweeps in
 # Offboard (position-held), so it belongs here too.
 MOTION_STEP_TYPES: frozenset[str] = frozenset(
-    {"scan", "track_center", "approach", "orbit"}
+    {"scan", "track_center", "approach", "orbit", "goto_relative", "goto_absolute"}
 )
 
 # Verbs that run open-loop or search for a bounded time. A plan author should give

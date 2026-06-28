@@ -1,0 +1,12 @@
+mission:
+  name: full_mission_test
+  steps:
+    - {type: takeoff, altitude_m: 3.0}
+    - {type: prime_offboard, hold_s: 1.5}
+    - {type: scan, direction: ccw, yaw_deg: 180, yaw_rate_deg_s: 20, until: locked, timeout_s: 12}
+    - {type: track_center, until: centered, timeout_s: 15}
+    - {type: approach, distance_m: 2.0, until: approach_done, timeout_s: 20}
+    - {type: goto_relative, north_m: 1.0, east_m: 0.0, down_m: 0.0, timeout_s: 10, acceptance_m: 0.5}
+    - {type: goto_absolute, north_m: 0.0, east_m: 0.0, down_m: -3.0, timeout_s: 10, acceptance_m: 0.5}
+    - {type: orbit, radius_m: 2.0, speed_m_s: 0.4, revolutions: 1, timeout_s: 45}
+    - {type: land}

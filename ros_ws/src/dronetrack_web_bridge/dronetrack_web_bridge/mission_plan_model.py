@@ -157,6 +157,60 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         },
         "category": "preflight",
     },
+    "goto_relative": {
+        "label": "Go To (Relative)",
+        "description": "Fly a NED offset from the current position",
+        "params": {
+            "north_m": {
+                "type": "float", "default": 0.0, "min": -50.0, "max": 50.0, "step": 0.5,
+                "label": "North (m)",
+            },
+            "east_m": {
+                "type": "float", "default": 0.0, "min": -50.0, "max": 50.0, "step": 0.5,
+                "label": "East (m)",
+            },
+            "down_m": {
+                "type": "float", "default": 0.0, "min": -20.0, "max": 10.0, "step": 0.5,
+                "label": "Down (m, negative=up)",
+            },
+            "timeout_s": {
+                "type": "float", "default": 15.0, "min": 0.0, "step": 1.0,
+                "label": "Timeout (s)",
+            },
+            "acceptance_m": {
+                "type": "float", "default": 0.5, "min": 0.1, "step": 0.1,
+                "label": "Acceptance Radius (m)",
+            },
+        },
+        "category": "motion",
+    },
+    "goto_absolute": {
+        "label": "Go To (Absolute)",
+        "description": "Fly to an absolute local NED position (relative to home)",
+        "params": {
+            "north_m": {
+                "type": "float", "default": 0.0, "min": -50.0, "max": 50.0, "step": 0.5,
+                "label": "North (m)",
+            },
+            "east_m": {
+                "type": "float", "default": 0.0, "min": -50.0, "max": 50.0, "step": 0.5,
+                "label": "East (m)",
+            },
+            "down_m": {
+                "type": "float", "default": -3.0, "min": -50.0, "max": 0.0, "step": 0.5,
+                "label": "Down (m, negative=up)",
+            },
+            "timeout_s": {
+                "type": "float", "default": 15.0, "min": 0.0, "step": 1.0,
+                "label": "Timeout (s)",
+            },
+            "acceptance_m": {
+                "type": "float", "default": 0.5, "min": 0.1, "step": 0.1,
+                "label": "Acceptance Radius (m)",
+            },
+        },
+        "category": "motion",
+    },
 }
 
 CATEGORY_COLORS: dict[str, str] = {
@@ -234,7 +288,7 @@ def steps_to_yaml(plan_name: str, steps: list[dict]) -> str:
 
     data: dict[str, Any] = {
         "mission": {
-            "name": sanitize_filename(plan_name),
+            "name": plan_name.strip() or "untitled",
             "steps": [],
         }
     }
@@ -244,11 +298,7 @@ def steps_to_yaml(plan_name: str, steps: list[dict]) -> str:
             raise ValueError(f"Unknown or missing step type: {verb!r}")
         entry: dict[str, Any] = {"type": verb}
         for key, val in step.get("params", {}).items():
-            schema = STEP_SCHEMA[verb].get("params", {}).get(key, {})
-            default = schema.get("default")
-            # only emit params that differ from defaults
-            if val != default:
-                entry[key] = val
+            entry[key] = val
         data["mission"]["steps"].append(entry)
 
     return yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
@@ -264,14 +314,14 @@ def lint_steps(steps: list[dict]) -> list[str]:
 
     has_prime = any(s.get("type") == "prime_offboard" for s in steps)
     has_motion = any(
-        s.get("type") in {"scan", "track_center", "approach", "orbit"}
+        s.get("type") in {"scan", "track_center", "approach", "orbit", "goto_relative", "goto_absolute"}
         for s in steps
     )
 
     seen_prime = False
     for i, step in enumerate(steps):
         verb = step.get("type", "")
-        is_motion = verb in {"scan", "track_center", "approach", "orbit"}
+        is_motion = verb in {"scan", "track_center", "approach", "orbit", "goto_relative", "goto_absolute"}
 
         if is_motion and not seen_prime:
             warnings.append(

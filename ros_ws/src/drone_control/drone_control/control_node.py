@@ -854,6 +854,16 @@ class ControlNode(Node):
             self.publish_position_hold("POSITION_HOLD_TRANSLATION_DISABLED_FOR_STAGE1", yaw_rate=0.0, update_yaw=False)
             return
 
+        if mission_mode == "GOTO":
+            if mission is not None and bool(mission.target_position_valid):
+                self.hold_position_north = float(mission.target_north)
+                self.hold_position_east = float(mission.target_east)
+                self.hold_position_down = float(mission.target_down)
+                self.position_hold_valid = True
+                self.position_hold_anchor_source = "goto"
+            self.publish_position_hold("GOTO", yaw_rate=0.0, update_yaw=False)
+            return
+
         if mission_mode == "SCAN":
             # Open-loop yaw sweep: hold the captured local-NED anchor and rotate
             # in place at the executor-commanded yaw rate. No target is required

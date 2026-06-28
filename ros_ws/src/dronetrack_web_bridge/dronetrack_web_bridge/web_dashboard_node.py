@@ -55,7 +55,7 @@ from dronetrack_msgs.msg import GroundStationHeartbeat, LinkStatus
 from dronetrack_web_bridge.mission_preview import load_mission_catalog
 from dronetrack_web_bridge.mission_plan_model import (
     get_step_schema, create_default_step, validate_step,
-    steps_to_yaml, lint_steps, sanitize_filename, CATEGORY_COLORS,
+    steps_to_yaml, lint_steps, sanitize_filename, CATEGORY_COLORS, STEP_SCHEMA,
 )
 from dronetrack_web_bridge.mission_preview_ext import plan_from_steps
 
@@ -176,9 +176,10 @@ function finite(n){ return typeof n === 'number' && Number.isFinite(n); }
 let planSteps = [], selectedStep = null, stepSchema = {};
 const VERB_CAT = {
   prime_offboard:'preflight', takeoff:'action', land:'action', rtl:'action',
-  hold:'action', scan:'motion', approach:'motion', orbit:'motion', track_center:'motion'
+  hold:'action', scan:'motion', approach:'motion', orbit:'motion', track_center:'motion',
+  goto_relative:'motion', goto_absolute:'motion'
 };
-const ADD_VERBS = ['takeoff','prime_offboard','scan','track_center','approach','orbit','rtl','land','hold'];
+const ADD_VERBS = ['takeoff','prime_offboard','scan','track_center','approach','orbit','goto_relative','goto_absolute','rtl','land','hold'];
 function missionMain(text){
   const s = (text || '').trim();
   const idx = s.indexOf(':');
@@ -274,7 +275,9 @@ async function refreshLoadDropdown() {
 function addStep(verb) {
   const sc = stepSchema[verb] || {};
   const params = {};
-  (sc.params || []).forEach(p => { if (p.default !== undefined) params[p.name] = p.default; });
+  for (const [k, spec] of Object.entries(sc.params || {})) {
+    if (spec.default !== undefined) params[k] = spec.default;
+  }
   planSteps.push({type: verb, params});
   selectedStep = planSteps.length - 1;
   autosave(); renderSteps();
@@ -346,31 +349,39 @@ function renderSteps() {
     card.appendChild(head);
     if (selectedStep === i) {
       const sc = stepSchema[step.type] || {};
-      const pDefs = sc.params || [];
-      if (pDefs.length) {
+      const pEntries = Object.entries(sc.params || {});
+      if (pEntries.length) {
         const ed = document.createElement('div');
         ed.className = 'param-editor';
-        pDefs.forEach(pd => {
+        pEntries.forEach(([pName, spec]) => {
           const lbl = document.createElement('label');
-          lbl.textContent = pd.name + (pd.unit ? ' ('+pd.unit+')' : '');
+          lbl.textContent = spec.label || pName;
           let inp;
-          if (pd.type === 'enum' && pd.choices) {
+          if (spec.type === 'enum' && spec.options) {
             inp = document.createElement('select');
-            pd.choices.forEach(c => {
+            spec.options.forEach(c => {
               const o = document.createElement('option');
               o.value = c; o.textContent = c;
-              const cur = step.params[pd.name];
-              if (cur === c || (cur === undefined && pd.default === c)) o.selected = true;
+              const cur = step.params[pName];
+              if (cur === c || (cur === undefined && spec.default === c)) o.selected = true;
               inp.appendChild(o);
             });
+          } else if (spec.type === 'str') {
+            inp = document.createElement('input');
+            inp.type = 'text';
+            const cur = step.params[pName];
+            inp.value = cur !== undefined ? cur : (spec.default !== undefined ? spec.default : '');
           } else {
             inp = document.createElement('input');
-            inp.type = 'number'; inp.step = 'any';
-            const cur = step.params[pd.name];
-            inp.value = cur !== undefined ? cur : (pd.default !== undefined ? pd.default : '');
+            inp.type = 'number';
+            if (spec.step) inp.step = spec.step;
+            if (spec.min !== undefined) inp.min = spec.min;
+            if (spec.max !== undefined) inp.max = spec.max;
+            const cur = step.params[pName];
+            inp.value = cur !== undefined ? cur : (spec.default !== undefined ? spec.default : '');
           }
           inp.onchange = () => {
-            planSteps[i].params[pd.name] = inp.tagName === 'SELECT' ? inp.value : parseFloat(inp.value);
+            planSteps[i].params[pName] = inp.tagName === 'SELECT' || spec.type === 'str' ? inp.value : parseFloat(inp.value);
             sumEl.textContent = stepSummary(planSteps[i]);
             autosave();
           };
@@ -806,12 +817,12 @@ class WebDashboardNode(Node):
                 elif path == "/api/mission-plans":
                     self._send(200, json.dumps(node._list_mission_plans()).encode("utf-8"))
                 elif path.startswith("/api/mission-plans/"):
-                    filename = path[len("/api/mission-plans/"):]
+                    from urllib.parse import unquote
+                    filename = unquote(path[len("/api/mission-plans/"):])
                     if not filename or not node._safe_filename(filename):
                         self._send(400, b'{"error":"invalid filename"}')
                         return
-                    from urllib.parse import unquote
-                    result = node._load_mission_plan(unquote(filename))
+                    result = node._load_mission_plan(filename)
                     if result is None:
                         self._send(404, b'{"error":"plan not found"}')
                     else:
@@ -820,13 +831,14 @@ class WebDashboardNode(Node):
                     self._send(404, b'{"error":"not found"}')
 
             def do_DELETE(self):
-                if self.path.startswith("/api/mission-plans/"):
-                    filename = self.path[len("/api/mission-plans/"):]
+                path = self.path.split("?", 1)[0]
+                if path.startswith("/api/mission-plans/"):
+                    from urllib.parse import unquote
+                    filename = unquote(path[len("/api/mission-plans/"):])
                     if not filename or not node._safe_filename(filename):
                         self._send(400, b'{"error":"invalid filename"}')
                         return
-                    from urllib.parse import unquote
-                    result = node._delete_mission_plan(unquote(filename))
+                    result = node._delete_mission_plan(filename)
                     if result is None:
                         self._send(404, b'{"error":"plan not found"}')
                     else:
@@ -976,10 +988,19 @@ class WebDashboardNode(Node):
                     named_steps = []
                     for s in steps:
                         if isinstance(s, str):
-                            named_steps.append({"type": s, "params": {}})
+                            tp = s
+                            raw_params = {}
                         elif isinstance(s, dict):
                             tp = s.get("type", "")
-                            named_steps.append({"type": tp, "params": {k: v for k, v in s.items() if k != "type"}})
+                            raw_params = {k: v for k, v in s.items() if k != "type"}
+                        else:
+                            continue
+                        defaults = {}
+                        if tp in STEP_SCHEMA:
+                            for k, spec in STEP_SCHEMA[tp].get("params", {}).items():
+                                defaults[k] = spec["default"]
+                        defaults.update(raw_params)
+                        named_steps.append({"type": tp, "params": defaults})
                     return {
                         "name": mission.get("name", filename),
                         "steps": named_steps,

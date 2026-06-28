@@ -58,6 +58,8 @@ class MissionState(Enum):
     TRACK_CENTER = "TRACK_CENTER"
     APPROACH_TARGET = "APPROACH_TARGET"
     DO_ORBIT = "DO_ORBIT"
+    GOTO_RELATIVE = "GOTO_RELATIVE"
+    GOTO_ABSOLUTE = "GOTO_ABSOLUTE"
     RETURN_TO_LAUNCH = "RETURN_TO_LAUNCH"
     LAND = "LAND"
     COMPLETE = "COMPLETE"
@@ -72,6 +74,8 @@ STEP_NAMES = {
     MissionState.TRACK_CENTER: "4_track_center_yaw",
     MissionState.APPROACH_TARGET: "5_approach_target",
     MissionState.DO_ORBIT: "6_orbit_target",
+    MissionState.GOTO_RELATIVE: "goto_relative",
+    MissionState.GOTO_ABSOLUTE: "goto_absolute",
     MissionState.RETURN_TO_LAUNCH: "7_return_home",
     MissionState.LAND: "8_land",
 }
@@ -235,6 +239,8 @@ class MissionExecutorNode(Node):
             "rtl": self._step_rtl,
             "land": self._step_land,
             "hold": self._step_hold,
+            "goto_relative": self._step_goto_relative,
+            "goto_absolute": self._step_goto_absolute,
             "complete": self._step_complete,
         }
 
@@ -501,6 +507,8 @@ class MissionExecutorNode(Node):
         self.log_event("state_transition", from_state=self.state.value, to_state=new_state.value)
         self.state = new_state
         self.state_enter_time = time.monotonic()
+        if hasattr(self, "_goto_anchor"):
+            del self._goto_anchor
 
     def telemetry_is_fresh(self) -> bool:
         if self.last_telemetry is None:
@@ -667,6 +675,8 @@ class MissionExecutorNode(Node):
     def publish_mission_command(
         self, mode: str, active: bool, status: str, *, yaw_rate: float = 0.0,
         desired_distance_m: Optional[float] = None,
+        target_north: float = 0.0, target_east: float = 0.0, target_down: float = 0.0,
+        target_position_valid: bool = False,
     ) -> None:
         msg = MissionCommand()
         msg.stamp = self.get_clock().now().to_msg()
@@ -681,6 +691,10 @@ class MissionExecutorNode(Node):
         )
         msg.orbit_radius_m = float(self.orbit_radius_m)
         msg.orbit_speed_m_s = float(self.orbit_speed_m_s)
+        msg.target_position_valid = bool(target_position_valid)
+        msg.target_north = float(target_north)
+        msg.target_east = float(target_east)
+        msg.target_down = float(target_down)
         msg.step_index = self.step_index_for_state(self.state)
         msg.step_name = STEP_NAMES.get(self.state, self.state.value.lower())
         msg.status = status
@@ -768,6 +782,8 @@ class MissionExecutorNode(Node):
         prev = self.plan.steps[self.step_index].type if self.step_index < len(self.plan.steps) else "?"
         self.step_index += 1
         self.step_enter_time = time.monotonic()
+        if hasattr(self, "_goto_anchor"):
+            del self._goto_anchor
         if self.step_index < len(self.plan.steps):
             nxt = self.plan.steps[self.step_index]
             self.get_logger().warning(f"Mission step '{prev}' done -> step {self.step_index} '{nxt.type}'")
@@ -1007,6 +1023,63 @@ class MissionExecutorNode(Node):
         age = self.step_age()
         self.publish_state(f"hold, age={age:.1f}/{timeout:.1f}s")
         return timeout > 0.0 and age >= timeout
+
+    def _goto_target_ned(self, step, relative: bool) -> tuple[float, float, float]:
+        """Compute target NED. For relative, offset from current position."""
+        n = step.get_float("north_m", 0.0)
+        e = step.get_float("east_m", 0.0)
+        d = step.get_float("down_m", 0.0)
+        if relative and self.last_telemetry is not None:
+            if not hasattr(self, "_goto_anchor"):
+                self._goto_anchor = (
+                    float(getattr(self.last_telemetry, "local_position_north", 0.0)),
+                    float(getattr(self.last_telemetry, "local_position_east", 0.0)),
+                    float(getattr(self.last_telemetry, "local_position_down", 0.0)),
+                )
+            an, ae, ad = self._goto_anchor
+            return an + n, ae + e, ad + d
+        return n, e, d
+
+    def _goto_distance_to_target(self, tn: float, te: float, td: float) -> float:
+        if self.last_telemetry is None:
+            return float("inf")
+        cn = float(getattr(self.last_telemetry, "local_position_north", 0.0))
+        ce = float(getattr(self.last_telemetry, "local_position_east", 0.0))
+        cd = float(getattr(self.last_telemetry, "local_position_down", 0.0))
+        return math.sqrt((tn - cn) ** 2 + (te - ce) ** 2 + (td - cd) ** 2)
+
+    def _step_goto(self, step, relative: bool) -> bool:
+        if not self._check_airborne_local_or_hold("goto"):
+            self.publish_offboard_request(False)
+            return False
+        self.publish_offboard_request(True)
+        tn, te, td = self._goto_target_ned(step, relative)
+        acceptance = step.get_float("acceptance_m", 0.5)
+        dist = self._goto_distance_to_target(tn, te, td)
+        label = "goto_relative" if relative else "goto_absolute"
+        self.publish_mission_command(
+            "GOTO", True,
+            f"{label} to N={tn:.2f} E={te:.2f} D={td:.2f}, dist={dist:.2f}m",
+            target_north=tn, target_east=te, target_down=td,
+            target_position_valid=True,
+        )
+        age = self.step_age()
+        timeout = step.timeout_s if step.timeout_s is not None else 15.0
+        self.publish_state(
+            f"{label}, target=({tn:.1f},{te:.1f},{td:.1f}), "
+            f"dist={dist:.2f}m, accept={acceptance:.1f}m, age={age:.1f}/{timeout:.1f}s"
+        )
+        if dist <= acceptance:
+            return True
+        if timeout > 0.0 and age > timeout:
+            return True
+        return False
+
+    def _step_goto_relative(self, step) -> bool:
+        return self._step_goto(step, relative=True)
+
+    def _step_goto_absolute(self, step) -> bool:
+        return self._step_goto(step, relative=False)
 
     def _step_complete(self, step) -> bool:
         self._enter_complete()

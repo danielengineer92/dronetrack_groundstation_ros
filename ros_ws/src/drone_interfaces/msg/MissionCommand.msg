@@ -20,6 +20,12 @@ float32 desired_distance_m
 float32 orbit_speed_m_s
 float32 orbit_radius_m
 
+# Target NED position for goto commands.
+bool target_position_valid
+float32 target_north
+float32 target_east
+float32 target_down
+
 # Debug/status text from mission executor.
 uint32 step_index
 string step_name
