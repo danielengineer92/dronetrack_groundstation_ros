@@ -60,6 +60,9 @@ class TargetMoverNode(Node):
         self.start_time = time.monotonic()
         self.calls_sent = 0
         self.calls_ok = 0
+        self._consecutive_fails = 0
+        self._paused = False
+        self._retry_timer = None
 
         self.get_logger().info(
             f"Target mover up | entity={self.entity_name}, "
@@ -89,6 +92,9 @@ class TargetMoverNode(Node):
             )
 
     def _move(self) -> None:
+        if self._paused:
+            return
+
         t = time.monotonic() - self.start_time
         x = self.cx + self.radius * math.cos(self.omega * t)
         y = self.cy + self.radius * math.sin(self.omega * t)
@@ -111,10 +117,50 @@ class TargetMoverNode(Node):
             resp = future.result()
             if resp and resp.success:
                 self.calls_ok += 1
+                self._consecutive_fails = 0
+            else:
+                self._consecutive_fails += 1
+                if self._consecutive_fails >= 10 and not self._paused:
+                    self._paused = True
+                    self.get_logger().warning(
+                        f"Entity '{self.entity_name}' not found after "
+                        f"{self._consecutive_fails} attempts — pausing mover. "
+                        "Will retry every 5 s until the entity is spawned."
+                    )
+                    self._retry_timer = self.create_timer(5.0, self._retry_probe)
         except Exception as exc:
             self.get_logger().warning(
                 f"set_pose call failed: {exc}", throttle_duration_sec=5.0
             )
+
+    def _retry_probe(self) -> None:
+        """Send a single pose to see if the entity exists yet."""
+        req = SetEntityPose.Request()
+        req.entity = Entity()
+        req.entity.name = self.entity_name
+        req.entity.type = 2
+        req.pose = Pose(
+            position=Point(x=self.cx, y=self.cy, z=self.alt),
+            orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        future = self.client.call_async(req)
+        future.add_done_callback(self._on_retry_result)
+
+    def _on_retry_result(self, future) -> None:
+        try:
+            resp = future.result()
+            if resp and resp.success:
+                self.get_logger().info(
+                    f"Entity '{self.entity_name}' found — resuming motion loop."
+                )
+                self._paused = False
+                self._consecutive_fails = 0
+                self.start_time = time.monotonic()
+                if self._retry_timer:
+                    self._retry_timer.cancel()
+                    self._retry_timer = None
+        except Exception:
+            pass
 
     def _report(self) -> None:
         self.get_logger().info(
