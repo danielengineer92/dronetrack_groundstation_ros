@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# dt — DroneTrack SITL container manager (ROS 2 Jazzy + Gazebo Harmonic on the 5080)
+#
+#   docker/dt build     build the image (one time, ~10 min)
+#   docker/dt setup     clone+build PX4, build repo overlay, create YOLO venv (one time)
+#   docker/dt px4       TERMINAL 1: PX4 + Gazebo (renders the camera on the 5080)
+#   docker/dt run ...   TERMINAL 2: the DroneTrack stack (camera->YOLO->tracker->control)
+#   docker/dt shell     a bash shell inside the container
+#   docker/dt topic ... run `ros2 topic ...` in the sim env (e.g. dt topic hz /sim/camera/image_raw)
+#   docker/dt status    show container + GPU state
+#   docker/dt down      stop & remove the container (keeps the built image + home volume)
+#   docker/dt nuke      down + remove the home volume (forces a fresh setup)
+set -eo pipefail
+
+IMAGE="dronetrack-sim:jazzy"
+CONTAINER="dronetrack-sim"
+HOME_VOL="dronetrack-home"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The base osrf/ros image ships a default 'ubuntu' user at UID 1000, so that's
+# the container HOME. Persist it (PX4, overlay, venv) and mount the repo under it.
+CONTAINER_HOME="/home/ubuntu"
+REPO_IN="${CONTAINER_HOME}/dronetrack_groundstation_ros"
+
+# Use docker directly if we can; otherwise fall back to sudo (will prompt once).
+if docker info >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo docker"; fi
+
+running() { [ -n "$(${DOCKER} ps -q -f name="^${CONTAINER}$")" ]; }
+exists()  { [ -n "$(${DOCKER} ps -aq -f name="^${CONTAINER}$")" ]; }
+
+allow_x() {
+  # Let the container's X clients (gz, RViz) talk to the host X server (XWayland).
+  command -v xhost >/dev/null 2>&1 && xhost +local: >/dev/null 2>&1 || true
+}
+
+ensure_up() {
+  exists || ensure_up_create
+  running || ${DOCKER} start "${CONTAINER}" >/dev/null
+}
+
+ensure_up_create() {
+  allow_x
+  echo "Starting persistent container '${CONTAINER}' ..."
+  ${DOCKER} run -d --name "${CONTAINER}" \
+    --gpus all \
+    --network host \
+    --ipc host \
+    -e DISPLAY="${DISPLAY}" \
+    -e NVIDIA_DRIVER_CAPABILITIES=all \
+    -e QT_X11_NO_MITSHM=1 \
+    -e XDG_RUNTIME_DIR=/tmp/runtime-ros \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v "${HOME_VOL}":"${CONTAINER_HOME}" \
+    -v "${REPO_ROOT}":"${REPO_IN}" \
+    --restart unless-stopped \
+    "${IMAGE}" sleep infinity >/dev/null
+  ${DOCKER} exec "${CONTAINER}" bash -lc 'mkdir -p /tmp/runtime-ros && chmod 700 /tmp/runtime-ros' || true
+}
+
+# Exec with ROS sourced and the right cwd. Adds a TTY only when one is present,
+# so this works both interactively (real terminal) and non-interactively (CI/bg).
+dexec() {
+  allow_x; ensure_up
+  local tty=""; [ -t 0 ] && [ -t 1 ] && tty="-t"
+  ${DOCKER} exec -i ${tty} "${CONTAINER}" bash -lc "$1"
+}
+
+case "${1:-help}" in
+  build)
+    echo "Building ${IMAGE} (UID=$(id -u) GID=$(id -g)) ..."
+    ${DOCKER} build \
+      --build-arg USER_UID="$(id -u)" \
+      --build-arg USER_GID="$(id -g)" \
+      -t "${IMAGE}" "${REPO_ROOT}/docker"
+    echo "Built. Next:  docker/dt setup"
+    ;;
+  setup)
+    dexec "cd ${REPO_IN} && bash docker/setup_in_container.sh"
+    ;;
+  px4)
+    echo ">> Launching PX4 + Gazebo. In the pxh> shell, to let it arm in SITL:"
+    echo ">>   param set COM_DISARM_PRFLT -1"
+    echo ">>   commander arm"
+    dexec "cd ~/PX4-Autopilot && make px4_sitl gz_x500_mono_cam"
+    ;;
+  run)
+    shift
+    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh gazebo $*"
+    ;;
+  shell)
+    dexec "cd ${REPO_IN} && exec bash"
+    ;;
+  topic)
+    shift
+    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh topic $*"
+    ;;
+  status)
+    echo "== container =="; ${DOCKER} ps -a -f name="^${CONTAINER}$" \
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+    echo "== GPU in container =="
+    running && ${DOCKER} exec "${CONTAINER}" nvidia-smi --query-gpu=name,driver_version --format=csv,noheader \
+      || echo "(container not running)"
+    echo "== GL renderer (should say NVIDIA, not llvmpipe) =="
+    running && ${DOCKER} exec -e DISPLAY="${DISPLAY}" "${CONTAINER}" bash -lc 'glxinfo -B 2>/dev/null | grep -i "renderer\|OpenGL renderer" || echo "glxinfo unavailable"' \
+      || true
+    ;;
+  down)
+    exists && ${DOCKER} rm -f "${CONTAINER}" >/dev/null && echo "Removed ${CONTAINER}." || echo "No container."
+    ;;
+  nuke)
+    exists && ${DOCKER} rm -f "${CONTAINER}" >/dev/null || true
+    ${DOCKER} volume rm "${HOME_VOL}" >/dev/null 2>&1 && echo "Removed home volume ${HOME_VOL}." || echo "No home volume."
+    ;;
+  help|*)
+    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+esac

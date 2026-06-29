@@ -141,6 +141,15 @@ source_sim_env() {
 
   activate_venv
 
+  # `ros2 launch` runs node console-scripts under system python3 (their shebang),
+  # which cannot see the venv. Put the venv site-packages on PYTHONPATH so the
+  # nodes can import torch/ultralytics/mavsdk installed there.
+  if [ -d "${SIM_VENV}" ]; then
+    local vsp
+    vsp="$(ls -d "${SIM_VENV}"/lib/python*/site-packages 2>/dev/null | head -1)"
+    [ -n "${vsp}" ] && export PYTHONPATH="${vsp}${PYTHONPATH:+:${PYTHONPATH}}"
+  fi
+
   export ROS_DOMAIN_ID="${SIM_DOMAIN}"
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   export CYCLONEDDS_URI="file://${CYCLONE_CFG}"
@@ -232,8 +241,7 @@ cmd_build_sim() {
     --build-base "${SIM_BUILD_BASE}" \
     --install-base "${SIM_OVERLAY}" \
     --symlink-install \
-    --packages-select "${SIM_PACKAGES[@]}" \
-    --allow-overriding "${SIM_PACKAGES[@]}"
+    --packages-select "${SIM_PACKAGES[@]}"
 
   # Create the runtime venv after a successful build (pip packages go here).
   ensure_venv
