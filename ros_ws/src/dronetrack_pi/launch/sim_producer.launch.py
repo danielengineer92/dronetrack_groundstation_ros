@@ -102,7 +102,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("gz_world_name", default_value="default"),
         DeclareLaunchArgument(
             "gz_camera_topic",
-            default_value="/world/default/model/x500_mono_cam/link/camera_link/sensor/camera/image",
+            default_value="/world/default/model/x500_mono_cam_0/link/camera_link/sensor/camera/image",
             description="Gazebo transport camera topic — match your PX4 model."),
         DeclareLaunchArgument("gz_ros_image_topic", default_value="/sim/camera/image_raw"),
         DeclareLaunchArgument("ball_sdf", default_value=_resolve_ball_sdf()),

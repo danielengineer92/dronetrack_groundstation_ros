@@ -15,8 +15,8 @@ runs identically to the real split-architecture stack.
 
 Gazebo camera topic:
   PX4 SITL models publish camera images via Gazebo transport. The default
-  matches the x500_mono_cam model in the "default" world:
-    /world/default/model/x500_mono_cam/link/camera_link/sensor/camera/image
+  matches the x500_mono_cam model in the "default" world (PX4 appends _0):
+    /world/default/model/x500_mono_cam_0/link/camera_link/sensor/camera/image
 
   Override gz_camera_topic:= and gz_world_name:= if your setup differs.
 
@@ -194,7 +194,7 @@ def generate_launch_description() -> LaunchDescription:
             description="Gazebo world name (used for service bridging and ball spawn)."),
         DeclareLaunchArgument(
             "gz_camera_topic",
-            default_value="/world/default/model/x500_mono_cam/link/camera_link/sensor/camera/image",
+            default_value="/world/default/model/x500_mono_cam_0/link/camera_link/sensor/camera/image",
             description="Gazebo transport camera topic."),
         DeclareLaunchArgument(
             "gz_ros_image_topic", default_value="/sim/camera/image_raw",
