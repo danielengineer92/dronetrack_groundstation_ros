@@ -247,9 +247,11 @@ cmd_gazebo() {
   ros_pkg_exists dronetrack_perception || die "dronetrack_perception not found. Run scripts/ros_wsl.sh build-sim."
   ros_pkg_exists dronetrack_pi || die "dronetrack_pi not found. Run scripts/ros_wsl.sh build-sim."
 
+  # Check Gazebo bridge packages
+  ros_pkg_exists ros_gz_bridge || die "ros_gz_bridge not found. Install: sudo apt install ros-jazzy-ros-gz-bridge ros-jazzy-ros-gz-sim ros-jazzy-ros-gz-interfaces"
+
   local plan="${MISSION_PLAN_FILE:-}"
   if [ -z "${plan}" ]; then
-    # Try to find the default mission plan
     local control_share
     control_share="$(ros2 pkg prefix drone_control 2>/dev/null || true)"
     if [ -n "${control_share}" ] && [ -f "${control_share}/share/drone_control/missions/scan_and_orbit.yaml" ]; then
@@ -257,11 +259,15 @@ cmd_gazebo() {
     fi
   fi
 
+  # Resolve red_ball.sdf (repo-level models/ dir)
+  local ball_sdf="${REPO_ROOT}/models/red_ball.sdf"
+
   local args=(
     params_file:="${CONFIGS}/pi.yaml"
     gs_params_file:="${CONFIGS}/groundstation.yaml"
     connection_url:="${CONNECTION_URL}"
     dashboard_port:="${SIM_DASH_PORT}"
+    ball_sdf:="${ball_sdf}"
   )
   [ -n "${plan}" ] && args+=(mission_plan_file:="${plan}")
   args+=("$@")
@@ -271,14 +277,16 @@ cmd_gazebo() {
   [ -n "${plan}" ] && echo "Mission         | ${plan}" || echo "Mission         | (default)"
   echo "PX4             | ${CONNECTION_URL}"
   echo "Dashboard       | http://127.0.0.1:${SIM_DASH_PORT}/"
+  echo "Red ball SDF    | ${ball_sdf}"
   echo ""
   echo "Prereqs:"
   echo "  1. PX4 SITL + Gazebo running with a camera model (e.g. x500_mono_cam)"
-  echo "  2. ros_gz_bridge installed: sudo apt install ros-jazzy-ros-gz-bridge"
+  echo "  2. sudo apt install ros-jazzy-ros-gz-bridge ros-jazzy-ros-gz-sim ros-jazzy-ros-gz-interfaces"
   echo "  3. Vehicle armed (QGC or PX4 shell: commander arm)"
   echo ""
-  echo "Override Gazebo camera topic if needed:"
-  echo "  gz_camera_topic:=/world/default/model/YOUR_MODEL/link/camera_link/sensor/camera/image"
+  echo "Red-ball model: target_class defaults to red_ball."
+  echo "Use a trained model: model_path:=path/to/red_ball_yolo26s.pt device:=cuda:0"
+  echo "Override Gazebo camera: gz_camera_topic:=/world/MYWORLD/model/.../image"
   exec ros2 launch dronetrack_pi sitl_gazebo_launch.py "${args[@]}"
 }
 
