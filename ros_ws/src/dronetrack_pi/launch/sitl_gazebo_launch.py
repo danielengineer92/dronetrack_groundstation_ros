@@ -23,6 +23,14 @@ Gazebo camera topic:
 Usage (after PX4 SITL + Gazebo are running):
   scripts/ros_wsl.sh gazebo
   scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=red_ball_yolo26s.pt
+
+Split setup (gz on a separate PC, e.g. a 5080):
+  # On the sim PC (renders + owns the ball, publishes /sim/camera/image_raw):
+  scripts/ros_wsl.sh gazebo            # local_sim defaults true
+  # On the laptop (consumes the feed over the LAN, runs YOLO + the stack):
+  scripts/ros_wsl.sh gazebo local_sim:=false device:=cuda:0 \
+      model_path:=red_ball_yolo26s.pt connection_url:=udp://<sim-pc-ip>:14540
+  # Both machines: same ROS_DOMAIN_ID + RMW_IMPLEMENTATION on the same LAN.
 """
 
 import os
@@ -75,6 +83,10 @@ def _resolve_ball_sdf():
 
 def _create_bridge_and_spawn(context, *args, **kwargs):
     """OpaqueFunction: resolve substitutions, write bridge YAML, return nodes."""
+    # SPLIT: on the laptop consumer (local_sim:=false) the 5080 owns the camera
+    # bridge, the set_pose service bridge, and the ball spawn — skip them here.
+    if LaunchConfiguration("local_sim").perform(context).lower() != "true":
+        return []
     world = LaunchConfiguration("gz_world_name").perform(context)
     cam_gz = LaunchConfiguration("gz_camera_topic").perform(context)
     cam_ros = LaunchConfiguration("gz_ros_image_topic").perform(context)
@@ -193,6 +205,13 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "ball_sdf", default_value=default_ball_sdf,
             description="Path to the red_ball.sdf model file."),
+        DeclareLaunchArgument(
+            "local_sim", default_value="true",
+            description="True: this machine runs gz, so it owns the camera/set_pose "
+                        "bridge, the red_ball spawn, and target_mover. SPLIT setup: set "
+                        "false on the laptop consumer — the 5080 publishes "
+                        "/sim/camera/image_raw over the LAN and owns the ball; the laptop "
+                        "only republishes + runs YOLO + the mission stack."),
 
         # Target mover
         DeclareLaunchArgument("ball_center_x", default_value="5.0",
@@ -235,7 +254,7 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
-    # ---- target mover: orbits the red ball ----
+    # ---- target mover: orbits the red ball (producer/local_sim side only) ----
     target_mover = Node(
         package="dronetrack_perception",
         executable="target_mover_node",
@@ -251,6 +270,7 @@ def generate_launch_description() -> LaunchDescription:
             "rate_hz": 20.0,
         }],
         output="screen",
+        condition=IfCondition(LaunchConfiguration("local_sim")),
     )
 
     # ---- YOLO ----
