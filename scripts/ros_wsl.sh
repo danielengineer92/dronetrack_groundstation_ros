@@ -16,6 +16,7 @@ SIM_LOG_BASE="${SIM_LOG_BASE:-$HOME/dronetrack_groundstation_ros_sim/log}"
 SIM_DASH_PORT="${SIM_DASH_PORT:-8091}"
 CONNECTION_URL="${CONNECTION_URL:-udp://:14540}"
 CYCLONE_CFG="${CYCLONE_CFG:-$HOME/.ros/dronetrack_sim_cyclonedds.xml}"
+SIM_VENV="${SIM_VENV:-$HOME/ros_venv}"
 
 SIM_PACKAGES=(
   dronetrack_msgs
@@ -51,6 +52,7 @@ Common SITL overrides:
   SIM_DASH_PORT=8091
   SIM_UNDERLAY=~/dronetrack_sim/install
   SIM_OVERLAY=~/dronetrack_groundstation_ros_sim/install
+  SIM_VENV=~/ros_venv   (auto-created by build-sim)
 
 Examples:
   scripts/ros_wsl.sh doctor
@@ -73,6 +75,28 @@ have() {
 require_wsl() {
   if ! grep -qi microsoft /proc/version 2>/dev/null; then
     echo "WARNING: this runner is tuned for WSL Ubuntu; continuing on native Linux." >&2
+  fi
+}
+
+ensure_venv() {
+  if [ ! -f "${SIM_VENV}/bin/activate" ]; then
+    echo "Creating Python venv at ${SIM_VENV} (--system-site-packages) ..."
+    python3 -m venv --system-site-packages "${SIM_VENV}"
+    # shellcheck disable=SC1090
+    source "${SIM_VENV}/bin/activate"
+    pip install --upgrade pip >/dev/null 2>&1
+    pip install "numpy<2" ultralytics opencv-python mavsdk aioconsole grpcio
+    echo "Venv ready: ${SIM_VENV}"
+  else
+    # shellcheck disable=SC1090
+    source "${SIM_VENV}/bin/activate"
+  fi
+}
+
+activate_venv() {
+  if [ -f "${SIM_VENV}/bin/activate" ]; then
+    # shellcheck disable=SC1090
+    source "${SIM_VENV}/bin/activate"
   fi
 }
 
@@ -115,6 +139,8 @@ source_sim_env() {
     source "${SIM_OVERLAY}/setup.bash"
   fi
 
+  activate_venv
+
   export ROS_DOMAIN_ID="${SIM_DOMAIN}"
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   export CYCLONEDDS_URI="file://${CYCLONE_CFG}"
@@ -144,6 +170,7 @@ cmd_doctor() {
   have ros2 && echo "OK  ros2 already on PATH" || echo "INFO ros2 not on PATH until environment is sourced"
   [ -f "${SIM_UNDERLAY}/setup.bash" ] && echo "OK  sim underlay setup.bash" || echo "MISS sim underlay setup.bash (${SIM_UNDERLAY})"
   [ -f "${SIM_OVERLAY}/setup.bash" ] && echo "OK  current repo sim overlay setup.bash" || echo "MISS current repo sim overlay setup.bash (run: scripts/ros_wsl.sh build-sim)"
+  [ -f "${SIM_VENV}/bin/activate" ] && echo "OK  python venv ${SIM_VENV}" || echo "MISS python venv (auto-created by build-sim)"
   echo
 
   source_sim_env
@@ -197,6 +224,8 @@ cmd_build_sim() {
   export ROS_DOMAIN_ID="${SIM_DOMAIN}"
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   mkdir -p "${SIM_BUILD_BASE}" "${SIM_OVERLAY}" "${SIM_LOG_BASE}"
+
+  # Build uses system Python (not the venv) so rosidl can find numpy C headers.
   echo "Building current repo overlay -> ${SIM_OVERLAY}"
   colcon build \
     --base-paths "${WS}/src" \
@@ -205,6 +234,12 @@ cmd_build_sim() {
     --symlink-install \
     --packages-select "${SIM_PACKAGES[@]}" \
     --allow-overriding "${SIM_PACKAGES[@]}"
+
+  # Create the runtime venv after a successful build (pip packages go here).
+  ensure_venv
+  echo ""
+  echo "Build complete. Runtime venv: ${SIM_VENV}"
+  echo "To add pip packages:  source ${SIM_VENV}/bin/activate && pip install <pkg>"
 }
 
 ensure_sim_overlay() {
@@ -272,7 +307,8 @@ cmd_gazebo() {
   [ -n "${plan}" ] && args+=(mission_plan_file:="${plan}")
   args+=("$@")
 
-  echo "GAZEBO SITL env | domain=${ROS_DOMAIN_ID}, rmw=${RMW_IMPLEMENTATION}, cyclone=${CYCLONEDDS_URI}"
+  echo "GAZEBO SITL env | domain=${ROS_DOMAIN_ID}, rmw=${RMW_IMPLEMENTATION}"
+  echo "Venv            | ${VIRTUAL_ENV:-system python (no venv!)}"
   echo "Overlay         | underlay=${SIM_UNDERLAY}, current=${SIM_OVERLAY}"
   [ -n "${plan}" ] && echo "Mission         | ${plan}" || echo "Mission         | (default)"
   echo "PX4             | ${CONNECTION_URL}"

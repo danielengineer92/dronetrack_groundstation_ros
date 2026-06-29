@@ -22,18 +22,17 @@ Track a moving red ball in Gazebo with the real DroneTrack vision pipeline
 # ROS 2 Jazzy must already be installed. Then:
 sudo apt update && sudo apt install -y \
     ros-jazzy-ros-gz ros-jazzy-ros-gz-image ros-jazzy-ros-gz-bridge \
-    ros-jazzy-ros-gz-interfaces ros-jazzy-rmw-cyclonedds-cpp \
-    ros-jazzy-cv-bridge
-pip install ultralytics opencv-python          # YOLO (where it runs)
+    ros-jazzy-ros-gz-interfaces ros-jazzy-ros-gz-sim \
+    ros-jazzy-rmw-cyclonedds-cpp ros-jazzy-cv-bridge
 
 # PX4 with the camera model
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive ~/PX4-Autopilot
 cd ~/PX4-Autopilot && make px4_sitl gz_x500_mono_cam
 
-# This repo + build the SITL overlay
+# This repo + build the SITL overlay (also creates ~/ros_venv with YOLO + numpy)
 cd <this-repo>
 git checkout px4-gazebo-sim
-scripts/ros_wsl.sh build-sim       # (WSL). On native Linux: colcon build, then source install/setup.bash
+scripts/ros_wsl.sh build-sim       # builds, then auto-creates ~/ros_venv
 ```
 
 Put your trained red-ball model somewhere on the PC, e.g.
