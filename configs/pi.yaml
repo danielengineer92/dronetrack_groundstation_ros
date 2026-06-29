@@ -176,7 +176,7 @@ mission_executor_node:
     require_armed_for_mission: true
     telemetry_timeout_s: 2.0
     takeoff_altitude_m: 3.0
-    airborne_altitude_m: 2.7
+    airborne_altitude_m: 1.5
     takeoff_timeout_s: 20.0
     offboard_prime_time_s: 1.5
     track_center_timeout_s: 0.0

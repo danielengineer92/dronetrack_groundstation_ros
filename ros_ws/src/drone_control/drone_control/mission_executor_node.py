@@ -102,7 +102,7 @@ class MissionExecutorNode(Node):
         self.declare_parameter("require_armed_for_mission", True)
         self.declare_parameter("telemetry_timeout_s", 2.0)
         self.declare_parameter("takeoff_altitude_m", 3.0)
-        self.declare_parameter("airborne_altitude_m", 2.7)
+        self.declare_parameter("airborne_altitude_m", 1.5)
         self.declare_parameter("takeoff_timeout_s", 20.0)
         self.declare_parameter("offboard_prime_time_s", 1.5)
         self.declare_parameter("track_center_timeout_s", 0.0)  # 0 = keep yaw tracking until stopped.
@@ -533,10 +533,8 @@ class MissionExecutorNode(Node):
         altitude = float(self.last_telemetry.relative_altitude)
         landed_state = str(self.last_telemetry.landed_state).upper()
         if "ON_GROUND" in landed_state or "LANDED" in landed_state:
-            return False
-        if "TAKING_OFF" in landed_state:
-            return altitude >= self.airborne_altitude_m
-        if "IN_AIR" in landed_state:
+            # PX4 SITL can briefly report ON_GROUND during flight;
+            # trust altitude over landed_state when well above ground
             return altitude >= self.airborne_altitude_m
         return altitude >= self.airborne_altitude_m
 
