@@ -33,6 +33,16 @@ groundstation_heartbeat_node:
     software_version: "0.1.0"
     perception_stale_s: 1.0
 
+# ---- Gazebo camera republisher (SITL only) ---------------------------------
+gz_cam_republisher:
+  ros__parameters:
+    gz_image_topic: "/sim/camera/image_raw"
+    compressed_out_topic: "/drone/camera/image_raw/compressed"
+    raw_out_topic: "/drone/camera/image_raw"
+    republish_raw: true
+    jpeg_quality: 80
+    report_period_s: 5.0
+
 web_dashboard_node:
   ros__parameters:
     host: "0.0.0.0"

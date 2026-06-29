@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_node = dronetrack_perception.yolo_node:main',
+            'gz_cam_republisher = dronetrack_perception.gz_cam_republisher:main',
         ],
     },
 )

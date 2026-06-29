@@ -39,6 +39,7 @@ Commands:
   doctor        Check WSL, ROS, overlays, required packages, and PX4/MAVSDK basics.
   build-sim     Build this repo into a dedicated SITL overlay.
   sitl          Build if needed, then launch the current-repo SITL mission stack.
+  gazebo        Build if needed, then launch SITL with real Gazebo camera + YOLO vision.
   env [cmd...]  Source the exact SITL ROS environment, then print it or run cmd.
   topic <args>  Run `ros2 topic <args>` in the exact SITL ROS environment.
   echo <topic>  Echo one message from a topic in the exact SITL ROS environment.
@@ -54,6 +55,7 @@ Common SITL overrides:
 Examples:
   scripts/ros_wsl.sh doctor
   scripts/ros_wsl.sh sitl allow_scan_without_lock:=true auto_start:=true fake_target_class:=ignored_ball
+  scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=yolov8s.pt
   scripts/ros_wsl.sh topic list
   scripts/ros_wsl.sh echo /drone/mission/state
 EOF
@@ -238,6 +240,48 @@ cmd_sitl() {
   exec ros2 launch dronetrack_pi sitl_mission_launch.py "${args[@]}"
 }
 
+cmd_gazebo() {
+  require_wsl
+  ensure_sim_overlay
+  source_sim_env
+  ros_pkg_exists dronetrack_perception || die "dronetrack_perception not found. Run scripts/ros_wsl.sh build-sim."
+  ros_pkg_exists dronetrack_pi || die "dronetrack_pi not found. Run scripts/ros_wsl.sh build-sim."
+
+  local plan="${MISSION_PLAN_FILE:-}"
+  if [ -z "${plan}" ]; then
+    # Try to find the default mission plan
+    local control_share
+    control_share="$(ros2 pkg prefix drone_control 2>/dev/null || true)"
+    if [ -n "${control_share}" ] && [ -f "${control_share}/share/drone_control/missions/scan_and_orbit.yaml" ]; then
+      plan="${control_share}/share/drone_control/missions/scan_and_orbit.yaml"
+    fi
+  fi
+
+  local args=(
+    params_file:="${CONFIGS}/pi.yaml"
+    gs_params_file:="${CONFIGS}/groundstation.yaml"
+    connection_url:="${CONNECTION_URL}"
+    dashboard_port:="${SIM_DASH_PORT}"
+  )
+  [ -n "${plan}" ] && args+=(mission_plan_file:="${plan}")
+  args+=("$@")
+
+  echo "GAZEBO SITL env | domain=${ROS_DOMAIN_ID}, rmw=${RMW_IMPLEMENTATION}, cyclone=${CYCLONEDDS_URI}"
+  echo "Overlay         | underlay=${SIM_UNDERLAY}, current=${SIM_OVERLAY}"
+  [ -n "${plan}" ] && echo "Mission         | ${plan}" || echo "Mission         | (default)"
+  echo "PX4             | ${CONNECTION_URL}"
+  echo "Dashboard       | http://127.0.0.1:${SIM_DASH_PORT}/"
+  echo ""
+  echo "Prereqs:"
+  echo "  1. PX4 SITL + Gazebo running with a camera model (e.g. x500_mono_cam)"
+  echo "  2. ros_gz_bridge installed: sudo apt install ros-jazzy-ros-gz-bridge"
+  echo "  3. Vehicle armed (QGC or PX4 shell: commander arm)"
+  echo ""
+  echo "Override Gazebo camera topic if needed:"
+  echo "  gz_camera_topic:=/world/default/model/YOUR_MODEL/link/camera_link/sensor/camera/image"
+  exec ros2 launch dronetrack_pi sitl_gazebo_launch.py "${args[@]}"
+}
+
 cmd_env() {
   source_sim_env
   if [ "$#" -gt 0 ]; then
@@ -267,9 +311,9 @@ cmd_echo() {
 
 cmd_down() {
   echo "Stopping current-repo SITL launch processes if present..."
-  pkill -INT -f "[r]os2 launch dronetrack_pi sitl_mission_launch.py" 2>/dev/null || true
+  pkill -INT -f "[r]os2 launch dronetrack_pi sitl_" 2>/dev/null || true
   sleep 2
-  pkill -TERM -f "[r]os2 launch dronetrack_pi sitl_mission_launch.py" 2>/dev/null || true
+  pkill -TERM -f "[r]os2 launch dronetrack_pi sitl_" 2>/dev/null || true
 }
 
 main() {
@@ -278,6 +322,7 @@ main() {
     doctor) shift; cmd_doctor "$@" ;;
     build-sim) shift; cmd_build_sim "$@" ;;
     sitl) shift; cmd_sitl "$@" ;;
+    gazebo) shift; cmd_gazebo "$@" ;;
     env) shift; cmd_env "$@" ;;
     topic) shift; cmd_topic "$@" ;;
     echo) shift; cmd_echo "$@" ;;

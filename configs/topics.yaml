@@ -72,6 +72,14 @@ operator_request_topics:
   - name: "/drone/mavsdk/offboard_request"  # std_msgs/Bool
   - name: "/drone/mavsdk/action_command"    # drone_interfaces/MavsdkActionCommand (gated by allow_mavsdk_actions)
 
+# Gazebo SITL topics (only active when running sitl_gazebo_launch.py).
+gazebo_topics:
+  - name: "/sim/camera/image_raw"
+    type: "sensor_msgs/Image"
+    direction: "GZ->LOCAL"
+    owner: "ros_gz_bridge (bridges from Gazebo transport)"
+    note: "Intermediate topic. gz_cam_republisher compresses it onto the standard /drone/camera/image_raw/compressed."
+
 # Pi-OWNED approval topics. The laptop must NEVER publish these.
 pi_owned_topics:
   - name: "/drone/autonomy/enabled"         # autonomy_manager_node only
