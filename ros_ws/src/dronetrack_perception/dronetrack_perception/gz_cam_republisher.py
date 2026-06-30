@@ -81,6 +81,11 @@ class GzCamRepublisher(Node):
 
         out = CompressedImage()
         out.header = msg.header
+        # Gazebo stamps frames with simulation time (starts near 0); the rest of
+        # the stack (detection gate freshness checks, latency) runs on wall clock.
+        # This node emulates the Pi camera, whose stamp IS wall clock, so restamp
+        # here — otherwise every detection looks billions of seconds "stale".
+        out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = msg.header.frame_id or "camera_optical_frame"
         out.format = "jpeg"
         out.data = encoded.tobytes()

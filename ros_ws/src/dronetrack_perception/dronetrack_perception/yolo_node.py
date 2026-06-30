@@ -110,6 +110,10 @@ class YoloNode(Node):
     def _load_model(self) -> None:
         try:
             from ultralytics import YOLO
+            import os
+            # Expand ~ / env vars: launch args aren't shell-expanded, so a path like
+            # ~/models/foo.pt would otherwise be taken literally and fail to load.
+            self.model_path = os.path.expanduser(os.path.expandvars(self.model_path))
             self.get_logger().info(f"Loading YOLO model: {self.model_path}")
             self.model = YOLO(self.model_path)
             dummy = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
