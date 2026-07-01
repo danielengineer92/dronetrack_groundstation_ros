@@ -14,7 +14,7 @@ yolo_node:
     detections_topic: "/groundstation/vision/detections"  # outbound to the Pi gate
     model_path: "yolov8n.pt"          # override at launch; e.g. an ncnn/.pt model dir
     target_class: ""                  # empty = all classes (matches default yolov8n COCO model)
-    confidence_threshold: 0.25
+    confidence_threshold: 0.15
     iou_threshold: 0.45
     device: "cpu"                     # "cuda:0" (NVIDIA, verified ~3x faster) / "mps" (Apple) / "cpu"
     input_size: 640

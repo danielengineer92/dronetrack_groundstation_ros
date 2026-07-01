@@ -81,17 +81,17 @@ tracker_node:
     detections_topic: "/drone/vision/detections"   # gate republishes here
     target_error_topic: "/drone/tracking/target_error"
     target_class: "red_ball"
-    min_confidence: 0.25
-    detection_timeout: 1.5
-    reacquisition_timeout: 4.0
+    min_confidence: 0.15
+    detection_timeout: 2.5
+    reacquisition_timeout: 6.0
     smoothing_alpha: 0.35
-    target_area_min: 0.002
+    target_area_min: 0.0004
     target_area_max: 0.7
     publish_rate: 30.0
     proximity_threshold: 0.12
-    stale_detection_timeout: 2.5
-    missed_detection_threshold: 2
-    coast_timeout: 2.0
+    stale_detection_timeout: 3.5
+    missed_detection_threshold: 10
+    coast_timeout: 3.5
     lock_confirm_frames: 1
     estimate_distance: true
     distance_calibration_k: 0.0
@@ -142,7 +142,7 @@ autonomy_manager_node:
     initial_autonomy_request: false
     initial_offboard_request: false
     publish_rate: 10.0
-    target_timeout: 1.0
+    target_timeout: 3.0
     telemetry_timeout: 2.0
     request_timeout: 0.0
     enable_offboard_when_ready: true
@@ -196,26 +196,26 @@ control_node:
     control_command_topic: "/drone/control/command"
     mission_command_topic: "/drone/mission/command"
     autonomy_enabled: false
-    gain_yaw: 0.8
+    gain_yaw: 0.25
     gain_down: 0.3
     gain_forward: 1.0
     gain_right: 1.0
-    deadband_x: 0.05
+    deadband_x: 0.10
     deadband_y: 0.05
     max_velocity_forward: 2.0
     max_velocity_right: 2.0
     max_velocity_down: 0.5
-    max_yaw_rate: 1.0
+    max_yaw_rate: 0.4
     max_accel_forward: 1.5
     max_accel_right: 1.5
     max_accel_down: 0.5
-    max_yaw_accel: 2.0
+    max_yaw_accel: 0.8
     min_battery_percent: 25.0
     require_gps: false
     require_armed: true
     min_altitude_m: 2.0
     control_rate: 20.0
-    target_timeout: 1.0
+    target_timeout: 3.0
     mission_command_timeout: 1.0
     telemetry_timeout: 2.0
     # APPROACH translation stays OFF by default. Even if set true, the resulting
