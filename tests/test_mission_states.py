@@ -39,6 +39,10 @@ EXPECTED_SEQUENCE = [
     "COMPLETE",
 ]
 
+# States the executor only emits under some conditions (e.g. PREFLIGHT is skipped
+# when preflight checks pass instantly). The sequence matcher may skip these.
+OPTIONAL_STATES = frozenset({"PREFLIGHT"})
+
 TIMEOUT_S = 120.0
 SETTLE_S = 3.0
 
@@ -66,7 +70,9 @@ class MissionStateChecker(Node):
         self.success = False
 
     def _on_state(self, msg: String) -> None:
-        state = msg.data.strip().upper()
+        # The executor publishes "NAME: detail" (e.g. "TAKEOFF: takeoff
+        # requested, altitude=..."); match on the NAME only.
+        state = msg.data.split(":", 1)[0].strip().upper()
         if not state:
             return
 
@@ -76,16 +82,23 @@ class MissionStateChecker(Node):
         self.observed.append(state)
         self.get_logger().info(f"State transition: {state}")
 
-        if self.expected_idx < len(EXPECTED_SEQUENCE):
+        # Advance through the expected sequence, skipping optional states this
+        # mission plan didn't emit. Interleaved/unexpected states are ignored
+        # (we simply keep waiting for the next required state).
+        while self.expected_idx < len(EXPECTED_SEQUENCE):
             expected = EXPECTED_SEQUENCE[self.expected_idx]
             if state == expected:
                 self.expected_idx += 1
-                if self.expected_idx >= len(EXPECTED_SEQUENCE):
-                    self.get_logger().info("All expected states observed!")
-                    self.done = True
-                    self.success = True
-            elif state not in EXPECTED_SEQUENCE:
-                self.get_logger().warning(f"Unexpected state: {state} (not in expected sequence)")
+                break
+            if expected in OPTIONAL_STATES:
+                self.expected_idx += 1  # optional state not seen; skip it
+                continue
+            break
+
+        if self.expected_idx >= len(EXPECTED_SEQUENCE):
+            self.get_logger().info("All expected states observed!")
+            self.done = True
+            self.success = True
 
     def trigger_mission(self) -> None:
         if self.triggered:
