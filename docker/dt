@@ -64,6 +64,15 @@ dexec() {
   ${DOCKER} exec -i ${tty} "${CONTAINER}" bash -lc "$1"
 }
 
+shell_quote() {
+  local out="" arg
+  for arg in "$@"; do
+    printf -v arg '%q' "${arg}"
+    out+="${out:+ }${arg}"
+  done
+  printf '%s' "${out}"
+}
+
 case "${1:-help}" in
   build)
     echo "Building ${IMAGE} (UID=$(id -u) GID=$(id -g)) ..."
@@ -84,14 +93,14 @@ case "${1:-help}" in
     ;;
   run)
     shift
-    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh gazebo $*"
+    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh gazebo $(shell_quote "$@")"
     ;;
   shell)
     dexec "cd ${REPO_IN} && exec bash"
     ;;
   topic)
     shift
-    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh topic $*"
+    dexec "cd ${REPO_IN} && bash scripts/ros_wsl.sh topic $(shell_quote "$@")"
     ;;
   status)
     echo "== container =="; ${DOCKER} ps -a -f name="^${CONTAINER}$" \

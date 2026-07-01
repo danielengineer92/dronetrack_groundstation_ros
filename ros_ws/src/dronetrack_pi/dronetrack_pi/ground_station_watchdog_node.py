@@ -31,7 +31,6 @@ can still re-arm/recover deliberately once the link returns.
 
 from __future__ import annotations
 
-import math
 import time
 
 import rclpy
@@ -156,15 +155,15 @@ class GroundStationWatchdogNode(Node):
     def _tick(self) -> None:
         now = self._monotonic_s()
 
-        hb_age = float("nan") if self._last_heartbeat_time is None else now - self._last_heartbeat_time
-        det_age = float("nan") if self._last_detection_time is None else now - self._last_detection_time
+        hb_age = -1.0 if self._last_heartbeat_time is None else now - self._last_heartbeat_time
+        det_age = -1.0 if self._last_detection_time is None else now - self._last_detection_time
 
-        heartbeat_ok = math.isfinite(hb_age) and hb_age <= self.max_heartbeat_age_s
+        heartbeat_ok = hb_age >= 0.0 and hb_age <= self.max_heartbeat_age_s
 
         if not heartbeat_ok:
             link_ok = False
             reason = "NO_HEARTBEAT" if self._last_heartbeat_time is None else "HEARTBEAT_STALE"
-        elif math.isfinite(det_age) and det_age > self.max_detection_age_s:
+        elif det_age >= 0.0 and det_age > self.max_detection_age_s:
             # Heartbeat is alive but perception went quiet. Link is "up" for control
             # purposes (drone holds), but we flag detections as stale for the operator.
             link_ok = True
