@@ -179,6 +179,7 @@ class MissionExecutorNode(Node):
         self.mission_active = bool(self.auto_start and self.mission_enabled)
         self.action_command_id = 0
         self.actions_sent: set[str] = set()
+        self._last_land_cmd_time = 0.0
         self._last_autonomy_request: Optional[bool] = None
         self._last_offboard_request: Optional[bool] = None
         self._last_autonomy_request_publish_time = 0.0
@@ -953,12 +954,19 @@ class MissionExecutorNode(Node):
 
     def _step_land(self, step) -> bool:
         self.publish_offboard_request(False)
+        # A single LAND sent while Offboard setpoints are still streaming (e.g.
+        # immediately after a DO_ORBIT step) can be ignored by PX4, leaving the
+        # vehicle hovering. Re-issue LAND every ~2 s until it actually descends.
+        if self.is_airborne() and (time.monotonic() - self._last_land_cmd_time) >= 2.0:
+            self.actions_sent.discard("land")
+            self._last_land_cmd_time = time.monotonic()
         self.send_action_once("land", "LAND", "land")
         self.publish_mission_command("HOLD", True, "land requested")
         timeout = step.timeout_s if step.timeout_s is not None else self.land_wait_s
         age = self.step_age()
         self.publish_state(f"landing, age={age:.1f}/{timeout:.1f}s")
-        return age > timeout
+        # Complete once actually on the ground, or after the timeout as a backstop.
+        return (age > 3.0 and not self.is_airborne()) or age > timeout
 
     def _step_hold(self, step) -> bool:
         self.publish_offboard_request(True)
