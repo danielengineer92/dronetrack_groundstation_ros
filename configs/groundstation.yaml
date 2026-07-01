@@ -17,7 +17,7 @@ yolo_node:
     confidence_threshold: 0.15
     iou_threshold: 0.45
     device: "cpu"                     # "cuda:0" (NVIDIA, verified ~3x faster) / "mps" (Apple) / "cpu"
-    input_size: 640
+    input_size: 1408
     max_detections: 20
     half_precision: false             # set true with device:=cuda:0 for a further GPU speedup
     verbose: false
