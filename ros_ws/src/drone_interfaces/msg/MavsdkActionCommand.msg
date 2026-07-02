@@ -3,7 +3,7 @@
 builtin_interfaces/Time stamp
 uint32 command_id
 
-# Action: TAKEOFF, LAND, RETURN_TO_LAUNCH, DO_ORBIT, HOLD
+# Action: ARM (double opt-in), TAKEOFF, LAND, RETURN_TO_LAUNCH, DO_ORBIT, HOLD, GOTO_LOCATION
 string action
 
 # Extra hard gate from the sender. If false, telemetry must ignore the command.

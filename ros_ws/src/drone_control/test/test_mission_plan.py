@@ -250,6 +250,40 @@ def test_get_float_falls_back_on_garbage():
     assert step.get_float("altitude_m", 3.0) == 3.0
 
 
+def test_parse_goto_step():
+    plan = parse_mission_plan(
+        {"mission": {"steps": [
+            {"type": "takeoff"},
+            {"type": "goto", "north_m": 3.0, "east_m": -2.0, "tolerance_m": 1.0, "timeout_s": 30},
+            {"type": "land"},
+        ]}}
+    )
+    goto = plan.steps[1]
+    assert goto.type == "goto"
+    assert goto.state_name == "GOTO"
+    assert goto.get_float("north_m", 0.0) == 3.0
+    assert goto.get_float("east_m", 0.0) == -2.0
+
+
+def test_goto_requires_an_offset():
+    try:
+        parse_mission_plan({"mission": {"steps": [{"type": "goto", "timeout_s": 30}]}})
+    except MissionPlanError as exc:
+        assert "north_m" in str(exc)
+    else:
+        raise AssertionError("expected MissionPlanError for goto with no offsets")
+
+
+def test_goto_offset_out_of_range_raises():
+    for step in ({"type": "goto", "north_m": 900.0}, {"type": "goto", "east_m": -900.0}):
+        try:
+            parse_mission_plan({"mission": {"steps": [step]}})
+        except MissionPlanError:
+            pass
+        else:
+            raise AssertionError(f"expected MissionPlanError for {step!r}")
+
+
 def test_parse_mission_plan_text_yaml_and_json():
     yaml_text = "mission:\n  name: from_yaml\n  steps:\n    - {type: takeoff, altitude_m: 3.0}\n    - land\n"
     plan = parse_mission_plan_text(yaml_text)

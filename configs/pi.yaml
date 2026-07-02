@@ -99,8 +99,8 @@ tracker_node:
     focal_length_px: 0.0
     horizontal_fov_deg: 70.0
     vertical_fov_deg: 55.0
-    image_width_px: 640
-    image_height_px: 480
+    image_width_px: 1280
+    image_height_px: 960
     min_distance_m: 0.25
     max_distance_m: 12.0
     distance_filter_alpha: 0.25
@@ -125,6 +125,7 @@ telemetry_node:
     allow_translation_commands: false
     stop_offboard_on_disable: true
     allow_mavsdk_actions: false      # keep false for normal hardware bench work
+    allow_arm_via_mavsdk: false      # extra opt-in for the dashboard Arm button; hardware stays false
     action_command_timeout: 3.0
     action_telemetry_timeout: 2.0
     action_airborne_altitude_m: 0.5
@@ -185,6 +186,10 @@ mission_executor_node:
     scan_yaw_deg: 180.0
     scan_yaw_rate_deg_s: 20.0
     scan_timeout_s: 12.0
+    # goto step defaults (world-frame offset reposition via MAVSDK goto_location;
+    # gated by telemetry_node.allow_mavsdk_actions like TAKEOFF/DO_ORBIT).
+    goto_timeout_s: 30.0
+    goto_tolerance_m: 1.0
     mission_plan_file: ""
     # Runtime plan upload (dashboard mission builder). Plans arriving here are
     # fully re-validated and refused while a mission is active. Set the request

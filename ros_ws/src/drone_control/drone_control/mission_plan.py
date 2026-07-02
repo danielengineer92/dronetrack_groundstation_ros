@@ -40,6 +40,7 @@ STEP_TYPE_TO_STATE: dict[str, str] = {
     "scan": "SCAN",
     "track_center": "TRACK_CENTER",
     "approach": "APPROACH_TARGET",
+    "goto": "GOTO",
     "orbit": "DO_ORBIT",
     "rtl": "RETURN_TO_LAUNCH",
     "land": "LAND",
@@ -68,7 +69,7 @@ MOTION_STEP_TYPES: frozenset[str] = frozenset(
 # (track_center is deliberately excluded: until=none + no timeout is its supported
 # "hold and yaw-track indefinitely" mode.)
 TIMEOUT_RECOMMENDED_STEP_TYPES: frozenset[str] = frozenset(
-    {"scan", "approach", "orbit"}
+    {"scan", "approach", "orbit", "goto"}
 )
 
 # Allowed sweep directions for a `scan` step (counter-clockwise / clockwise yaw).
@@ -88,6 +89,10 @@ NUMERIC_STEP_PARAM_RANGES: dict[str, tuple[Optional[float], Optional[float]]] = 
     "radius_m": (0.0, 500.0),
     "speed_m_s": (0.0, 20.0),
     "revolutions": (0.0, 100.0),
+    # goto: world-frame NED offsets from the position at step entry.
+    "north_m": (-500.0, 500.0),
+    "east_m": (-500.0, 500.0),
+    "tolerance_m": (0.0, 50.0),
 }
 
 
@@ -248,6 +253,11 @@ def _parse_step(raw: object, index: int, mission_name: str) -> MissionStep:
 
     if step_type == "scan":
         _validate_scan_params(params, where)
+
+    if step_type == "goto" and not any(k in params for k in ("north_m", "east_m", "altitude_m")):
+        raise MissionPlanError(
+            f"{where} (type 'goto') must set at least one of north_m, east_m, altitude_m"
+        )
 
     return MissionStep(step_type, params)
 

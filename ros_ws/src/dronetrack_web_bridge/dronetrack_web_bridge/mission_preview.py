@@ -19,6 +19,7 @@ VALID_STEP_TYPES = {
     "scan",
     "track_center",
     "approach",
+    "goto",
     "orbit",
     "rtl",
     "land",
@@ -27,7 +28,7 @@ VALID_STEP_TYPES = {
 }
 
 MOTION_STEP_TYPES = {"scan", "track_center", "approach", "orbit"}
-TIMEOUT_RECOMMENDED_STEP_TYPES = {"scan", "approach", "orbit"}
+TIMEOUT_RECOMMENDED_STEP_TYPES = {"scan", "approach", "orbit", "goto"}
 
 
 def discover_mission_paths(module_file: str | None = None) -> list[Path]:
@@ -392,6 +393,13 @@ def _step_label(step_type: str, params: dict[str, Any]) -> str:
         return f"track center until {params.get('until', 'none')}"
     if step_type == "approach":
         return f"approach to {params.get('distance_m', 'default')} m"
+    if step_type == "goto":
+        parts = [f"{key[0].upper()}{params[key]:+g} m" if isinstance(params.get(key), (int, float))
+                 else f"{key[0].upper()}{params[key]} m"
+                 for key in ("north_m", "east_m") if key in params]
+        if "altitude_m" in params:
+            parts.append(f"alt {params['altitude_m']} m")
+        return "goto offset " + (", ".join(parts) if parts else "(none)")
     if step_type == "orbit":
         return (
             f"orbit r={params.get('radius_m', 'default')} m, "

@@ -92,6 +92,9 @@ def _create_bridge_and_spawn(context, *args, **kwargs):
     cam_ros = LaunchConfiguration("gz_ros_image_topic").perform(context)
     ball_sdf = LaunchConfiguration("ball_sdf").perform(context)
     spawn_ball = LaunchConfiguration("spawn_ball").perform(context).lower() == "true"
+    ball_x = LaunchConfiguration("ball_center_x").perform(context)
+    ball_y = LaunchConfiguration("ball_center_y").perform(context)
+    ball_z = LaunchConfiguration("ball_altitude").perform(context)
 
     # ---- write bridge config ----
     bridge_yaml = tempfile.NamedTemporaryFile(
@@ -137,7 +140,8 @@ def _create_bridge_and_spawn(context, *args, **kwargs):
                         "ros2", "run", "ros_gz_sim", "create",
                         "-name", "red_ball",
                         "-file", ball_sdf,
-                        "-x", "5", "-y", "0", "-z", "1",
+                        # Spawn at the mover's orbit center so the two agree.
+                        "-x", ball_x, "-y", ball_y, "-z", ball_z,
                         "-world", world,
                     ],
                     output="screen",
@@ -173,6 +177,8 @@ def generate_launch_description() -> LaunchDescription:
                               description="MAVSDK connection URL for PX4 SITL."),
         DeclareLaunchArgument("allow_mavsdk_actions", default_value="true",
                               description="SITL: allow TAKEOFF/ORBIT/LAND actions."),
+        DeclareLaunchArgument("allow_arm_via_mavsdk", default_value="true",
+                              description="SITL: allow the dashboard Arm button (hardware default is false)."),
         DeclareLaunchArgument("allow_translation_commands", default_value="false",
                               description="SITL: allow velocity/translation commands."),
         DeclareLaunchArgument("enable_approach_translation", default_value="false",
@@ -214,7 +220,7 @@ def generate_launch_description() -> LaunchDescription:
                         "only republishes + runs YOLO + the mission stack."),
 
         # Target mover
-        DeclareLaunchArgument("ball_center_x", default_value="5.0",
+        DeclareLaunchArgument("ball_center_x", default_value="6.0",
                               description="Ball orbit center X (m, NED)."),
         DeclareLaunchArgument("ball_center_y", default_value="0.0",
                               description="Ball orbit center Y."),
@@ -314,6 +320,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[params, {
             "connection_url": LaunchConfiguration("connection_url"),
             "allow_mavsdk_actions": ParameterValue(LaunchConfiguration("allow_mavsdk_actions"), value_type=bool),
+            "allow_arm_via_mavsdk": ParameterValue(LaunchConfiguration("allow_arm_via_mavsdk"), value_type=bool),
             "allow_translation_commands": ParameterValue(LaunchConfiguration("allow_translation_commands"), value_type=bool),
         }],
         output="screen", emulate_tty=True,

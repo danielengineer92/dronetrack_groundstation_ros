@@ -77,6 +77,9 @@ DASHBOARD_HTML = """<!doctype html>
   .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap:14px; }
   .card { background:#0a1528; border:1px solid rgba(100,160,220,.18); border-radius:8px; padding:14px; }
   .camera, .planner { margin-top:14px; background:#071326; border:1px solid rgba(100,160,220,.2); border-radius:8px; overflow:hidden; }
+  .camera { max-width:70%; margin-left:auto; margin-right:auto; }
+  .op-row { max-width:70%; margin:14px auto 0; justify-content:center; }
+  @media (max-width: 900px) { .camera, .op-row { max-width:100%; } }
   .camera-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-end; padding:14px; }
   .camera-title { font-size:20px; font-weight:800; margin-top:3px; }
   .frame { background:#02060c; aspect-ratio:16/9; display:grid; place-items:center; }
@@ -91,6 +94,7 @@ DASHBOARD_HTML = """<!doctype html>
   button { font:inherit; font-weight:700; border:0; border-radius:8px; padding:12px 16px; cursor:pointer; }
   .start { background:#1f6feb; color:#fff; } .ready { background:#236; color:#cfe; }
   .hold { background:#7a5; color:#012; } .land { background:#ff5f75; color:#210; }
+  .arm { background:#ffcc66; color:#210; }
   select { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; min-width:230px; }
   input { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; }
   .step select, .step input { min-width:0; padding:5px 7px; font-size:13px; }
@@ -121,6 +125,13 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="frame"><img id="stream" src="/stream.mjpg" alt="Live camera feed with YOLO target boxes"/></div>
     <div class="target-row"><small class="target-list" id="targets">No targets</small><small id="frame_age"></small></div>
   </section>
+  <div class="row op-row">
+    <button class="arm" onclick="post('arm',{confirm:true})">Arm</button>
+    <button class="ready" onclick="post('autonomy_request',{enabled:true})">System Ready</button>
+    <button class="start" onclick="post('mission_request',{enabled:true})">Start Mission</button>
+    <button class="hold" onclick="post('abort_hold',{confirm:true})">Abort / Hold</button>
+    <button class="land" onclick="post('land',{confirm:true})">Land</button>
+  </div>
   <div class="grid" style="margin-top:14px">
     <div class="card"><div class="k">Link</div><div class="v" id="link">--</div><small id="link_reason"></small></div>
     <div class="card"><div class="k">Latency</div><div class="v" id="latency">--</div></div>
@@ -176,16 +187,11 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="steps" id="builder_steps"></div>
     </div>
   </section>
-  <div class="row">
-    <button class="ready" onclick="post('autonomy_request',{enabled:true})">System Ready</button>
-    <button class="start" onclick="post('mission_request',{enabled:true})">Start Mission</button>
-    <button class="hold" onclick="post('abort_hold',{confirm:true})">Abort / Hold</button>
-    <button class="land" onclick="post('land',{confirm:true})">Land</button>
-  </div>
   <p><small>Operator buttons publish request topics only. The Pi re-validates and
   may ignore them. Sent mission plans are re-validated by the mission executor and
-  refused while a mission is active. This page cannot arm, send control, or bypass
-  Pi safety gates.</small></p>
+  refused while a mission is active. Arm is a request too: it is ignored unless the
+  Pi explicitly enables allow_arm_via_mavsdk (off on hardware). This page cannot
+  send control or bypass Pi safety gates.</small></p>
 </div>
 <script>
 function cls(el,c){el.className='v '+c;}
@@ -312,6 +318,7 @@ const STEP_PARAM_DEFS = {
   scan:           [['direction','ccw','dir'],['yaw_deg','180','num'],['yaw_rate_deg_s','20','num'],['until','locked','until'],['timeout_s','12','num']],
   track_center:   [['until','','until'],['timeout_s','','num']],
   approach:       [['distance_m','2.0','num'],['until','','until'],['timeout_s','20','num']],
+  goto:           [['north_m','+3.0','num'],['east_m','0.0','num'],['altitude_m','','num'],['tolerance_m','1.0','num'],['timeout_s','30','num']],
   orbit:          [['radius_m','2.0','num'],['speed_m_s','0.4','num'],['revolutions','1','num'],['timeout_s','','num']],
   rtl:            [['timeout_s','15','num']],
   land:           [['timeout_s','','num']],
@@ -722,6 +729,13 @@ class WebDashboardNode(Node):
         cmd.note = note
         self.action_pub.publish(cmd)
 
+    def arm(self) -> None:
+        # Request-only, like every other operator action: telemetry_node ignores
+        # ARM unless BOTH allow_mavsdk_actions and allow_arm_via_mavsdk are true,
+        # and its policy additionally requires on-ground + not-armed + fresh
+        # telemetry. On hardware with the defaults this button does nothing.
+        self._send_action("ARM", "dashboard arm request")
+
     def abort_hold(self) -> None:
         self.autonomy_pub.publish(Bool(data=False))
         self.offboard_pub.publish(Bool(data=False))
@@ -902,6 +916,9 @@ class WebDashboardNode(Node):
                     elif self.path == "/api/land":
                         if payload.get("confirm"):
                             node.land()
+                    elif self.path == "/api/arm":
+                        if payload.get("confirm"):
+                            node.arm()
                     elif self.path == "/api/mission_plan/validate":
                         self._send(200, json.dumps(node.validate_mission_payload(payload)).encode("utf-8"))
                         return

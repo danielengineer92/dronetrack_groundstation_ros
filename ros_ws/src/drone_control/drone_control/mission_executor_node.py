@@ -58,6 +58,7 @@ class MissionState(Enum):
     SCAN = "SCAN"
     TRACK_CENTER = "TRACK_CENTER"
     APPROACH_TARGET = "APPROACH_TARGET"
+    GOTO = "GOTO"
     DO_ORBIT = "DO_ORBIT"
     RETURN_TO_LAUNCH = "RETURN_TO_LAUNCH"
     LAND = "LAND"
@@ -72,6 +73,7 @@ STEP_NAMES = {
     MissionState.SCAN: "3_scan_for_target",
     MissionState.TRACK_CENTER: "4_track_center_yaw",
     MissionState.APPROACH_TARGET: "5_approach_target",
+    MissionState.GOTO: "5b_goto_position",
     MissionState.DO_ORBIT: "6_orbit_target",
     MissionState.RETURN_TO_LAUNCH: "7_return_home",
     MissionState.LAND: "8_land",
@@ -132,6 +134,8 @@ class MissionExecutorNode(Node):
         self.declare_parameter("orbit_timeout_s", 45.0)
         self.declare_parameter("rtl_wait_s", 10.0)
         self.declare_parameter("land_wait_s", 10.0)
+        self.declare_parameter("goto_timeout_s", 30.0)
+        self.declare_parameter("goto_tolerance_m", 1.0)
         self.declare_parameter("use_mavsdk_do_orbit", True)
         self.declare_parameter("require_distance_for_orbit", True)
         self.declare_parameter("require_target_centered_for_orbit", True)
@@ -177,6 +181,8 @@ class MissionExecutorNode(Node):
         self.orbit_timeout_s = float(self.get_parameter("orbit_timeout_s").value)
         self.rtl_wait_s = float(self.get_parameter("rtl_wait_s").value)
         self.land_wait_s = float(self.get_parameter("land_wait_s").value)
+        self.goto_timeout_s = float(self.get_parameter("goto_timeout_s").value)
+        self.goto_tolerance_m = max(0.1, float(self.get_parameter("goto_tolerance_m").value))
         self.use_mavsdk_do_orbit = bool(self.get_parameter("use_mavsdk_do_orbit").value)
         self.require_distance_for_orbit = bool(self.get_parameter("require_distance_for_orbit").value)
         self.require_target_centered_for_orbit = bool(self.get_parameter("require_target_centered_for_orbit").value)
@@ -191,6 +197,8 @@ class MissionExecutorNode(Node):
         self.actions_sent: set[str] = set()
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
+        # Per-step goto targets, captured once at step entry (step_index -> tuple).
+        self._goto_targets: dict[int, tuple[float, float, float, float, float, float]] = {}
         self._last_autonomy_request: Optional[bool] = None
         self._last_offboard_request: Optional[bool] = None
         self._last_autonomy_request_publish_time = 0.0
@@ -245,6 +253,7 @@ class MissionExecutorNode(Node):
             "scan": self._step_scan,
             "track_center": self._step_track_center,
             "approach": self._step_approach,
+            "goto": self._step_goto,
             "orbit": self._step_orbit,
             "rtl": self._step_rtl,
             "land": self._step_land,
@@ -460,6 +469,7 @@ class MissionExecutorNode(Node):
         self.step_index = 0
         self.step_enter_time = time.monotonic()
         self.actions_sent.clear()
+        self._goto_targets.clear()
         detail = (
             f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
             f"{[s.type for s in plan.steps]}"
@@ -631,6 +641,9 @@ class MissionExecutorNode(Node):
         radius_m: Optional[float] = None,
         velocity_m_s: Optional[float] = None,
         orbit_revolutions: Optional[float] = None,
+        latitude_deg: Optional[float] = None,
+        longitude_deg: Optional[float] = None,
+        absolute_altitude_m: Optional[float] = None,
     ) -> None:
         if key in self.actions_sent:
             return
@@ -646,9 +659,9 @@ class MissionExecutorNode(Node):
         msg.velocity_m_s = float(self.orbit_speed_m_s if velocity_m_s is None else velocity_m_s)
         msg.orbit_revolutions = float(self.orbit_revolutions if orbit_revolutions is None else orbit_revolutions)
         msg.yaw_behavior = "FRONT_TO_CIRCLE_CENTER"
-        msg.latitude_deg = math.nan
-        msg.longitude_deg = math.nan
-        msg.absolute_altitude_m = math.nan
+        msg.latitude_deg = math.nan if latitude_deg is None else float(latitude_deg)
+        msg.longitude_deg = math.nan if longitude_deg is None else float(longitude_deg)
+        msg.absolute_altitude_m = math.nan if absolute_altitude_m is None else float(absolute_altitude_m)
         msg.note = note
 
         if action == "DO_ORBIT":
@@ -747,6 +760,7 @@ class MissionExecutorNode(Node):
             MissionState.SCAN,
             MissionState.TRACK_CENTER,
             MissionState.APPROACH_TARGET,
+            MissionState.GOTO,
             MissionState.DO_ORBIT,
             MissionState.RETURN_TO_LAUNCH,
             MissionState.LAND,
@@ -798,6 +812,7 @@ class MissionExecutorNode(Node):
         self.step_enter_time = time.monotonic()
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
+        self._goto_targets.clear()
         if self.plan.steps:
             self.transition(MissionState[self.plan.steps[0].state_name])
         self.log_event("plan_started", plan=self.plan.name, steps=[s.type for s in self.plan.steps])
@@ -988,6 +1003,103 @@ class MissionExecutorNode(Node):
         if self.approach_done(desired):
             return True
         timeout = step.timeout_s if step.timeout_s is not None else self.approach_timeout_s
+        return age > timeout
+
+    def _compute_goto_target(self, step) -> Optional[tuple[float, float, float, float, float, float]]:
+        """Resolve a goto step's offsets into local-NED + global targets.
+
+        Offsets are WORLD-frame north/east meters relative to the position at
+        step entry; altitude_m (if given) is an absolute relative-altitude
+        target. Returns (north, east, down, lat_deg, lon_deg, abs_alt_m), or
+        None while the required telemetry is not available.
+        """
+        if self.last_telemetry is None or not self.local_position_ready():
+            return None
+        t = self.last_telemetry
+        lat = float(t.latitude)
+        lon = float(t.longitude)
+        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+            return None
+
+        north_off = step.get_float("north_m", 0.0)
+        east_off = step.get_float("east_m", 0.0)
+        cur_north = float(t.local_position_north)
+        cur_east = float(t.local_position_east)
+        cur_down = float(t.local_position_down)
+        cur_rel_alt = float(t.relative_altitude)
+        cur_abs_alt = float(t.absolute_altitude)
+
+        rel_alt_target = step.get_float("altitude_m", cur_rel_alt)
+        climb_m = rel_alt_target - cur_rel_alt
+
+        earth_radius_m = 6378137.0
+        lat_rad = math.radians(lat)
+        out_lat = lat + math.degrees(north_off / earth_radius_m)
+        out_lon = lon + math.degrees(east_off / (earth_radius_m * max(math.cos(lat_rad), 1e-6)))
+        return (
+            cur_north + north_off,
+            cur_east + east_off,
+            cur_down - climb_m,  # NED: up is negative down
+            out_lat,
+            out_lon,
+            cur_abs_alt + climb_m,
+        )
+
+    def _step_goto(self, step) -> bool:
+        """Reposition by a world-frame offset via PX4 (MAVSDK goto_location).
+
+        Safety: uses the same MAVSDK action gate as TAKEOFF/DO_ORBIT
+        (telemetry_node allow_mavsdk_actions + airborne + valid local position),
+        so hardware keeps this disabled unless explicitly allowed. Offboard is
+        released — PX4's own Hold/reposition controller owns the motion.
+        """
+        if not self._check_airborne_local_or_hold("goto"):
+            self.publish_offboard_request(False)
+            return False
+        self.publish_offboard_request(False)
+
+        target = self._goto_targets.get(self.step_index)
+        if target is None:
+            target = self._compute_goto_target(step)
+            if target is None:
+                self.publish_mission_command("HOLD", True, "goto blocked: no global/local position yet")
+                self.publish_state("goto blocked: waiting for position")
+                return False
+            self._goto_targets[self.step_index] = target
+            self.log_event(
+                "goto_target_captured",
+                step_index=self.step_index,
+                target_ned=[round(v, 2) for v in target[:3]],
+                target_global=[round(target[3], 7), round(target[4], 7), round(target[5], 2)],
+            )
+
+        north, east, down, lat, lon, abs_alt = target
+        self.send_action_once(
+            self._step_action_key("goto"), "GOTO_LOCATION",
+            f"goto offset N={step.get_float('north_m', 0.0):+.1f}m "
+            f"E={step.get_float('east_m', 0.0):+.1f}m",
+            latitude_deg=lat, longitude_deg=lon, absolute_altitude_m=abs_alt,
+        )
+        self.publish_mission_command("HOLD", True, "goto reposition requested; PX4 owns motion")
+
+        tolerance_m = step.get_float("tolerance_m", self.goto_tolerance_m)
+        distance_m = float("nan")
+        if self.local_position_ready() and self.last_telemetry is not None:
+            t = self.last_telemetry
+            distance_m = math.sqrt(
+                (north - float(t.local_position_north)) ** 2
+                + (east - float(t.local_position_east)) ** 2
+                + (down - float(t.local_position_down)) ** 2
+            )
+        timeout = step.timeout_s if step.timeout_s is not None else self.goto_timeout_s
+        age = self.step_age()
+        self.publish_state(
+            f"goto in progress, distance={distance_m:.2f}/{tolerance_m:.2f}m, age={age:.1f}/{timeout:.1f}s"
+        )
+        # Give PX4 a beat to accept the reposition before testing arrival, so a
+        # goto that starts inside the tolerance ring doesn't complete instantly.
+        if age > 1.0 and math.isfinite(distance_m) and distance_m <= tolerance_m:
+            return True
         return age > timeout
 
     def _step_orbit(self, step) -> bool:

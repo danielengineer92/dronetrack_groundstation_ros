@@ -6,7 +6,8 @@ telemetry and, when explicitly enabled, consumes /drone/control/command and send
 safe position-hold/yaw Offboard setpoints to PX4.
 
 Safety posture for this first command bridge:
-- Does NOT arm the drone.
+- Does NOT arm the drone unless BOTH allow_mavsdk_actions and
+  allow_arm_via_mavsdk are true (hardware default: both false).
 - Does NOT take off.
 - Does NOT command forward/right/down motion by default.
 - Requires /drone/mavsdk/offboard_enable true before starting Offboard.
@@ -105,6 +106,9 @@ class TelemetryNode(Node):
         self.declare_parameter('stop_offboard_on_disable', True)
         self.declare_parameter('action_command_topic', '/drone/mavsdk/action_command')
         self.declare_parameter('allow_mavsdk_actions', False)
+        # ARM has its own opt-in ON TOP of allow_mavsdk_actions. Hardware keeps
+        # this false (arm from RC/QGC); SITL launches enable it deliberately.
+        self.declare_parameter('allow_arm_via_mavsdk', False)
         self.declare_parameter('action_command_timeout', 3.0)
         self.declare_parameter('action_telemetry_timeout', 2.0)
         self.declare_parameter('action_airborne_altitude_m', 0.5)
@@ -129,6 +133,7 @@ class TelemetryNode(Node):
         self._stop_offboard_on_disable: bool = bool(self.get_parameter('stop_offboard_on_disable').value)
         self._action_command_topic: str = str(self.get_parameter('action_command_topic').value)
         self._allow_mavsdk_actions: bool = bool(self.get_parameter('allow_mavsdk_actions').value)
+        self._allow_arm_via_mavsdk: bool = bool(self.get_parameter('allow_arm_via_mavsdk').value)
         self._action_command_timeout: float = float(self.get_parameter('action_command_timeout').value)
         self._action_telemetry_timeout: float = float(self.get_parameter('action_telemetry_timeout').value)
         self._action_airborne_altitude_m: float = float(self.get_parameter('action_airborne_altitude_m').value)
@@ -681,6 +686,19 @@ class TelemetryNode(Node):
         if action in ('LAND', 'RETURN_TO_LAUNCH', 'RTL', 'HOLD'):
             return True, "ACTION_ESCAPE_ALLOWED"
 
+        if action == 'ARM':
+            if not self._allow_arm_via_mavsdk:
+                return False, 'ARM_NOT_ALLOWED (allow_arm_via_mavsdk=false; arm from RC/QGC)'
+            state = self._action_state_snapshot()
+            ok, reason = self._action_state_fresh(state, 'armed_time', 'landed_state_time')
+            if not ok:
+                return False, reason
+            if state['armed']:
+                return False, 'ALREADY_ARMED'
+            if self._action_state_airborne(state):
+                return False, 'AIRBORNE_CANNOT_ARM'
+            return True, 'ARM_POLICY_OK'
+
         if action == 'TAKEOFF':
             state = self._action_state_snapshot()
             ok, reason = self._action_state_fresh(
@@ -697,7 +715,7 @@ class TelemetryNode(Node):
                 return False, 'ALREADY_AIRBORNE'
             return True, 'TAKEOFF_POLICY_OK'
 
-        if action == 'DO_ORBIT':
+        if action in ('DO_ORBIT', 'GOTO_LOCATION'):
             state = self._action_state_snapshot()
             ok, reason = self._action_state_fresh(
                 state,
@@ -711,7 +729,7 @@ class TelemetryNode(Node):
                 return False, 'NOT_AIRBORNE'
             if not self._action_state_local_position_ready(state):
                 return False, 'LOCAL_POSITION_NOT_VALID'
-            return True, 'DO_ORBIT_POLICY_OK'
+            return True, f'{action}_POLICY_OK'
 
         return True, 'NO_EXTRA_POLICY'
 
@@ -764,7 +782,12 @@ class TelemetryNode(Node):
         action = str(command.action).strip().upper()
 
         if action == 'ARM':
-            raise ValueError('ARM action is intentionally not supported by telemetry_node; arm manually from RC/QGC')
+            # Reached only after _action_policy_allows passed the double opt-in
+            # (allow_mavsdk_actions AND allow_arm_via_mavsdk) plus the on-ground,
+            # not-armed, telemetry-fresh checks.
+            self.get_logger().warning('Sending ARM (allow_arm_via_mavsdk=true).')
+            await drone.action.arm()
+            return
 
         if action == 'TAKEOFF':
             altitude = max(0.5, float(command.takeoff_altitude_m))
@@ -789,6 +812,24 @@ class TelemetryNode(Node):
 
         if action == 'DO_ORBIT':
             await self._send_do_orbit_mavlink_direct(drone, command)
+            return
+
+        if action == 'GOTO_LOCATION':
+            lat = float(command.latitude_deg)
+            lon = float(command.longitude_deg)
+            abs_alt = float(command.absolute_altitude_m)
+            if not all(math.isfinite(v) for v in (lat, lon, abs_alt)):
+                raise ValueError('GOTO_LOCATION requires finite latitude/longitude/absolute_altitude')
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                raise ValueError(f'GOTO_LOCATION lat/lon out of range: {lat}, {lon}')
+            # Keep the current heading; the sender expresses motion, not yaw.
+            with self._data_lock:
+                yaw_deg = math.degrees(float(self._telemetry_data['yaw'])) % 360.0
+            self.get_logger().warning(
+                f'Sending goto_location | lat={lat:.7f}, lon={lon:.7f}, '
+                f'abs_alt={abs_alt:.2f}m, yaw={yaw_deg:.1f}deg'
+            )
+            await drone.action.goto_location(lat, lon, abs_alt, yaw_deg)
             return
 
         raise ValueError(f'unknown MAVSDK action: {command.action}')
