@@ -59,3 +59,6 @@ web_dashboard_node:
     mission_command_topic: "/drone/mission/command"
     autonomy_state_topic: "/drone/autonomy/state"
     mission_catalog_paths: ""          # empty = auto-discover sibling drone_control/missions when present
+    mission_plan_topic: "/drone/mission/plan_request"   # mission-builder upload (executor re-validates)
+    mission_plan_ack_topic: "/drone/mission/plan_ack"
+    mission_save_dir: ""               # empty = ~/dronetrack_missions (builder "Save to Catalog")

@@ -71,6 +71,10 @@ operator_request_topics:
   - name: "/drone/autonomy/request"         # std_msgs/Bool
   - name: "/drone/mavsdk/offboard_request"  # std_msgs/Bool
   - name: "/drone/mavsdk/action_command"    # drone_interfaces/MavsdkActionCommand (gated by allow_mavsdk_actions)
+  - name: "/drone/mission/plan_request"     # std_msgs/String, YAML/JSON mission plan (dashboard builder).
+                                            # UNTRUSTED: mission_executor_node re-validates with the full
+                                            # parser and refuses uploads while a mission is active.
+  - name: "/drone/mission/plan_ack"         # std_msgs/String, executor's ACCEPTED/REJECTED reply (PI->GS)
 
 # Gazebo SITL topics (only active when running sitl_gazebo_launch.py).
 gazebo_topics:

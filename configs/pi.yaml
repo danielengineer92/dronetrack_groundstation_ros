@@ -186,6 +186,11 @@ mission_executor_node:
     scan_yaw_rate_deg_s: 20.0
     scan_timeout_s: 12.0
     mission_plan_file: ""
+    # Runtime plan upload (dashboard mission builder). Plans arriving here are
+    # fully re-validated and refused while a mission is active. Set the request
+    # topic to "" to disable uploads entirely (e.g. locked-down hardware).
+    mission_plan_topic: "/drone/mission/plan_request"
+    mission_plan_ack_topic: "/drone/mission/plan_ack"
     event_log_enabled: true
     event_log_directory: "~/drone_mission_logs"
 

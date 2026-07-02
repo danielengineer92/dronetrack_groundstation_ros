@@ -44,6 +44,7 @@ from drone_control.mission_plan import (
     build_default_plan,
     lint_plan,
     load_mission_plan,
+    parse_mission_plan_text,
 )
 
 
@@ -113,6 +114,13 @@ class MissionExecutorNode(Node):
         # which reproduces the original hardcoded sequence (backward compatible).
         self.declare_parameter("mission_plan_file", "")
 
+        # Runtime plan upload (e.g. from the dashboard mission builder). The plan
+        # arrives as a YAML/JSON document on a String topic, is fully re-validated
+        # here, and is REJECTED while a mission is active. Set the topic to "" to
+        # disable uploads entirely (e.g. on hardware).
+        self.declare_parameter("mission_plan_topic", "/drone/mission/plan_request")
+        self.declare_parameter("mission_plan_ack_topic", "/drone/mission/plan_ack")
+
         # Later/full mission behavior parameters. Kept so the old orbit path can be re-enabled later.
         self.declare_parameter("target_timeout_s", 2.0)
         self.declare_parameter("desired_approach_distance_m", 2.0)
@@ -156,6 +164,8 @@ class MissionExecutorNode(Node):
         self.scan_yaw_rate_deg_s = float(self.get_parameter("scan_yaw_rate_deg_s").value)
         self.scan_timeout_s = float(self.get_parameter("scan_timeout_s").value)
         self.mission_plan_file = str(self.get_parameter("mission_plan_file").value).strip()
+        self.mission_plan_topic = str(self.get_parameter("mission_plan_topic").value).strip()
+        self.mission_plan_ack_topic = str(self.get_parameter("mission_plan_ack_topic").value).strip()
 
         self.target_timeout_s = float(self.get_parameter("target_timeout_s").value)
         self.desired_approach_distance_m = float(self.get_parameter("desired_approach_distance_m").value)
@@ -180,6 +190,7 @@ class MissionExecutorNode(Node):
         self.action_command_id = 0
         self.actions_sent: set[str] = set()
         self._last_land_cmd_time = 0.0
+        self._last_takeoff_cmd_time = 0.0
         self._last_autonomy_request: Optional[bool] = None
         self._last_offboard_request: Optional[bool] = None
         self._last_autonomy_request_publish_time = 0.0
@@ -198,6 +209,11 @@ class MissionExecutorNode(Node):
         self.request_sub = self.create_subscription(Bool, self.mission_request_topic, self.mission_request_callback, qos)
         self.target_sub = self.create_subscription(TargetError, self.target_error_topic, self.target_callback, qos)
         self.telemetry_sub = self.create_subscription(DroneTelemetry, self.telemetry_topic, self.telemetry_callback, qos)
+        self.plan_ack_pub = None
+        self.plan_sub = None
+        if self.mission_plan_topic:
+            self.plan_ack_pub = self.create_publisher(String, self.mission_plan_ack_topic, qos)
+            self.plan_sub = self.create_subscription(String, self.mission_plan_topic, self.mission_plan_callback, qos)
         self.command_pub = self.create_publisher(MissionCommand, self.mission_command_topic, qos)
         self.state_pub = self.create_publisher(String, self.mission_state_topic, qos)
         self.action_pub = self.create_publisher(MavsdkActionCommand, self.mavsdk_action_topic, qos)
@@ -405,6 +421,58 @@ class MissionExecutorNode(Node):
             self.transition(MissionState.IDLE if self.mission_enabled else MissionState.DISABLED)
         self.diagnostics.mark_received(self.mission_request_topic, summary=f"request={requested}, active={self.mission_active}")
 
+    def _publish_plan_ack(self, accepted: bool, detail: str) -> None:
+        if self.plan_ack_pub is None:
+            return
+        msg = String()
+        msg.data = f"{'ACCEPTED' if accepted else 'REJECTED'}: {detail}"
+        self.plan_ack_pub.publish(msg)
+
+    def mission_plan_callback(self, msg: String) -> None:
+        """Validate and stage a mission plan uploaded at runtime (dashboard builder).
+
+        Safety posture: this only changes WHICH validated plan the executor will
+        walk on the next Start Mission. It never starts a mission, never arms,
+        and is refused outright while a mission is active. All the per-step
+        safety gates (preflight, MAVSDK action gating, offboard gating) are
+        unchanged.
+        """
+        if self.mission_active:
+            detail = "mission is active; stop the mission before uploading a new plan"
+            self.get_logger().warning(f"Mission plan upload rejected: {detail}")
+            self.log_event("mission_plan_upload_rejected", reason="mission_active")
+            self._publish_plan_ack(False, detail)
+            return
+
+        try:
+            plan = parse_mission_plan_text(msg.data, source="plan_request topic")
+        except MissionPlanError as exc:
+            self.get_logger().error(f"Mission plan upload rejected: {exc}")
+            self.log_event("mission_plan_upload_rejected", reason=str(exc))
+            self._publish_plan_ack(False, str(exc))
+            return
+
+        warnings = lint_plan(plan)
+        for warning in warnings:
+            self.get_logger().warning(f"Mission plan lint: {warning}")
+
+        self.plan = plan
+        self.step_index = 0
+        self.step_enter_time = time.monotonic()
+        self.actions_sent.clear()
+        detail = (
+            f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
+            f"{[s.type for s in plan.steps]}"
+        )
+        self.get_logger().warning(f"Mission plan upload accepted: {detail}")
+        self.log_event(
+            "mission_plan_uploaded",
+            plan=plan.name,
+            steps=[s.type for s in plan.steps],
+            lint_warnings=warnings,
+        )
+        self._publish_plan_ack(True, detail + (f" | lint: {'; '.join(warnings)}" if warnings else ""))
+
     def target_callback(self, msg: TargetError) -> None:
         self.last_target = msg
         self.last_target_time = time.monotonic()
@@ -546,6 +614,12 @@ class MissionExecutorNode(Node):
             return False
         desired = self.desired_approach_distance_m if desired_distance_m is None else float(desired_distance_m)
         return abs(float(self.last_target.distance_m) - desired) <= self.approach_distance_tolerance_m
+
+    def _step_action_key(self, action: str) -> str:
+        # Key one-shot actions by plan position, not just by action name: a plan
+        # may legitimately contain the same verb twice (e.g. two orbit steps),
+        # and a mission-wide "do_orbit" key would silently swallow the second.
+        return f"step{self.step_index}:{action}"
 
     def send_action_once(
         self,
@@ -722,6 +796,8 @@ class MissionExecutorNode(Node):
     def _start_plan(self) -> None:
         self.step_index = 0
         self.step_enter_time = time.monotonic()
+        self._last_land_cmd_time = 0.0
+        self._last_takeoff_cmd_time = 0.0
         if self.plan.steps:
             self.transition(MissionState[self.plan.steps[0].state_name])
         self.log_event("plan_started", plan=self.plan.name, steps=[s.type for s in self.plan.steps])
@@ -794,8 +870,16 @@ class MissionExecutorNode(Node):
             self.publish_state("already airborne; skipping takeoff")
             return True
         altitude_m = step.get_float("altitude_m", self.takeoff_altitude_m)
+        # Re-issue TAKEOFF every ~5s while still on the ground. A single send can
+        # be swallowed by a transient PX4 link drop or a momentarily-closed action
+        # gate, which would wedge the mission on this step forever.
+        takeoff_key = self._step_action_key("takeoff")
+        if (time.monotonic() - self._last_takeoff_cmd_time) >= 5.0:
+            self.actions_sent.discard(takeoff_key)
+            self._last_takeoff_cmd_time = time.monotonic()
         self.send_action_once(
-            "takeoff", "TAKEOFF", "smart mission takeoff before Offboard", takeoff_altitude_m=altitude_m
+            takeoff_key, "TAKEOFF",
+            "smart mission takeoff before Offboard", takeoff_altitude_m=altitude_m,
         )
         current_altitude = 0.0 if self.last_telemetry is None else float(self.last_telemetry.relative_altitude)
         self.publish_mission_command(
@@ -926,7 +1010,8 @@ class MissionExecutorNode(Node):
 
         if self.use_mavsdk_do_orbit:
             self.send_action_once(
-                "do_orbit", "DO_ORBIT", "MAV_CMD_DO_ORBIT around estimated ball center",
+                self._step_action_key("do_orbit"), "DO_ORBIT",
+                "MAV_CMD_DO_ORBIT around estimated ball center",
                 radius_m=radius_m, velocity_m_s=speed_m_s, orbit_revolutions=revolutions,
             )
             self.publish_mission_command("HOLD", True, "DO_ORBIT requested; PX4 owns orbit if accepted")
@@ -945,7 +1030,7 @@ class MissionExecutorNode(Node):
 
     def _step_rtl(self, step) -> bool:
         self.publish_offboard_request(False)
-        self.send_action_once("rtl", "RETURN_TO_LAUNCH", "return to launch")
+        self.send_action_once(self._step_action_key("rtl"), "RETURN_TO_LAUNCH", "return to launch")
         self.publish_mission_command("HOLD", True, "RTL requested")
         timeout = step.timeout_s if step.timeout_s is not None else self.rtl_wait_s
         age = self.step_age()
@@ -957,10 +1042,11 @@ class MissionExecutorNode(Node):
         # A single LAND sent while Offboard setpoints are still streaming (e.g.
         # immediately after a DO_ORBIT step) can be ignored by PX4, leaving the
         # vehicle hovering. Re-issue LAND every ~2 s until it actually descends.
+        land_key = self._step_action_key("land")
         if self.is_airborne() and (time.monotonic() - self._last_land_cmd_time) >= 2.0:
-            self.actions_sent.discard("land")
+            self.actions_sent.discard(land_key)
             self._last_land_cmd_time = time.monotonic()
-        self.send_action_once("land", "LAND", "land")
+        self.send_action_once(land_key, "LAND", "land")
         self.publish_mission_command("HOLD", True, "land requested")
         timeout = step.timeout_s if step.timeout_s is not None else self.land_wait_s
         age = self.step_age()

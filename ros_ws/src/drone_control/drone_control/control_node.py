@@ -328,8 +328,18 @@ class ControlNode(Node):
                     )
 
         for param in params:
+            # Coerce to the attribute's existing type: `ros2 param set ... 1`
+            # arrives as an int and would silently replace a float gain/limit.
             old_value = getattr(self, param.name, None)
-            setattr(self, param.name, param.value)
+            if isinstance(old_value, bool):
+                new_value = bool(param.value)
+            elif isinstance(old_value, float):
+                new_value = float(param.value)
+            elif isinstance(old_value, int):
+                new_value = int(param.value)
+            else:
+                new_value = param.value
+            setattr(self, param.name, new_value)
 
             if param.name in ("autonomy_enabled", "autonomous_enabled"):
                 self.set_autonomy_enabled(bool(param.value), source=f"parameter:{param.name}")
@@ -546,7 +556,7 @@ class ControlNode(Node):
 
         if not telemetry.connected:
             return False, STATUS_BLOCKED_DISCONNECTED
-         
+
         if telemetry.battery_remaining_percent < self.min_battery_percent:
             return False, STATUS_BLOCKED_LOW_BATTERY
 
@@ -766,9 +776,9 @@ class ControlNode(Node):
         source_error_y: float = 0.0,
         desired_yaw: float | None = None,
     ) -> None:
-      # IDLE must always mean no real movement command is being sent.
-      # desired_yaw is debug-only so we can see what yaw WOULD have been commanded
-      # if autonomy/safety gates allowed movement.
+        # IDLE must always mean no real movement command is being sent.
+        # desired_yaw is debug-only so we can see what yaw WOULD have been
+        # commanded if autonomy/safety gates allowed movement.
         self.last_command_forward = 0.0
         self.last_command_right = 0.0
         self.last_command_down = 0.0

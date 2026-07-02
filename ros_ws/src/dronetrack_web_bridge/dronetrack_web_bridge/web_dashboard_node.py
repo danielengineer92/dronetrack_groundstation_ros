@@ -14,22 +14,34 @@ endpoint. Differences for the split architecture:
 Endpoints:
     GET  /                 dashboard HTML
     GET  /api/status       latest status JSON
-    GET  /api/missions     local mission plan previews (display only)
+    GET  /api/missions     local mission plan previews
     GET  /stream.mjpg      live camera stream with YOLO detection overlays
-    POST /api/mission_request   {"enabled": true|false}
-    POST /api/autonomy_request  {"enabled": true|false}
-    POST /api/abort_hold        {"confirm": true}
-    POST /api/land              {"confirm": true}
+    POST /api/mission_request       {"enabled": true|false}
+    POST /api/autonomy_request      {"enabled": true|false}
+    POST /api/abort_hold            {"confirm": true}
+    POST /api/land                  {"confirm": true}
+    POST /api/mission_plan/validate {"mission": {...}}
+    POST /api/mission_plan/save     {"mission": {...}, "filename": "name"}
+    POST /api/mission_plan/send     {"mission": {...}} or {"catalog_index": N}
+
+Mission builder trust boundary: /api/mission_plan/send publishes the plan text on
+a request topic. The Pi-side mission executor is the authority: it re-validates
+the plan with the full parser, refuses uploads while a mission is active, and
+answers on an ack topic. Uploading a plan never starts a mission, never arms,
+and never bypasses the Pi safety gates.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 try:
     import cv2
@@ -46,7 +58,11 @@ from std_msgs.msg import Bool, String
 
 from drone_interfaces.msg import DetectionArray, DroneTelemetry, MavsdkActionCommand, MissionCommand
 from dronetrack_msgs.msg import GroundStationHeartbeat, LinkStatus
-from dronetrack_web_bridge.mission_preview import load_mission_catalog
+from dronetrack_web_bridge.mission_preview import (
+    discover_mission_paths,
+    load_mission_catalog,
+    preview_mission_data,
+)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -76,6 +92,13 @@ DASHBOARD_HTML = """<!doctype html>
   .start { background:#1f6feb; color:#fff; } .ready { background:#236; color:#cfe; }
   .hold { background:#7a5; color:#012; } .land { background:#ff5f75; color:#210; }
   select { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; min-width:230px; }
+  input { font:inherit; color:#e7f4ff; background:#09182d; border:1px solid rgba(100,160,220,.28); border-radius:8px; padding:9px 10px; }
+  .step select, .step input { min-width:0; padding:5px 7px; font-size:13px; }
+  .step-params { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .step-params label { display:flex; flex-direction:column; gap:2px; color:#83a3bd; font-size:11px; }
+  .step-tools { display:flex; gap:4px; margin-top:6px; }
+  .step-tools button { padding:4px 9px; font-size:12px; background:#123; color:#cfe6ff; }
+  .ack-ok { color:#50fa7b; } .ack-bad { color:#ff5f75; } .ack-wait { color:#ffcc66; }
   .planner-head { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:14px; align-items:flex-end; }
   .plan-body { display:grid; grid-template-columns:minmax(220px,320px) 1fr; gap:14px; padding:0 14px 14px; }
   .plan-meta { color:#cfe6ff; word-break:break-word; }
@@ -113,8 +136,11 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
   <section class="planner">
     <div class="planner-head">
-      <div><div class="k">Mission Plans</div><div class="camera-title">Preview</div></div>
-      <select id="mission_select" onchange="renderMissionPreview()"></select>
+      <div><div class="k">Mission Plans</div><div class="camera-title">Catalog</div></div>
+      <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+        <select id="mission_select" onchange="renderMissionPreview()"></select>
+        <button class="ready" onclick="sendCatalogMission()">Send to Drone</button>
+      </div>
     </div>
     <div class="plan-body">
       <div>
@@ -125,6 +151,31 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="steps" id="plan_steps"></div>
     </div>
   </section>
+  <section class="planner">
+    <div class="planner-head">
+      <div><div class="k">Mission Builder</div><div class="camera-title">Create Mission</div></div>
+      <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+        <input id="builder_name" placeholder="mission name" value="custom_mission"/>
+        <select id="builder_step_type"></select>
+        <button class="ready" onclick="builderAddStep()">+ Add Step</button>
+      </div>
+    </div>
+    <div class="plan-body">
+      <div>
+        <div class="k">Plan Status</div>
+        <div class="plan-meta" id="builder_result">Add steps, then Validate / Save / Send.</div>
+        <div class="warnings" id="builder_warnings"></div>
+        <div class="k" style="margin-top:12px">Executor Ack</div>
+        <div class="plan-meta" id="plan_ack">--</div>
+        <div class="row" style="margin-top:12px">
+          <button class="ready" onclick="builderValidate()">Validate</button>
+          <button class="ready" onclick="builderSave()">Save to Catalog</button>
+          <button class="start" onclick="builderSend()">Send to Drone</button>
+        </div>
+      </div>
+      <div class="steps" id="builder_steps"></div>
+    </div>
+  </section>
   <div class="row">
     <button class="ready" onclick="post('autonomy_request',{enabled:true})">System Ready</button>
     <button class="start" onclick="post('mission_request',{enabled:true})">Start Mission</button>
@@ -132,7 +183,9 @@ DASHBOARD_HTML = """<!doctype html>
     <button class="land" onclick="post('land',{confirm:true})">Land</button>
   </div>
   <p><small>Operator buttons publish request topics only. The Pi re-validates and
-  may ignore them. This page cannot arm, send control, or bypass Pi safety gates.</small></p>
+  may ignore them. Sent mission plans are re-validated by the mission executor and
+  refused while a mission is active. This page cannot arm, send control, or bypass
+  Pi safety gates.</small></p>
 </div>
 <script>
 function cls(el,c){el.className='v '+c;}
@@ -187,6 +240,12 @@ async function tick(){
     const ae = s.autonomy_effective || (s.autonomy_requested ? 'REQUESTED' : 'OFF');
     auton.textContent = ae; cls(auton, ae==='OFF'||ae==='DISABLED'?'ok':ae==='ENABLED'||ae==='READY'?'warn':'ok');
     document.getElementById('autonomy_detail').textContent = s.autonomy_requested?'operator requested':'';
+    const ack = document.getElementById('plan_ack');
+    ack.textContent = s.plan_ack || '--';
+    ack.className = 'plan-meta ' + (
+      (s.plan_ack||'').startsWith('ACCEPTED') ? 'ack-ok' :
+      (s.plan_ack||'').startsWith('REJECTED') ? 'ack-bad' :
+      (s.plan_ack||'').startsWith('PENDING') ? 'ack-wait' : '');
     document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
   }catch(e){ document.getElementById('updated').textContent='status fetch failed'; }
 }
@@ -240,7 +299,148 @@ async function post(path, body){
   await fetch('/api/'+path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   tick();
 }
-setInterval(tick, 500); tick(); loadMissions();
+async function postJson(path, body){
+  const r = await fetch('/api/'+path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return await r.json();
+}
+
+// ---- mission builder ----
+// Per-step editable parameters: [key, placeholder, kind]. kind: num | until | dir | text
+const STEP_PARAM_DEFS = {
+  takeoff:        [['altitude_m','3.0','num']],
+  prime_offboard: [['hold_s','1.5','num']],
+  scan:           [['direction','ccw','dir'],['yaw_deg','180','num'],['yaw_rate_deg_s','20','num'],['until','locked','until'],['timeout_s','12','num']],
+  track_center:   [['until','','until'],['timeout_s','','num']],
+  approach:       [['distance_m','2.0','num'],['until','','until'],['timeout_s','20','num']],
+  orbit:          [['radius_m','2.0','num'],['speed_m_s','0.4','num'],['revolutions','1','num'],['timeout_s','','num']],
+  rtl:            [['timeout_s','15','num']],
+  land:           [['timeout_s','','num']],
+  hold:           [['status','holding position','text'],['timeout_s','','num']],
+};
+const UNTIL_OPTIONS = ['', 'locked', 'centered', 'approach_done', 'airborne', 'none'];
+let builderSteps = [];
+
+function builderInit(){
+  const sel = document.getElementById('builder_step_type');
+  Object.keys(STEP_PARAM_DEFS).forEach(t => {
+    const o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o);
+  });
+  builderSteps = [
+    {type:'takeoff', params:{altitude_m:'3.0'}},
+    {type:'prime_offboard', params:{hold_s:'1.5'}},
+    {type:'track_center', params:{}},
+    {type:'land', params:{}},
+  ];
+  renderBuilder();
+}
+function builderAddStep(){
+  const t = document.getElementById('builder_step_type').value;
+  builderSteps.push({type:t, params:{}});
+  renderBuilder();
+}
+function builderRemove(i){ builderSteps.splice(i,1); renderBuilder(); }
+function builderMove(i,d){
+  const j = i+d;
+  if(j<0 || j>=builderSteps.length) return;
+  [builderSteps[i], builderSteps[j]] = [builderSteps[j], builderSteps[i]];
+  renderBuilder();
+}
+function builderSetParam(i,k,v){ builderSteps[i].params[k]=v; }
+function renderBuilder(){
+  const root = document.getElementById('builder_steps');
+  root.innerHTML = '';
+  builderSteps.forEach((st,i) => {
+    const item = document.createElement('div'); item.className='step';
+    const num = document.createElement('div'); num.className='step-num'; num.textContent=String(i+1);
+    const body = document.createElement('div');
+    const typ = document.createElement('div'); typ.className='step-type'; typ.textContent=st.type;
+    const params = document.createElement('div'); params.className='step-params';
+    (STEP_PARAM_DEFS[st.type]||[]).forEach(([key, placeholder, kind]) => {
+      const lab = document.createElement('label');
+      lab.appendChild(document.createTextNode(key));
+      let inp;
+      if(kind==='until' || kind==='dir'){
+        inp = document.createElement('select');
+        (kind==='dir' ? ['ccw','cw'] : UNTIL_OPTIONS).forEach(v => {
+          const o=document.createElement('option'); o.value=v; o.textContent=v===''?'(default)':v; inp.appendChild(o);
+        });
+        inp.value = st.params[key] ?? '';
+      }else{
+        inp = document.createElement('input');
+        inp.placeholder = placeholder;
+        inp.size = Math.max(6, placeholder.length);
+        inp.value = st.params[key] ?? '';
+      }
+      inp.addEventListener('input', e => builderSetParam(i, key, e.target.value));
+      inp.addEventListener('change', e => builderSetParam(i, key, e.target.value));
+      lab.appendChild(inp);
+      params.appendChild(lab);
+    });
+    const tools = document.createElement('div'); tools.className='step-tools';
+    [['\\u2191',()=>builderMove(i,-1)],['\\u2193',()=>builderMove(i,1)],['remove',()=>builderRemove(i)]].forEach(([txt,fn])=>{
+      const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; tools.appendChild(b);
+    });
+    body.appendChild(typ); body.appendChild(params); body.appendChild(tools);
+    item.appendChild(num); item.appendChild(body);
+    root.appendChild(item);
+  });
+}
+function buildMission(){
+  const steps = builderSteps.map(st => {
+    const out = {type: st.type};
+    Object.entries(st.params).forEach(([k,v]) => {
+      const s = String(v).trim();
+      if(s === '') return;
+      const n = Number(s);
+      out[k] = Number.isFinite(n) && /^[-+0-9.eE]+$/.test(s) ? n : s;
+    });
+    return out;
+  });
+  return {name: (document.getElementById('builder_name').value.trim() || 'custom_mission'), steps};
+}
+function showBuilderResult(text, ok, warnings){
+  const res = document.getElementById('builder_result');
+  res.textContent = text;
+  res.className = 'plan-meta ' + (ok ? 'ack-ok' : 'ack-bad');
+  const w = document.getElementById('builder_warnings');
+  w.innerHTML = '';
+  (warnings||[]).forEach(t => { const d=document.createElement('small'); d.textContent=t; w.appendChild(d); });
+}
+async function builderValidate(){
+  try{
+    const r = await postJson('mission_plan/validate', {mission: buildMission()});
+    if(r.valid) showBuilderResult('Valid: '+r.steps.length+' steps', true, r.warnings);
+    else showBuilderResult('Invalid: '+(r.error||'unknown error'), false, r.warnings);
+  }catch(e){ showBuilderResult('Validate failed: '+e, false); }
+}
+async function builderSave(){
+  try{
+    const m = buildMission();
+    const r = await postJson('mission_plan/save', {mission: m, filename: m.name});
+    if(r.ok){ showBuilderResult('Saved: '+r.path, true, (r.record||{}).warnings); loadMissions(); }
+    else showBuilderResult('Save failed: '+(r.error||'unknown error'), false, (r.record||{}).warnings);
+  }catch(e){ showBuilderResult('Save failed: '+e, false); }
+}
+async function builderSend(){
+  try{
+    const r = await postJson('mission_plan/send', {mission: buildMission()});
+    if(r.ok) showBuilderResult('Sent \\''+r.sent+'\\' to the mission executor \\u2014 watch Executor Ack.', true, (r.record||{}).warnings);
+    else showBuilderResult('Send failed: '+(r.error||'unknown error'), false, (r.record||{}).warnings);
+    tick();
+  }catch(e){ showBuilderResult('Send failed: '+e, false); }
+}
+async function sendCatalogMission(){
+  const sel = document.getElementById('mission_select');
+  if(sel.value === '') return;
+  try{
+    const r = await postJson('mission_plan/send', {catalog_index: Number(sel.value)});
+    const meta = document.getElementById('plan_meta');
+    meta.textContent = r.ok ? ('Sent \\''+r.sent+'\\' to the mission executor \\u2014 watch Executor Ack.')
+                            : ('Send failed: '+(r.error||'unknown error'));
+    tick();
+  }catch(e){ document.getElementById('plan_meta').textContent = 'Send failed: '+e; }
+}
+setInterval(tick, 500); tick(); loadMissions(); builderInit();
 </script>
 </body></html>"""
 
@@ -278,15 +478,22 @@ class WebDashboardNode(Node):
         self.declare_parameter("mission_command_topic", "/drone/mission/command")
         self.declare_parameter("autonomy_state_topic", "/drone/autonomy/state")
         self.declare_parameter("mission_catalog_paths", "")
+        self.declare_parameter("mission_plan_topic", "/drone/mission/plan_request")
+        self.declare_parameter("mission_plan_ack_topic", "/drone/mission/plan_ack")
+        # Where dashboard-built missions are saved. Empty = ~/dronetrack_missions.
+        self.declare_parameter("mission_save_dir", "")
 
         self.host = str(self.get_parameter("host").value)
         self.port = int(self.get_parameter("port").value)
-        self.mission_catalog = load_mission_catalog(
-            self.get_parameter("mission_catalog_paths").value,
-            module_file=__file__,
-        )
+
+        save_dir = str(self.get_parameter("mission_save_dir").value).strip()
+        self.mission_save_dir = Path(save_dir).expanduser() if save_dir else Path.home() / "dronetrack_missions"
+        self._catalog_lock = threading.Lock()
+        self.mission_catalog: list[dict] = []
+        self._reload_mission_catalog()
 
         self._lock = threading.Lock()
+        self._shutdown = threading.Event()
         self._state = {
             "link_ok": False, "link_reason": "no data", "latency_s": float("nan"),
             "perception_fps": -1.0, "detection_count": 0, "max_confidence": 0.0,
@@ -297,6 +504,7 @@ class WebDashboardNode(Node):
             "autonomy_effective": "", "mission_state": "",
             "mission_command_mode": "", "mission_step_index": -1,
             "mission_step_name": "", "mission_command_status": "",
+            "plan_ack": "",
         }
         self._latest_jpeg: bytes | None = None
         self._latest_frame_time = 0.0
@@ -326,8 +534,11 @@ class WebDashboardNode(Node):
                                  self._on_mission_command, reliable)
         self.create_subscription(String, str(self.get_parameter("autonomy_state_topic").value),
                                  self._on_autonomy_state, reliable)
+        self.create_subscription(String, str(self.get_parameter("mission_plan_ack_topic").value),
+                                 self._on_plan_ack, reliable)
 
         self.mission_pub = self.create_publisher(Bool, str(self.get_parameter("mission_request_topic").value), reliable)
+        self.plan_pub = self.create_publisher(String, str(self.get_parameter("mission_plan_topic").value), reliable)
         self.autonomy_pub = self.create_publisher(Bool, str(self.get_parameter("autonomy_request_topic").value), reliable)
         self.offboard_pub = self.create_publisher(Bool, str(self.get_parameter("offboard_request_topic").value), reliable)
         self.action_pub = self.create_publisher(MavsdkActionCommand, str(self.get_parameter("mavsdk_action_topic").value), reliable)
@@ -403,6 +614,89 @@ class WebDashboardNode(Node):
         with self._lock:
             self._state["autonomy_effective"] = msg.data
 
+    def _on_plan_ack(self, msg: String) -> None:
+        with self._lock:
+            self._state["plan_ack"] = msg.data
+
+    # ---- mission builder ---------------------------------------------------
+    def _reload_mission_catalog(self) -> None:
+        configured = str(self.get_parameter("mission_catalog_paths").value or "").strip()
+        if configured:
+            paths = [p for p in configured.replace(";", os.pathsep).split(os.pathsep) if p.strip()]
+        else:
+            paths = [str(p) for p in discover_mission_paths(__file__)]
+        paths.append(str(self.mission_save_dir))  # dashboard-built missions join the catalog
+        catalog = load_mission_catalog(paths, module_file=__file__)
+        with self._catalog_lock:
+            self.mission_catalog = catalog
+
+    @staticmethod
+    def _extract_mission_data(payload: dict) -> dict:
+        mission = payload.get("mission")
+        if not isinstance(mission, dict):
+            raise ValueError("payload must contain a 'mission' object")
+        return {"mission": mission}
+
+    def validate_mission_payload(self, payload: dict) -> dict:
+        data = self._extract_mission_data(payload)
+        return preview_mission_data(data, module_file=__file__)
+
+    def save_mission_payload(self, payload: dict) -> dict:
+        data = self._extract_mission_data(payload)
+        record = preview_mission_data(data, module_file=__file__)
+        if not record.get("valid"):
+            return {"ok": False, "error": record.get("error") or "invalid mission", "record": record}
+
+        requested = str(payload.get("filename") or record.get("name") or "custom_mission")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", requested.removesuffix(".yaml").removesuffix(".yml")).strip("_")
+        if not stem:
+            return {"ok": False, "error": "filename resolves to nothing after sanitizing"}
+
+        import yaml
+
+        try:
+            self.mission_save_dir.mkdir(parents=True, exist_ok=True)
+            path = self.mission_save_dir / f"{stem}.yaml"
+            path.write_text(
+                yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return {"ok": False, "error": f"could not write mission file: {exc}"}
+
+        self._reload_mission_catalog()
+        self.get_logger().info(f"Mission builder saved plan '{record.get('name')}' to {path}")
+        return {"ok": True, "path": str(path), "record": record}
+
+    def send_mission_payload(self, payload: dict) -> dict:
+        if "catalog_index" in payload:
+            with self._catalog_lock:
+                catalog = list(self.mission_catalog)
+            try:
+                record = catalog[int(payload["catalog_index"])]
+            except (ValueError, TypeError, IndexError):
+                return {"ok": False, "error": "catalog_index out of range"}
+            if not record.get("valid"):
+                return {"ok": False, "error": f"catalog mission invalid: {record.get('error')}"}
+            try:
+                text = Path(str(record["path"])).read_text(encoding="utf-8")
+            except OSError as exc:
+                return {"ok": False, "error": f"could not read mission file: {exc}"}
+            plan_name = str(record.get("name") or record.get("filename"))
+        else:
+            data = self._extract_mission_data(payload)
+            record = preview_mission_data(data, module_file=__file__)
+            if not record.get("valid"):
+                return {"ok": False, "error": record.get("error") or "invalid mission", "record": record}
+            text = json.dumps(data)
+            plan_name = str(record.get("name"))
+
+        with self._lock:
+            self._state["plan_ack"] = "PENDING: waiting for mission executor ack..."
+        self.plan_pub.publish(String(data=text))
+        self.get_logger().info(f"Mission builder sent plan '{plan_name}' to the mission executor")
+        return {"ok": True, "sent": plan_name, "record": record}
+
     # ---- operator actions ------------------------------------------------
     def publish_mission_request(self, enabled: bool) -> None:
         self.mission_pub.publish(Bool(data=enabled))
@@ -462,13 +756,17 @@ class WebDashboardNode(Node):
         }
 
     def mission_catalog_snapshot(self) -> dict:
+        with self._catalog_lock:
+            missions = list(self.mission_catalog)
         return {
-            "mode": "preview_only",
+            "mode": "preview_and_upload",
             "trust_boundary": (
-                "Mission selection stays on the Pi: set mission_executor_node.mission_plan_file "
-                "there before starting a mission. The dashboard only previews local YAML."
+                "Uploaded plans are re-validated by the Pi-side mission executor, which "
+                "refuses uploads while a mission is active. Uploading never starts a "
+                "mission, never arms, and never bypasses Pi safety gates."
             ),
-            "missions": self.mission_catalog,
+            "save_dir": str(self.mission_save_dir),
+            "missions": missions,
         }
 
     def _latest_stream_frame(self) -> bytes | None:
@@ -540,7 +838,7 @@ class WebDashboardNode(Node):
         handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         handler.end_headers()
 
-        while True:
+        while not self._shutdown.is_set():
             frame = self._latest_stream_frame()
             if frame is None:
                 time.sleep(0.1)
@@ -590,6 +888,9 @@ class WebDashboardNode(Node):
                 except json.JSONDecodeError:
                     self._send(400, b'{"error":"bad json"}')
                     return
+                if not isinstance(payload, dict):
+                    self._send(400, b'{"error":"payload must be a JSON object"}')
+                    return
                 try:
                     if self.path == "/api/mission_request":
                         node.publish_mission_request(bool(payload.get("enabled", False)))
@@ -601,10 +902,21 @@ class WebDashboardNode(Node):
                     elif self.path == "/api/land":
                         if payload.get("confirm"):
                             node.land()
+                    elif self.path == "/api/mission_plan/validate":
+                        self._send(200, json.dumps(node.validate_mission_payload(payload)).encode("utf-8"))
+                        return
+                    elif self.path == "/api/mission_plan/save":
+                        self._send(200, json.dumps(node.save_mission_payload(payload)).encode("utf-8"))
+                        return
+                    elif self.path == "/api/mission_plan/send":
+                        self._send(200, json.dumps(node.send_mission_payload(payload)).encode("utf-8"))
+                        return
                     else:
                         self._send(404, b'{"error":"not found"}')
                         return
                     self._send(200, b'{"ok":true}')
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"))
                 except Exception as exc:  # noqa: BLE001
                     self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"))
 
@@ -624,6 +936,7 @@ class WebDashboardNode(Node):
         self._thread.start()
 
     def destroy_node(self) -> None:
+        self._shutdown.set()  # unblock any MJPEG stream loops before stopping the server
         try:
             self._httpd.shutdown()
         except Exception:  # noqa: BLE001

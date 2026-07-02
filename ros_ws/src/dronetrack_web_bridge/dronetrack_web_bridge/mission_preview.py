@@ -78,6 +78,49 @@ def load_mission_catalog(configured_paths: Any = "", module_file: str | None = N
     return records
 
 
+def preview_mission_data(data: Any, module_file: str | None = None) -> dict[str, Any]:
+    """Validate an in-memory mission mapping and return a JSON-safe record.
+
+    Used both for file previews and for dashboard mission-builder validation.
+    Prefers the real drone_control parser (full validation, identical to what
+    the Pi-side executor enforces) and falls back to the local lightweight
+    checks when drone_control is not importable.
+    """
+    record: dict[str, Any] = {
+        "name": "",
+        "valid": False,
+        "error": "",
+        "warnings": [],
+        "steps": [],
+    }
+
+    # Prefer the real drone_control parser: it enforces exactly what the Pi-side
+    # executor enforces. The lightweight fallback is ONLY for environments where
+    # drone_control is not importable — it must never mask a strict-parser
+    # rejection, or the dashboard would call a plan valid that the executor
+    # (correctly) refuses.
+    try:
+        _ensure_drone_control_importable(module_file)
+        from drone_control.mission_plan import parse_mission_plan  # noqa: F401
+
+        parser_available = True
+    except Exception:  # noqa: BLE001
+        parser_available = False
+
+    try:
+        if parser_available:
+            preview = _preview_with_drone_control(data, module_file)
+        else:
+            preview = _preview_with_fallback(data)
+    except Exception as exc:  # noqa: BLE001
+        record["error"] = str(exc)
+        return record
+
+    record.update(preview)
+    record["valid"] = True
+    return record
+
+
 def preview_mission_file(path: Path, module_file: str | None = None) -> dict[str, Any]:
     """Return a JSON-safe preview record for one mission YAML file."""
     record: dict[str, Any] = {
@@ -101,17 +144,10 @@ def preview_mission_file(path: Path, module_file: str | None = None) -> dict[str
         record["error"] = f"could not read mission YAML: {exc}"
         return record
 
-    try:
-        preview = _preview_with_drone_control(data, module_file)
-    except Exception as exc:  # noqa: BLE001
-        try:
-            preview = _preview_with_fallback(data)
-        except Exception:
-            record["error"] = str(exc)
-            return record
-
-    record.update(preview)
-    record["valid"] = True
+    data_record = preview_mission_data(data, module_file=module_file)
+    name = data_record.pop("name", "") or record["name"]
+    record.update(data_record)
+    record["name"] = name
     return record
 
 

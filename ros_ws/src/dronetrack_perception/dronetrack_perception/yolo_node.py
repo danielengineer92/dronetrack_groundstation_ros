@@ -67,12 +67,22 @@ class YoloNode(Node):
         self.compressed_image_topic = str(self.get_parameter("compressed_image_topic").value)
         self.detections_topic = str(self.get_parameter("detections_topic").value)
         self.process_every_n_frames = max(1, int(self.get_parameter("process_every_n_frames").value))
-        self.max_fps = float(self.get_parameter("max_fps").value)
+        self.max_fps = max(0.0, float(self.get_parameter("max_fps").value))
         self.min_process_interval_s = 1.0 / self.max_fps if self.max_fps > 0.0 else 0.0
+
+        # Ultralytics requires imgsz to be a multiple of the model stride (32).
+        # Round up rather than erroring per-frame with a confusing message.
+        rounded_input = max(32, ((self.input_size + 31) // 32) * 32)
+        if rounded_input != self.input_size:
+            self.get_logger().warning(
+                f"input_size={self.input_size} is not a multiple of 32; using {rounded_input}.")
+            self.input_size = rounded_input
+        self.confidence_threshold = min(1.0, max(0.0, self.confidence_threshold))
+        self.iou_threshold = min(1.0, max(0.0, self.iou_threshold))
 
         self._received_frames = 0
         self._published_arrays = 0
-        self._last_process_start = 0.0
+        self._next_process_time = 0.0
         self._report_window_start = time.monotonic()
         self._target_class_ids: Optional[List[int]] = None
         self.bridge = CvBridge()
@@ -126,6 +136,15 @@ class YoloNode(Node):
             self.get_logger().error("ultralytics not installed. pip install ultralytics")
             self.model_loaded = False
         except Exception as exc:  # noqa: BLE001
+            if self.device not in ("", "cpu"):
+                # A missing/broken GPU stack should degrade to slower perception,
+                # not take the whole perception pipeline down.
+                self.get_logger().error(
+                    f"Failed to load YOLO model on device '{self.device}' ({exc}); retrying on cpu.")
+                self.device = "cpu"
+                self.half_precision = False  # half is CUDA-only
+                self._load_model()
+                return
             self.get_logger().error(f"Failed to load YOLO model: {exc}")
             self.model_loaded = False
 
@@ -165,13 +184,19 @@ class YoloNode(Node):
             return
         if self._received_frames % self.process_every_n_frames != 0:
             return
+        # Anchored-schedule throttle. A naive "now - last >= interval" check drops
+        # every other frame when max_fps equals the camera rate: frame periods
+        # jitter around the interval, so half of them land a hair early. Anchoring
+        # the next slot to the previous slot (not to the last processed frame)
+        # absorbs that jitter and delivers the configured rate exactly.
         now = time.monotonic()
-        if (
-            self.min_process_interval_s > 0.0
-            and now - self._last_process_start < self.min_process_interval_s
-        ):
-            return
-        self._last_process_start = now
+        if self.min_process_interval_s > 0.0:
+            if now < self._next_process_time:
+                return
+            slot = self._next_process_time + self.min_process_interval_s
+            # If we fell far behind (slow inference, stalled stream), re-anchor to
+            # now instead of racing to catch up on a backlog of virtual slots.
+            self._next_process_time = slot if slot > now - self.min_process_interval_s else now + self.min_process_interval_s
 
         try:
             img_h, img_w = frame.shape[:2]

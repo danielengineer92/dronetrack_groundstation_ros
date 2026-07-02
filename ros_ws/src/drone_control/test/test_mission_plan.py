@@ -16,6 +16,7 @@ try:
         build_default_plan,
         lint_plan,
         parse_mission_plan,
+        parse_mission_plan_text,
     )
 except ImportError:  # pragma: no cover - direct-run convenience
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - direct-run convenience
         build_default_plan,
         lint_plan,
         parse_mission_plan,
+        parse_mission_plan_text,
     )
 
 
@@ -208,6 +210,72 @@ def test_lint_clean_scan_plan_has_no_timeout_warning():
     )
     warnings = lint_plan(plan)
     assert not any("timeout_s" in w for w in warnings)
+
+
+def test_nan_timeout_raises():
+    # YAML `.nan` parses to float NaN; every comparison against NaN is False, so
+    # an unvalidated NaN timeout would make a step never time out.
+    try:
+        parse_mission_plan({"mission": {"steps": [{"type": "orbit", "timeout_s": float("nan")}]}})
+    except MissionPlanError as exc:
+        assert "timeout_s" in str(exc)
+    else:
+        raise AssertionError("expected MissionPlanError for NaN timeout_s")
+
+
+def test_bad_numeric_param_raises():
+    cases = [
+        {"type": "takeoff", "altitude_m": "very high"},
+        {"type": "takeoff", "altitude_m": -2.0},
+        {"type": "takeoff", "altitude_m": float("inf")},
+        {"type": "orbit", "radius_m": 0},
+        {"type": "orbit", "speed_m_s": 100.0},
+        {"type": "prime_offboard", "hold_s": -1},
+    ]
+    for step in cases:
+        try:
+            parse_mission_plan({"mission": {"steps": [step]}})
+        except MissionPlanError:
+            pass
+        else:
+            raise AssertionError(f"expected MissionPlanError for {step!r}")
+
+
+def test_get_float_falls_back_on_garbage():
+    plan = build_default_plan()
+    step = plan.steps[0]
+    step.params["altitude_m"] = "not-a-number"
+    assert step.get_float("altitude_m", 3.0) == 3.0
+    step.params["altitude_m"] = float("nan")
+    assert step.get_float("altitude_m", 3.0) == 3.0
+
+
+def test_parse_mission_plan_text_yaml_and_json():
+    yaml_text = "mission:\n  name: from_yaml\n  steps:\n    - {type: takeoff, altitude_m: 3.0}\n    - land\n"
+    plan = parse_mission_plan_text(yaml_text)
+    assert plan.name == "from_yaml"
+    assert [s.type for s in plan.steps] == ["takeoff", "land"]
+
+    json_text = '{"mission": {"name": "from_json", "steps": [{"type": "takeoff"}, {"type": "land"}]}}'
+    plan = parse_mission_plan_text(json_text)
+    assert plan.name == "from_json"
+    assert [s.type for s in plan.steps] == ["takeoff", "land"]
+
+
+def test_parse_mission_plan_text_rejects_garbage_and_oversize():
+    for bad in ("not: [valid", "steps: 3", ""):
+        try:
+            parse_mission_plan_text(bad)
+        except MissionPlanError:
+            pass
+        else:
+            raise AssertionError(f"expected MissionPlanError for {bad!r}")
+    try:
+        parse_mission_plan_text("#" + "x" * (70 * 1024))
+    except MissionPlanError as exc:
+        assert "bytes" in str(exc)
+    else:
+        raise AssertionError("expected MissionPlanError for oversized plan text")
 
 
 def _run_all():

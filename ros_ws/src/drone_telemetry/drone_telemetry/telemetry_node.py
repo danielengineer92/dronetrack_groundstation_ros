@@ -404,6 +404,7 @@ class TelemetryNode(Node):
                 return
 
         await asyncio.gather(
+            self._watch_connection_state(drone),
             self._stream_battery(drone),
             self._stream_position(drone),
             self._stream_position_velocity_ned(drone),
@@ -417,6 +418,52 @@ class TelemetryNode(Node):
             self._offboard_command_loop(drone),
             self._action_command_loop(drone),
         )
+
+    async def _watch_connection_state(self, drone) -> None:
+        """Keep _connected truthful for the LIFETIME of the session.
+
+        The initial wait loop in _connect_and_stream breaks out on the first
+        is_connected=True, so without this watcher a later PX4 drop would leave
+        _connected stuck True: the dashboard would show CONNECTED and the command
+        bridge would keep trying to send.
+
+        Disconnects are DEBOUNCED: under lockstep SITL (and on lossy links)
+        MAVSDK's connection_state flaps False->True within a fraction of a
+        second every few seconds. Reacting instantly would flicker every
+        downstream safety gate and drop one-shot actions, so a loss only counts
+        after it persists for the grace window; recovery counts immediately.
+        """
+        grace_s = 3.0
+        pending_disconnect: Optional[asyncio.Task] = None
+
+        async def flip_down_after_grace() -> None:
+            try:
+                await asyncio.sleep(grace_s)
+            except asyncio.CancelledError:
+                return
+            if self._running and self._connected:
+                self._connected = False
+                self._connection_status = "DISCONNECTED"
+                self._offboard_active = False
+                self._prime_hold_position = None
+                self.get_logger().error(
+                    f'PX4 connection LOST (no MAVSDK heartbeat for {grace_s:.0f}s).')
+
+        async for state in drone.core.connection_state():
+            if not self._running:
+                if pending_disconnect is not None:
+                    pending_disconnect.cancel()
+                return
+            if state.is_connected:
+                if pending_disconnect is not None:
+                    pending_disconnect.cancel()
+                    pending_disconnect = None
+                if not self._connected:
+                    self._connected = True
+                    self._connection_status = "CONNECTED"
+                    self.get_logger().warning('PX4 connection RECOVERED (MAVSDK connection_state).')
+            elif pending_disconnect is None or pending_disconnect.done():
+                pending_disconnect = asyncio.ensure_future(flip_down_after_grace())
 
     async def _stream_battery(self, drone) -> None:
         async for battery in drone.telemetry.battery():
@@ -1003,8 +1050,12 @@ class TelemetryNode(Node):
                 east = float(self._telemetry_data['local_position_east'])
                 down = float(self._telemetry_data['local_position_down'])
                 yaw_deg = math.degrees(float(self._telemetry_data['yaw'])) % 360.0
+                ned_time = float(self._last_local_position_time)
 
             if not valid or not all(math.isfinite(v) for v in (north, east, down, yaw_deg)):
+                return None
+            # Never anchor a hold position on a stale NED sample.
+            if ned_time <= 0.0 or time.monotonic() - ned_time > self._action_telemetry_timeout:
                 return None
 
             self._prime_hold_position = (north, east, down, yaw_deg)
@@ -1069,6 +1120,8 @@ class TelemetryNode(Node):
             armed = bool(self._telemetry_data['armed'])
             battery_remaining = float(self._telemetry_data['battery_remaining'])
             flight_mode = str(self._telemetry_data['flight_mode'])
+            local_position_valid = bool(self._telemetry_data['local_position_valid'])
+            local_position_time = float(self._last_local_position_time)
 
         decision = {
             'executor_enabled': self._mavsdk_offboard_enabled,
@@ -1138,11 +1191,17 @@ class TelemetryNode(Node):
                 decision['reason'] = f'{BRIDGE_BAD_POSITION_COMMAND}: position_valid=false'
                 return decision
             # Defense-in-depth: don't forward an absolute NED setpoint unless the
-            # bridge's OWN live telemetry says local position is currently valid.
-            # The command's position_valid bit can be stale if the EKF/GPS dropped
-            # out after the command was built upstream.
-            if not bool(self._telemetry_data.get('local_position_valid', False)):
+            # bridge's OWN live telemetry says local position is currently valid
+            # AND recent. The command's position_valid bit can be stale if the
+            # EKF/GPS dropped out after the command was built upstream, and the
+            # local flag itself is only set by the NED stream — if that stream
+            # stalls the flag would otherwise stay true forever.
+            if not local_position_valid:
                 decision['reason'] = f'{BRIDGE_BAD_POSITION_COMMAND}: local_position_invalid (live telemetry)'
+                return decision
+            ned_age = now - local_position_time
+            if local_position_time <= 0.0 or ned_age > self._action_telemetry_timeout:
+                decision['reason'] = f'{BRIDGE_BAD_POSITION_COMMAND}: local_position_stale ({ned_age:.2f}s)'
                 return decision
             if not all(math.isfinite(v) for v in (north, east, down, yaw_deg)):
                 decision['reason'] = f'{BRIDGE_BAD_POSITION_COMMAND}: non_finite'

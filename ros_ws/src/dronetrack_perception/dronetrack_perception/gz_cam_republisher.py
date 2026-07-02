@@ -13,6 +13,8 @@ that subscribe to raw (e.g. YOLO in raw transport mode) work too.
 
 from __future__ import annotations
 
+import time
+
 import cv2
 import rclpy
 from cv_bridge import CvBridge
@@ -39,9 +41,16 @@ class GzCamRepublisher(Node):
         self.jpeg_quality = max(1, min(100, int(self.get_parameter("jpeg_quality").value)))
         report_s = max(0.5, float(self.get_parameter("report_period_s").value))
 
+        self.declare_parameter("stall_warn_s", 5.0)
+        self.stall_warn_s = max(1.0, float(self.get_parameter("stall_warn_s").value))
+
         self.bridge = CvBridge()
         self.frames_in = 0
         self.frames_out = 0
+        self._last_frame_mono = 0.0
+        self._last_report_frames_in = 0
+        self._last_report_mono = time.monotonic()
+        self._stalled = False
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -65,6 +74,10 @@ class GzCamRepublisher(Node):
 
     def _on_image(self, msg: Image) -> None:
         self.frames_in += 1
+        self._last_frame_mono = time.monotonic()
+        if self._stalled:
+            self._stalled = False
+            self.get_logger().warning("Gazebo camera stream recovered; frames flowing again.")
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as exc:
@@ -105,8 +118,28 @@ class GzCamRepublisher(Node):
         self.frames_out += 1
 
     def _report(self) -> None:
+        now = time.monotonic()
+        window = max(1e-6, now - self._last_report_mono)
+        fps = (self.frames_in - self._last_report_frames_in) / window
+        self._last_report_frames_in = self.frames_in
+        self._last_report_mono = now
+
+        # Loud stall detection. The gz->ROS image bridge is known to stop
+        # forwarding frames occasionally while Gazebo keeps rendering; when that
+        # happens perception silently dies. Make it unmissable in the logs and
+        # name the recovery so an operator (or a log-watching script) can act.
+        frame_age = now - self._last_frame_mono if self._last_frame_mono > 0.0 else -1.0
+        if self.frames_in > 0 and frame_age > self.stall_warn_s:
+            self._stalled = True
+            self.get_logger().error(
+                f"Gazebo camera stream STALLED: no frames for {frame_age:.1f}s "
+                f"(in={self.frames_in} total). ros_gz image bridge likely hung; "
+                "restart the bridge/container to recover."
+            )
+            return
+
         self.get_logger().info(
-            f"Gazebo cam republisher | in={self.frames_in}, out={self.frames_out}"
+            f"Gazebo cam republisher | in={self.frames_in}, out={self.frames_out}, fps={fps:.1f}"
         )
 
 

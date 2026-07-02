@@ -74,6 +74,22 @@ TIMEOUT_RECOMMENDED_STEP_TYPES: frozenset[str] = frozenset(
 # Allowed sweep directions for a `scan` step (counter-clockwise / clockwise yaw).
 VALID_SCAN_DIRECTIONS: frozenset[str] = frozenset({"ccw", "cw"})
 
+# Known numeric step parameters and their validity ranges, checked at parse time.
+# Mission plans can now arrive from the dashboard (untrusted operator input), so
+# every number a step handler will later read with get_float() must already be a
+# finite float in a sane range — a bad value must fail at load, never mid-flight.
+# Format: key -> (min_exclusive, max_inclusive). None disables that bound.
+NUMERIC_STEP_PARAM_RANGES: dict[str, tuple[Optional[float], Optional[float]]] = {
+    "altitude_m": (0.0, 120.0),
+    "hold_s": (0.0, 600.0),
+    "yaw_deg": (0.0, 100_000.0),
+    "yaw_rate_deg_s": (0.0, 180.0),
+    "distance_m": (0.0, 500.0),
+    "radius_m": (0.0, 500.0),
+    "speed_m_s": (0.0, 20.0),
+    "revolutions": (0.0, 100.0),
+}
+
 
 @dataclass
 class MissionStep:
@@ -90,15 +106,29 @@ class MissionStep:
     @property
     def timeout_s(self) -> Optional[float]:
         value = self.params.get("timeout_s")
-        return None if value is None else float(value)
+        if value is None:
+            return None
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError):
+            return None
+        return timeout if math.isfinite(timeout) and timeout >= 0.0 else None
 
     @property
     def state_name(self) -> str:
         return STEP_TYPE_TO_STATE[self.type]
 
     def get_float(self, key: str, default: float) -> float:
+        # Validated at parse time; the fallback keeps a handler tick from ever
+        # raising inside the executor timer if a plan was built programmatically.
         value = self.params.get(key)
-        return float(default) if value is None else float(value)
+        if value is None:
+            return float(default)
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return result if math.isfinite(result) else float(default)
 
     @property
     def scan_direction(self) -> str:
@@ -199,8 +229,22 @@ def _parse_step(raw: object, index: int, mission_name: str) -> MissionStep:
             timeout_val = float(params["timeout_s"])
         except (TypeError, ValueError):
             raise MissionPlanError(f"{where} timeout_s must be a number, got {params['timeout_s']!r}")
-        if timeout_val < 0.0:
-            raise MissionPlanError(f"{where} timeout_s must be >= 0, got {timeout_val}")
+        if not math.isfinite(timeout_val) or timeout_val < 0.0:
+            raise MissionPlanError(f"{where} timeout_s must be a finite number >= 0, got {timeout_val}")
+
+    for key, (lo, hi) in NUMERIC_STEP_PARAM_RANGES.items():
+        if key not in params:
+            continue
+        try:
+            value = float(params[key])
+        except (TypeError, ValueError):
+            raise MissionPlanError(f"{where} {key} must be a number, got {params[key]!r}")
+        if not math.isfinite(value):
+            raise MissionPlanError(f"{where} {key} must be finite, got {value}")
+        if lo is not None and value <= lo:
+            raise MissionPlanError(f"{where} {key} must be > {lo:g}, got {value:g}")
+        if hi is not None and value > hi:
+            raise MissionPlanError(f"{where} {key} must be <= {hi:g}, got {value:g}")
 
     if step_type == "scan":
         _validate_scan_params(params, where)
@@ -280,20 +324,33 @@ def lint_plan(plan: MissionPlan) -> list[str]:
     return warnings
 
 
-def load_mission_plan(path: str) -> MissionPlan:
-    """Load and parse a YAML mission plan file. Raises MissionPlanError on failure."""
+def parse_mission_plan_text(text: str, source: str = "<inline>") -> MissionPlan:
+    """Parse a YAML/JSON mission plan document. Raises MissionPlanError on failure.
+
+    Used for plans that arrive over a topic (e.g. uploaded from the dashboard);
+    JSON is a subset of YAML so both serializations go through the same parser
+    and the same validation.
+    """
     import yaml  # local import: PyYAML is always available in a ROS 2 environment
 
+    max_plan_bytes = 64 * 1024
+    if len(text.encode("utf-8", errors="replace")) > max_plan_bytes:
+        raise MissionPlanError(f"mission plan from {source} exceeds {max_plan_bytes} bytes")
+
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise MissionPlanError(f"mission plan from {source} is not valid YAML: {exc}") from exc
+
+    return parse_mission_plan(data)
+
+
+def load_mission_plan(path: str) -> MissionPlan:
+    """Load and parse a YAML mission plan file. Raises MissionPlanError on failure."""
     plan_path = Path(path).expanduser()
     try:
         text = plan_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise MissionPlanError(f"could not read mission plan file '{plan_path}': {exc}") from exc
 
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise MissionPlanError(f"mission plan file '{plan_path}' is not valid YAML: {exc}") from exc
-
-    plan = parse_mission_plan(data)
-    return plan
+    return parse_mission_plan_text(text, source=f"file '{plan_path}'")
