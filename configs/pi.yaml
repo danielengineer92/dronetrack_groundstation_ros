@@ -184,7 +184,9 @@ mission_executor_node:
     require_armed_for_mission: true
     telemetry_timeout_s: 2.0
     takeoff_altitude_m: 3.0
-    airborne_altitude_m: 2.7
+    # A commanded 3.0 m takeoff settles at ~2.75 m measured; 2.7 left 5 cm of
+    # margin and flapped NOT_AIRBORNE mid-orbit. Keep this well under hover.
+    airborne_altitude_m: 2.3
     takeoff_timeout_s: 20.0
     offboard_prime_time_s: 1.5
     track_center_timeout_s: 0.0

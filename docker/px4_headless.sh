@@ -23,6 +23,8 @@ cd "$HOME/PX4-Autopilot"
 #     must never latch "Preflight Fail: No connection to the GCS" -> Arming
 #     denied, which deadlocks mission re-runs (docs/handoff_orbit_rerun.md).
 #   COM_DISARM_LAND 2.0: disarm shortly after landing.
+#   NAV_MC_ALT_RAD 0.2: default (~0.8 m) lets PX4 declare takeoff done ~0.75 m
+#     below the commanded altitude, so a 3.2 m takeoff hovered at ~2.45 m.
 (
   for _ in $(seq 1 120); do
     grep -qa "Ready for takeoff" /tmp/px4.log 2>/dev/null && break
@@ -33,6 +35,7 @@ cd "$HOME/PX4-Autopilot"
     echo "param set NAV_RCL_ACT 0"
     echo "param set COM_RCL_EXCEPT 4"
     echo "param set COM_DISARM_LAND 2.0"
+    echo "param set NAV_MC_ALT_RAD 0.2"
   } > /tmp/px4in
 ) &
 

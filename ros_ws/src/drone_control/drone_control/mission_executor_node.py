@@ -606,7 +606,12 @@ class MissionExecutorNode(Node):
         if "TAKING_OFF" in landed_state:
             return altitude >= self.airborne_altitude_m
         if "IN_AIR" in landed_state:
-            return altitude >= self.airborne_altitude_m
+            # Trust PX4's land detector. Gating IN_AIR on an altitude guess
+            # wedged the orbit step whenever the hover settled below the
+            # threshold (rel_altitude and the takeoff target don't share a
+            # reference in practice — observed hover 2.26 m for a 3.0 m
+            # command with a 2.3 m gate).
+            return True
         return altitude >= self.airborne_altitude_m
 
     def target_is_fresh_locked(self) -> bool:
@@ -955,10 +960,17 @@ class MissionExecutorNode(Node):
         if not self._check_preflight_or_hold("takeoff"):
             return False
         self.publish_offboard_request(False)
-        # Takeoff if needed: skip when already airborne.
-        if self.is_airborne():
-            self.publish_mission_command("HOLD", True, "already airborne; skipping takeoff")
-            self.publish_state("already airborne; skipping takeoff")
+        # Done when the land detector says airborne AND PX4 has finished its
+        # Takeoff climb (flight mode left TAKEOFF). Completing on an altitude
+        # gate let the next step (prime_offboard) capture its hold anchor
+        # mid-climb and freeze the drone below the commanded takeoff altitude.
+        flight_mode = ""
+        if self.last_telemetry is not None:
+            # str() of the MAVSDK enum may be "TAKEOFF" or "FlightMode.TAKEOFF".
+            flight_mode = str(self.last_telemetry.flight_mode).strip().upper().split(".")[-1]
+        if self.is_airborne() and flight_mode != "TAKEOFF":
+            self.publish_mission_command("HOLD", True, "takeoff complete; airborne")
+            self.publish_state("takeoff complete; airborne")
             return True
         altitude_m = step.get_float("altitude_m", self.takeoff_altitude_m)
         # Re-issue TAKEOFF every ~5s while still on the ground. A single send can
@@ -978,11 +990,11 @@ class MissionExecutorNode(Node):
         )
         age = self.step_age()
         self.publish_state(
-            f"takeoff requested, altitude={current_altitude:.2f}/{self.airborne_altitude_m:.2f}m, "
-            f"ready_for_offboard={self.is_airborne()}, age={age:.1f}/{self.takeoff_timeout_s:.1f}s"
+            f"takeoff requested, altitude={current_altitude:.2f}m target={altitude_m:.2f}m, "
+            f"mode={flight_mode or 'unknown'}, age={age:.1f}/{self.takeoff_timeout_s:.1f}s"
         )
-        if self.is_airborne():
-            return True
+        # Completion is decided at the top of this step (airborne AND out of
+        # TAKEOFF mode), so the climb is never cut short here.
         if age > self.takeoff_timeout_s:
             # Stay on this step instead of yawing on the ground. Catches disabled action gates.
             self.publish_state("takeoff timeout; still waiting for takeoff altitude")
