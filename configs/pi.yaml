@@ -23,7 +23,7 @@ detection_gate_node:
     require_heartbeat: true         # no heartbeat yet => drop all detections
     max_message_rate_hz: 60.0       # inbound flood / DoS cap
     max_detections: 20              # absurd-payload cap
-    min_confidence: 0.10            # noise floor (tracker still has its own min_confidence)
+    min_confidence: 0.05            # noise floor (tracker still has its own min_confidence)
     clock_skew_tolerance_s: 0.25    # tolerate small future stamps from clock jitter
     report_period_s: 5.0
 
@@ -81,11 +81,11 @@ tracker_node:
     detections_topic: "/drone/vision/detections"   # gate republishes here
     target_error_topic: "/drone/tracking/target_error"
     target_class: "red_ball"
-    min_confidence: 0.15
+    min_confidence: 0.08
     detection_timeout: 2.5
     reacquisition_timeout: 6.0
     smoothing_alpha: 0.35
-    target_area_min: 0.0004
+    target_area_min: 0.0001   # 0.2m ball stays trackable to ~16m (was 0.0004 = ~8m cutoff; far orbit hit 9m)
     target_area_max: 0.7
     publish_rate: 30.0
     proximity_threshold: 0.12
