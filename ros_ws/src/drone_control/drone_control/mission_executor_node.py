@@ -206,6 +206,9 @@ class MissionExecutorNode(Node):
         self._orbit_marks: dict[str, float] = {}
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
+        # Rate limits for the landed-state recovery nudges (HOLD / ARM).
+        self._last_hold_cmd_time = 0.0
+        self._last_arm_cmd_time = 0.0
         # Per-step goto targets, captured once at step entry (step_index -> tuple).
         self._goto_targets: dict[int, tuple[float, float, float, float, float, float]] = {}
         self._last_autonomy_request: Optional[bool] = None
@@ -824,6 +827,9 @@ class MissionExecutorNode(Node):
         self.step_enter_time = time.monotonic()
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
+        # Rate limits for the landed-state recovery nudges (HOLD / ARM).
+        self._last_hold_cmd_time = 0.0
+        self._last_arm_cmd_time = 0.0
         self._goto_targets.clear()
         if self.plan.steps:
             self.transition(MissionState[self.plan.steps[0].state_name])
@@ -887,7 +893,38 @@ class MissionExecutorNode(Node):
     # complete (the loop then advances). These are the original per-state bodies,
     # parameterized by the plan step. Safety gates are unchanged.
     # ------------------------------------------------------------------
+    def _takeoff_ground_recovery(self) -> None:
+        """Un-wedge a mission re-run from a landed state.
+
+        After a landing PX4 parks in AUTO.LAND: an on-ground arm is instantly
+        undone by 'Disarmed by landing', so the takeoff step deadlocks on
+        PX4_NOT_ARMED (see docs/handoff_orbit_rerun.md). When the takeoff step
+        finds the vehicle on the ground: first break out of LAND with a HOLD,
+        then request ARM through the gated MAVSDK action path — telemetry_node
+        enforces the double opt-in (allow_mavsdk_actions AND
+        allow_arm_via_mavsdk) plus on-ground/not-armed/fresh-telemetry checks,
+        so this stays a no-op unless arming via MAVSDK is explicitly enabled.
+        """
+        if self.last_telemetry is None or self.is_airborne():
+            return
+        now = time.monotonic()
+        # str() of the MAVSDK enum may be "LAND" or "FlightMode.LAND".
+        mode = str(self.last_telemetry.flight_mode).strip().upper().split(".")[-1]
+        if mode == "LAND":
+            if now - self._last_hold_cmd_time >= 5.0:
+                self._last_hold_cmd_time = now
+                hold_key = self._step_action_key("hold_leave_land")
+                self.actions_sent.discard(hold_key)
+                self.send_action_once(hold_key, "HOLD", "leave AUTO.LAND before takeoff")
+            return
+        if not bool(self.last_telemetry.armed) and now - self._last_arm_cmd_time >= 5.0:
+            self._last_arm_cmd_time = now
+            arm_key = self._step_action_key("arm_for_takeoff")
+            self.actions_sent.discard(arm_key)
+            self.send_action_once(arm_key, "ARM", "arm for smart mission takeoff")
+
     def _step_takeoff(self, step) -> bool:
+        self._takeoff_ground_recovery()
         if not self._check_preflight_or_hold("takeoff"):
             return False
         self.publish_offboard_request(False)

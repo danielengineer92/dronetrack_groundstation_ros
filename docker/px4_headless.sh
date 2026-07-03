@@ -16,6 +16,26 @@ set -e
 rm -f /tmp/px4in /tmp/px4.log /tmp/px4_raw.log
 mkfifo /tmp/px4in
 cd "$HOME/PX4-Autopilot"
+
+# SITL bring-up params, injected in the background once PX4 is up:
+#   NAV_DLL_ACT/NAV_RCL_ACT 0 + COM_RCL_EXCEPT 4: headless SITL has no GCS/RC;
+#     a client connecting to the GCS port and dropping (QGC, a MAVSDK script)
+#     must never latch "Preflight Fail: No connection to the GCS" -> Arming
+#     denied, which deadlocks mission re-runs (docs/handoff_orbit_rerun.md).
+#   COM_DISARM_LAND 2.0: disarm shortly after landing.
+(
+  for _ in $(seq 1 120); do
+    grep -qa "Ready for takeoff" /tmp/px4.log 2>/dev/null && break
+    sleep 1
+  done
+  {
+    echo "param set NAV_DLL_ACT 0"
+    echo "param set NAV_RCL_ACT 0"
+    echo "param set COM_RCL_EXCEPT 4"
+    echo "param set COM_DISARM_LAND 2.0"
+  } > /tmp/px4in
+) &
+
 exec 9<>/tmp/px4in            # hold fifo open rw -> stdin never EOFs
 HEADLESS=1 make px4_sitl gz_x500_mono_cam <&9 2>&1 \
   | stdbuf -oL tr "\r" "\n" \
