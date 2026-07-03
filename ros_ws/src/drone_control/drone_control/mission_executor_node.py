@@ -80,6 +80,13 @@ STEP_NAMES = {
 }
 
 
+def _median(values) -> float:
+    ordered = sorted(float(v) for v in values)
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 class MissionExecutorNode(Node):
     def __init__(self) -> None:
         super().__init__("mission_executor_node")
@@ -136,6 +143,9 @@ class MissionExecutorNode(Node):
         # so the disable propagates (executor -> autonomy manager -> telemetry)
         # and the offboard loop cannot restart Offboard over PX4's ORBIT mode.
         self.declare_parameter("orbit_offboard_release_s", 1.5)
+        # Minimum center estimates to median before DO_ORBIT may be sent (the
+        # executor ticks at publish_rate, so 8 ~= 0.8 s of visible target).
+        self.declare_parameter("orbit_center_min_samples", 8)
         self.declare_parameter("rtl_wait_s", 10.0)
         self.declare_parameter("land_wait_s", 10.0)
         self.declare_parameter("goto_timeout_s", 30.0)
@@ -184,6 +194,7 @@ class MissionExecutorNode(Node):
         self.orbit_revolutions = float(self.get_parameter("orbit_revolutions").value)
         self.orbit_timeout_s = float(self.get_parameter("orbit_timeout_s").value)
         self.orbit_offboard_release_s = max(0.0, float(self.get_parameter("orbit_offboard_release_s").value))
+        self.orbit_center_min_samples = max(1, int(self.get_parameter("orbit_center_min_samples").value))
         self.rtl_wait_s = float(self.get_parameter("rtl_wait_s").value)
         self.land_wait_s = float(self.get_parameter("land_wait_s").value)
         self.goto_timeout_s = float(self.get_parameter("goto_timeout_s").value)
@@ -204,6 +215,14 @@ class MissionExecutorNode(Node):
         # "<key>:release" = when offboard was dropped, "<key>:sent" = when
         # DO_ORBIT went out (orbit progress is timed from the send, not step entry).
         self._orbit_marks: dict[str, float] = {}
+        # Orbit-center samples accumulated during the orbit step (keyed like
+        # actions_sent). A single estimate_target_global_center() sample rides
+        # on one instantaneous tracker distance (observed 2.7-10.8 m for a true
+        # ~6.3 m), which scattered sent centers 3-4 m around the ball — with
+        # radius 4 the circle then passes through the ball and the "orbit"
+        # looks like spinning in place. Component-wise median over the step's
+        # gate+release window keeps the center honest.
+        self._orbit_center_samples: dict[str, list] = {}
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
         # Rate limits for the landed-state recovery nudges (HOLD / ARM).
@@ -431,6 +450,7 @@ class MissionExecutorNode(Node):
             self.mission_active = True
             self.actions_sent.clear()
             self._orbit_marks.clear()
+            self._orbit_center_samples.clear()
             self.publish_autonomy_request(True)
             self.publish_offboard_request(False)
             self._start_plan()
@@ -439,6 +459,7 @@ class MissionExecutorNode(Node):
             self.mission_active = False
             self.actions_sent.clear()
             self._orbit_marks.clear()
+            self._orbit_center_samples.clear()
             self.publish_offboard_request(False)
             self.publish_autonomy_request(False)
             self.transition(MissionState.IDLE if self.mission_enabled else MissionState.DISABLED)
@@ -484,6 +505,7 @@ class MissionExecutorNode(Node):
         self.step_enter_time = time.monotonic()
         self.actions_sent.clear()
         self._orbit_marks.clear()
+        self._orbit_center_samples.clear()
         self._goto_targets.clear()
         detail = (
             f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
@@ -679,7 +701,12 @@ class MissionExecutorNode(Node):
         msg.absolute_altitude_m = math.nan if absolute_altitude_m is None else float(absolute_altitude_m)
         msg.note = note
 
-        if action == "DO_ORBIT":
+        if action == "DO_ORBIT" and not (
+            math.isfinite(msg.latitude_deg) and math.isfinite(msg.longitude_deg)
+        ):
+            # No explicit center from the caller — fall back to a single
+            # instantaneous estimate. Callers that can afford it should pass a
+            # filtered center instead (see _step_orbit's median sampling).
             center = self.estimate_target_global_center()
             if center is not None:
                 msg.latitude_deg, msg.longitude_deg, msg.absolute_altitude_m = center
@@ -1191,6 +1218,13 @@ class MissionExecutorNode(Node):
         release_mark = self._orbit_marks.get(f"{orbit_key}:release")
 
         if orbit_key not in self.actions_sent:
+            # Accumulate center estimates on every pre-send tick. One sample is
+            # hostage to that instant's tracker distance (±50% observed); the
+            # median over the gate+release window pins the center on the ball.
+            sample = self.estimate_target_global_center()
+            if sample is not None:
+                self._orbit_center_samples.setdefault(orbit_key, []).append(sample)
+
             if release_mark is None:
                 # Pre-release gates: run only while offboard is still ours.
                 self.publish_offboard_request(True)
@@ -1214,10 +1248,24 @@ class MissionExecutorNode(Node):
                 )
                 return False
 
+            samples = self._orbit_center_samples.get(orbit_key, [])
+            if len(samples) < self.orbit_center_min_samples:
+                # Ball briefly not visible etc. — keep collecting; the step
+                # timeout is the backstop against a target that never returns.
+                self.publish_state(
+                    f"orbit: collecting center samples ({len(samples)}/{self.orbit_center_min_samples})"
+                )
+                return False
+            center_lat = _median(s[0] for s in samples)
+            center_lon = _median(s[1] for s in samples)
+            center_alt = _median(s[2] for s in samples)
+
             self.send_action_once(
                 orbit_key, "DO_ORBIT",
-                "MAV_CMD_DO_ORBIT around estimated ball center",
+                f"MAV_CMD_DO_ORBIT around median ball center ({len(samples)} samples)",
                 radius_m=radius_m, velocity_m_s=speed_m_s, orbit_revolutions=revolutions,
+                latitude_deg=center_lat, longitude_deg=center_lon,
+                absolute_altitude_m=center_alt,
             )
             self._orbit_marks[f"{orbit_key}:sent"] = self.step_age()
 

@@ -94,11 +94,18 @@ tracker_node:
     coast_timeout: 3.5
     lock_confirm_frames: 1
     estimate_distance: true
-    distance_calibration_k: 0.0
+    # Empirical: distance_m = k / diameter_px. Calibrated against gz truth in
+    # SITL (k = true_dist * bbox_diam_px: 3.2m*30.5px=98, 6.3m*16.6px=105).
+    # Pure pinhole math (ball_diameter*fx/diam) predicts k=81, but YOLO boxes
+    # on a 15-30 px ball run ~1.2x fat, so calibrate the whole chain instead.
+    distance_calibration_k: 100.0
     ball_diameter_m: 0.20
     focal_length_px: 0.0
-    horizontal_fov_deg: 70.0
-    vertical_fov_deg: 55.0
+    # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad, 960x720),
+    # NOT a webcam guess: fx=fy=405 px. Wrong FOV skews bearing_x/bearing_y
+    # (and the pinhole distance fallback) by fx_err.
+    horizontal_fov_deg: 99.7
+    vertical_fov_deg: 83.3
     image_width_px: 960
     image_height_px: 720
     min_distance_m: 0.25
