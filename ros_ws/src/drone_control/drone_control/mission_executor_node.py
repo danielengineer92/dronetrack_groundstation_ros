@@ -132,6 +132,10 @@ class MissionExecutorNode(Node):
         self.declare_parameter("orbit_speed_m_s", 0.4)
         self.declare_parameter("orbit_revolutions", 1.0)
         self.declare_parameter("orbit_timeout_s", 45.0)
+        # How long to hold the offboard request dropped before sending DO_ORBIT,
+        # so the disable propagates (executor -> autonomy manager -> telemetry)
+        # and the offboard loop cannot restart Offboard over PX4's ORBIT mode.
+        self.declare_parameter("orbit_offboard_release_s", 1.5)
         self.declare_parameter("rtl_wait_s", 10.0)
         self.declare_parameter("land_wait_s", 10.0)
         self.declare_parameter("goto_timeout_s", 30.0)
@@ -179,6 +183,7 @@ class MissionExecutorNode(Node):
         self.orbit_speed_m_s = float(self.get_parameter("orbit_speed_m_s").value)
         self.orbit_revolutions = float(self.get_parameter("orbit_revolutions").value)
         self.orbit_timeout_s = float(self.get_parameter("orbit_timeout_s").value)
+        self.orbit_offboard_release_s = max(0.0, float(self.get_parameter("orbit_offboard_release_s").value))
         self.rtl_wait_s = float(self.get_parameter("rtl_wait_s").value)
         self.land_wait_s = float(self.get_parameter("land_wait_s").value)
         self.goto_timeout_s = float(self.get_parameter("goto_timeout_s").value)
@@ -195,6 +200,10 @@ class MissionExecutorNode(Node):
         self.mission_active = bool(self.auto_start and self.mission_enabled)
         self.action_command_id = 0
         self.actions_sent: set[str] = set()
+        # Step-age marks for the orbit hand-over (keyed like actions_sent):
+        # "<key>:release" = when offboard was dropped, "<key>:sent" = when
+        # DO_ORBIT went out (orbit progress is timed from the send, not step entry).
+        self._orbit_marks: dict[str, float] = {}
         self._last_land_cmd_time = 0.0
         self._last_takeoff_cmd_time = 0.0
         # Per-step goto targets, captured once at step entry (step_index -> tuple).
@@ -418,6 +427,7 @@ class MissionExecutorNode(Node):
             self.get_logger().warning(f"*** SMART MISSION REQUESTED | plan='{self.plan.name}' ***")
             self.mission_active = True
             self.actions_sent.clear()
+            self._orbit_marks.clear()
             self.publish_autonomy_request(True)
             self.publish_offboard_request(False)
             self._start_plan()
@@ -425,6 +435,7 @@ class MissionExecutorNode(Node):
             self.get_logger().warning("Mission stop requested; publishing HOLD/IDLE and dropping autonomy/offboard requests.")
             self.mission_active = False
             self.actions_sent.clear()
+            self._orbit_marks.clear()
             self.publish_offboard_request(False)
             self.publish_autonomy_request(False)
             self.transition(MissionState.IDLE if self.mission_enabled else MissionState.DISABLED)
@@ -469,6 +480,7 @@ class MissionExecutorNode(Node):
         self.step_index = 0
         self.step_enter_time = time.monotonic()
         self.actions_sent.clear()
+        self._orbit_marks.clear()
         self._goto_targets.clear()
         detail = (
             f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
@@ -1106,29 +1118,10 @@ class MissionExecutorNode(Node):
         if not self._check_airborne_local_or_hold("orbit"):
             self.publish_offboard_request(False)
             return False
-        self.publish_offboard_request(True)
-        if self.require_distance_for_orbit and not self.target_distance_ready():
-            self.publish_mission_command("TRACK_CENTER", True, "waiting for valid distance before orbit")
-            self.publish_state("orbit hold: distance not ready")
-            return False
-        if self.require_target_centered_for_orbit and not self.target_centered():
-            self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
-            self.publish_state("orbit hold: target not centered")
-            return False
 
         radius_m = step.get_float("radius_m", self.orbit_radius_m)
         speed_m_s = step.get_float("speed_m_s", self.orbit_speed_m_s)
         revolutions = step.get_float("revolutions", self.orbit_revolutions)
-
-        if self.use_mavsdk_do_orbit:
-            self.send_action_once(
-                self._step_action_key("do_orbit"), "DO_ORBIT",
-                "MAV_CMD_DO_ORBIT around estimated ball center",
-                radius_m=radius_m, velocity_m_s=speed_m_s, orbit_revolutions=revolutions,
-            )
-            self.publish_mission_command("HOLD", True, "DO_ORBIT requested; PX4 owns orbit if accepted")
-        else:
-            self.publish_mission_command("ORBIT_TARGET", True, "visual-servo orbit fallback")
 
         if step.timeout_s is not None:
             timeout = step.timeout_s
@@ -1136,7 +1129,65 @@ class MissionExecutorNode(Node):
             timeout = self._orbit_default_timeout(radius_m, speed_m_s, revolutions)
         else:
             timeout = self.orbit_timeout_s
-        age = self.step_age()
+
+        if not self.use_mavsdk_do_orbit:
+            self.publish_offboard_request(True)
+            if self.require_distance_for_orbit and not self.target_distance_ready():
+                self.publish_mission_command("TRACK_CENTER", True, "waiting for valid distance before orbit")
+                self.publish_state("orbit hold: distance not ready")
+                return False
+            if self.require_target_centered_for_orbit and not self.target_centered():
+                self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
+                self.publish_state("orbit hold: target not centered")
+                return False
+            self.publish_mission_command("ORBIT_TARGET", True, "visual-servo orbit fallback")
+            age = self.step_age()
+            self.publish_state(f"orbiting/requested, age={age:.1f}/{timeout:.1f}s")
+            return age > timeout
+
+        # DO_ORBIT path: PX4 flies the orbit in ORBIT mode, which the offboard
+        # stream would immediately override (telemetry restarts Offboard the
+        # moment setpoints are enabled, turning the "orbit" into a hover). So:
+        # gate while we still own the drone, then RELEASE offboard, wait for the
+        # disable to propagate, and only then send MAV_CMD_DO_ORBIT.
+        orbit_key = self._step_action_key("do_orbit")
+        release_mark = self._orbit_marks.get(f"{orbit_key}:release")
+
+        if orbit_key not in self.actions_sent:
+            if release_mark is None:
+                # Pre-release gates: run only while offboard is still ours.
+                self.publish_offboard_request(True)
+                if self.require_distance_for_orbit and not self.target_distance_ready():
+                    self.publish_mission_command("TRACK_CENTER", True, "waiting for valid distance before orbit")
+                    self.publish_state("orbit hold: distance not ready")
+                    return False
+                if self.require_target_centered_for_orbit and not self.target_centered():
+                    self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
+                    self.publish_state("orbit hold: target not centered")
+                    return False
+                release_mark = self.step_age()
+                self._orbit_marks[f"{orbit_key}:release"] = release_mark
+
+            self.publish_offboard_request(False)
+            self.publish_mission_command("HOLD", True, "releasing offboard before DO_ORBIT")
+            released_for = self.step_age() - release_mark
+            if released_for < self.orbit_offboard_release_s:
+                self.publish_state(
+                    f"orbit: releasing offboard ({released_for:.1f}/{self.orbit_offboard_release_s:.1f}s)"
+                )
+                return False
+
+            self.send_action_once(
+                orbit_key, "DO_ORBIT",
+                "MAV_CMD_DO_ORBIT around estimated ball center",
+                radius_m=radius_m, velocity_m_s=speed_m_s, orbit_revolutions=revolutions,
+            )
+            self._orbit_marks[f"{orbit_key}:sent"] = self.step_age()
+
+        # PX4 owns the orbit now; keep offboard released for the whole step.
+        self.publish_offboard_request(False)
+        self.publish_mission_command("HOLD", True, "DO_ORBIT sent; PX4 owns orbit (offboard released)")
+        age = self.step_age() - self._orbit_marks.get(f"{orbit_key}:sent", 0.0)
         self.publish_state(f"orbiting/requested, age={age:.1f}/{timeout:.1f}s")
         return age > timeout
 

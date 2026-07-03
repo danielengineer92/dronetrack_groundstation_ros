@@ -15,8 +15,13 @@
 mission:
   name: orbit_red_ball
   steps:
-    - {type: takeoff, altitude_m: 3.0}
+    # 4.0 m: hover must sit clearly ABOVE airborne_altitude_m (2.7) or the
+    # is_airborne() gate flaps NOT_AIRBORNE right at the threshold.
+    - {type: takeoff, altitude_m: 4.0}
     - {type: prime_offboard, hold_s: 1.5}
     - {type: track_center, until: centered, timeout_s: 20}
-    - {type: orbit, radius_m: 2.0, speed_m_s: 0.4, revolutions: 1, timeout_s: 45}
+    # r=4.0 @ 1.0 m/s matches the hand-verified orbit: ~25 s/lap, ball stays
+    # framed (yaw faces center) while the 9 m ring of posts sweeps behind it.
+    # 6 revolutions -> ~150 s. No timeout_s: executor derives it (+5 s margin).
+    - {type: orbit, radius_m: 4.0, speed_m_s: 1.0, revolutions: 6}
     - {type: land}

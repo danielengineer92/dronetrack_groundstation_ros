@@ -811,7 +811,7 @@ class TelemetryNode(Node):
             return
 
         if action == 'DO_ORBIT':
-            await self._send_do_orbit_mavlink_direct(drone, command)
+            await self._send_do_orbit_action(drone, command)
             return
 
         if action == 'GOTO_LOCATION':
@@ -833,6 +833,49 @@ class TelemetryNode(Node):
             return
 
         raise ValueError(f'unknown MAVSDK action: {command.action}')
+
+    async def _send_do_orbit_action(self, drone, command: MavsdkActionCommand) -> None:
+        """Start a PX4 ORBIT via MAVSDK action.do_orbit().
+
+        MAVSDK sends MAV_CMD_DO_ORBIT as a COMMAND_INT (lat/lon int32-scaled to
+        1e7) and performs the mode switch. The earlier MavlinkDirect path built
+        a COMMAND_LONG with float lat/lon in param5/6 — PX4's orbit handler
+        expects the global center in a COMMAND_INT, so it silently never entered
+        ORBIT (verified: nothing in the PX4 log, vehicle stayed in POSCTL).
+
+        Trade-off: action.do_orbit() does not expose param4 (orbit revolutions),
+        so PX4 orbits indefinitely. That is fine here — the mission executor's
+        orbit-step timeout advances to LAND, which ends the orbit. If a hard
+        revolution count is ever needed again, send a COMMAND_INT (not _LONG)
+        with param4 set, via MavlinkDirect.
+        """
+        radius_m = float(command.radius_m)
+        velocity_m_s = float(command.velocity_m_s)
+        lat = float(command.latitude_deg)
+        lon = float(command.longitude_deg)
+        abs_alt = float(command.absolute_altitude_m)
+        if not all(math.isfinite(v) for v in (lat, lon, abs_alt)):
+            raise ValueError('DO_ORBIT requires a finite global center (lat/lon/abs_alt)')
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(f'DO_ORBIT center lat/lon out of range: {lat}, {lon}')
+
+        from mavsdk.action import OrbitYawBehavior
+        yaw = self._orbit_yaw_behavior_enum(command.yaw_behavior, OrbitYawBehavior)
+        self.get_logger().warning(
+            'Sending do_orbit (MAVSDK action / COMMAND_INT) | '
+            f'radius={radius_m:.2f}m, velocity={velocity_m_s:.2f}m/s, '
+            f'yaw={command.yaw_behavior}, center=({lat:.7f}, {lon:.7f}, {abs_alt:.2f})'
+        )
+        await drone.action.do_orbit(radius_m, velocity_m_s, yaw, lat, lon, abs_alt)
+
+    def _orbit_yaw_behavior_enum(self, behavior_name: str, orbit_yaw_behavior):
+        """Map our yaw-behavior name to the MAVSDK OrbitYawBehavior enum, with a
+        safe default. `orbit_yaw_behavior` is the imported enum class."""
+        name = str(behavior_name).strip().upper()
+        aliases = {'FRONT_TO_CIRCLE_CENTER': 'HOLD_FRONT_TO_CIRCLE_CENTER'}
+        candidate = aliases.get(name, name) or 'HOLD_FRONT_TO_CIRCLE_CENTER'
+        return getattr(orbit_yaw_behavior, candidate,
+                       orbit_yaw_behavior.HOLD_FRONT_TO_CIRCLE_CENTER)
 
     async def _send_do_orbit_mavlink_direct(self, drone, command: MavsdkActionCommand) -> None:
         """Send MAV_CMD_DO_ORBIT through MAVSDK MavlinkDirect.
