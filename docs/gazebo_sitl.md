@@ -28,6 +28,15 @@ sudo apt update && sudo apt install -y \
 
 # PX4 with the camera model
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive ~/PX4-Autopilot
+
+# REQUIRED: disable PX4's GstCameraSystem gz plugin before first launch.
+# It buffers every camera frame when its GStreamer pipeline can't start
+# (~106 MB/s leak = the camera's full frame bandwidth) and hard-freezes the
+# machine in ~5 min. DroneTrack doesn't use it — the camera reaches YOLO via
+# ros_gz. Verified 2026-07-03 (Ubuntu 24.04, gz Harmonic 8.11, driver 595).
+sed -i 's#<plugin entity_name="\*" entity_type="world" filename="libGstCameraSystem.so" name="custom::GstCameraSystem"/>#<!-- DISABLED (frame leak, see dronetrack gazebo_sitl.md): GstCameraSystem -->#' \
+    ~/PX4-Autopilot/src/modules/simulation/gz_bridge/server.config
+
 cd ~/PX4-Autopilot && make px4_sitl gz_x500_mono_cam
 
 # This repo + build the SITL overlay (also creates ~/ros_venv with YOLO + numpy)
