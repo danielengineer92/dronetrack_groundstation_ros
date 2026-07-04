@@ -152,6 +152,17 @@ class MissionExecutorNode(Node):
         # Minimum center estimates to median before DO_ORBIT may be sent (the
         # executor ticks at publish_rate, so 8 ~= 0.8 s of visible target).
         self.declare_parameter("orbit_center_min_samples", 8)
+        # Orbit entry envelope: DO_ORBIT is only sent once the vehicle is within
+        # radius * factor + slack of the target. PX4's ORBIT mode captures the
+        # ring by flying STRAIGHT AT the centre from wherever the vehicle is, so
+        # handing it a far-away orbit "launches" the drone at the target. Inside
+        # the envelope the capture transient is a short, gentle arc. While
+        # outside, the step commands APPROACH_TARGET (profiled closing when
+        # translation is enabled, hold+centre when not; the step timeout is the
+        # backstop). factor <= 0 disables the gate. Read at call time, so both
+        # are live-tunable via ros2 param set.
+        self.declare_parameter("orbit_entry_distance_factor", 1.75)
+        self.declare_parameter("orbit_entry_slack_m", 0.5)
         self.declare_parameter("rtl_wait_s", 10.0)
         self.declare_parameter("land_wait_s", 10.0)
         self.declare_parameter("goto_timeout_s", 30.0)
@@ -1013,12 +1024,17 @@ class MissionExecutorNode(Node):
         now = time.monotonic()
         # str() of the MAVSDK enum may be "LAND" or "FlightMode.LAND".
         mode = str(self.last_telemetry.flight_mode).strip().upper().split(".")[-1]
-        if mode == "LAND":
+        # LAND: an on-ground arm is instantly undone by 'Disarmed by landing'.
+        # OFFBOARD: a stale on-ground Offboard (e.g. the stack was torn down
+        # mid-flight and PX4 landed itself) makes PX4 deny arming outright
+        # ("Resolve system health failures"). Both wedge the takeoff step the
+        # same way; break out to HOLD first, then arm.
+        if mode in ("LAND", "OFFBOARD"):
             if now - self._last_hold_cmd_time >= 5.0:
                 self._last_hold_cmd_time = now
                 hold_key = self._step_action_key("hold_leave_land")
                 self.actions_sent.discard(hold_key)
-                self.send_action_once(hold_key, "HOLD", "leave AUTO.LAND before takeoff")
+                self.send_action_once(hold_key, "HOLD", f"leave {mode} before takeoff")
             return
         if not bool(self.last_telemetry.armed) and now - self._last_arm_cmd_time >= 5.0:
             self._last_arm_cmd_time = now
@@ -1075,8 +1091,16 @@ class MissionExecutorNode(Node):
         if not self._check_preflight_or_hold("prime"):
             return False
         self.publish_offboard_request(True)
-        # Status must keep "priming PX4 Offboard" so control_node captures its prime anchor.
-        self.publish_mission_command("HOLD", True, "priming PX4 Offboard with zero/hold setpoints")
+        # If the target is already locked, keep the yaw ON it while priming
+        # (TRACK_CENTER = position-hold + yaw track, the exact same POSITION
+        # setpoint stream PX4 needs for the offboard handshake). A frozen HOLD
+        # here let a moving target walk out of the frame during the prime
+        # window, forcing a full scan re-hunt right after takeoff.
+        if self.target_is_fresh_locked():
+            self.publish_mission_command("TRACK_CENTER", True, "priming PX4 Offboard while tracking locked target")
+        else:
+            # Status must keep "priming PX4 Offboard" so control_node captures its prime anchor.
+            self.publish_mission_command("HOLD", True, "priming PX4 Offboard with zero/hold setpoints")
         hold_s = step.get_float("hold_s", self.offboard_prime_time_s)
         age = self.step_age()
         self.publish_state(f"priming offboard, age={age:.1f}/{hold_s:.1f}s")
@@ -1319,6 +1343,35 @@ class MissionExecutorNode(Node):
                     self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
                     self.publish_state("orbit hold: target not centered")
                     return False
+                # Entry envelope: never hand PX4 an orbit it must dash across
+                # the map (straight at the target) to capture. Requires a valid
+                # distance no farther than radius*factor + slack; until then
+                # keep closing under our own profiled APPROACH_TARGET control.
+                entry_factor = float(self.get_parameter("orbit_entry_distance_factor").value)
+                if entry_factor > 0.0:
+                    entry_max_m = radius_m * entry_factor + float(
+                        self.get_parameter("orbit_entry_slack_m").value
+                    )
+                    distance_ok = (
+                        self.last_target is not None
+                        and bool(getattr(self.last_target, "distance_valid", False))
+                        and math.isfinite(float(self.last_target.distance_m))
+                        and float(self.last_target.distance_m) > 0.0
+                    )
+                    if not distance_ok or float(self.last_target.distance_m) > entry_max_m:
+                        dist_text = (
+                            f"{float(self.last_target.distance_m):.2f}m" if distance_ok else "invalid"
+                        )
+                        self.publish_mission_command(
+                            "APPROACH_TARGET", True,
+                            f"closing to orbit entry envelope (<= {entry_max_m:.2f}m) before DO_ORBIT",
+                            desired_distance_m=radius_m,
+                        )
+                        self.publish_state(
+                            f"orbit hold: outside entry envelope (distance={dist_text}, "
+                            f"max={entry_max_m:.2f}m)"
+                        )
+                        return False
                 release_mark = self.step_age()
                 self._orbit_marks[f"{orbit_key}:release"] = release_mark
 

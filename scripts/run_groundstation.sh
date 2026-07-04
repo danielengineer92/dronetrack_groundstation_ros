@@ -12,6 +12,16 @@ maybe_setup_cyclonedds "$(yaml_get laptop_ip)"   # pin the laptop's LAN interfac
 # shellcheck disable=SC1091
 source "${INSTALL_DIR}/setup.bash"
 
+# Perception deps (ultralytics/torch/numpy<2) live in the repo venv when present.
+# ros2-run node scripts execute under the system python, so expose the venv's
+# site-packages via PYTHONPATH (prepended, so its numpy<2 pin wins).
+for _venv_site in "${REPO_ROOT}"/.venv/lib/python3*/site-packages; do
+  if [ -d "${_venv_site}" ]; then
+    export PYTHONPATH="${_venv_site}${PYTHONPATH:+:${PYTHONPATH}}"
+    echo "Using venv packages: ${_venv_site}"
+  fi
+done
+
 echo "Launching dronetrack_groundstation/groundstation_launch.py ..."
 # From a Windows browser over WSL2 mirrored networking, use 127.0.0.1 (not
 # localhost -> IPv6 ::1, which mirrored WSL does not bridge).

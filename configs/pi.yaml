@@ -84,7 +84,10 @@ tracker_node:
     min_confidence: 0.08
     detection_timeout: 2.5
     reacquisition_timeout: 6.0
-    smoothing_alpha: 0.35
+    # 0.5 (was 0.35): EMA weight on the newest error sample. At ~12 fps YOLO,
+    # 0.35 added ~150 ms of extra lag on top of the pipeline delay — visible as
+    # trailing a moving ball, worst right after first lock. 0.5 halves that.
+    smoothing_alpha: 0.5
     target_area_min: 0.0001   # 0.2m ball stays trackable to ~16m (was 0.0004 = ~8m cutoff; far orbit hit 9m)
     target_area_max: 0.7
     publish_rate: 30.0
@@ -188,6 +191,14 @@ mission_executor_node:
     # v*lead tangent. SITL sweep (2026-07-04): cuts lead-vector direction
     # error ~23 deg -> ~9 deg on the orbiting ball, robust across q.
     orbit_lead_curved: true
+    # Orbit entry envelope (anti launch-at-target). PX4's ORBIT mode captures
+    # the ring by flying STRAIGHT AT the centre from wherever the vehicle is,
+    # so DO_ORBIT sent from far away darts the drone at the ball. Only send it
+    # once distance <= radius * factor + slack; outside, the orbit step keeps
+    # commanding APPROACH_TARGET (profiled closing when translation is enabled,
+    # hold+centre when not — the step timeout is the backstop). 0 disables.
+    orbit_entry_distance_factor: 1.75
+    orbit_entry_slack_m: 0.5
     target_state_topic: "/drone/tracking/target_state"
     mission_enabled: true
     auto_start: false
@@ -213,7 +224,12 @@ mission_executor_node:
     run_full_orbit_after_track_center: false
     # Scan-for-target defaults (overridable per scan step in the mission YAML).
     scan_yaw_deg: 180.0
-    scan_yaw_rate_deg_s: 20.0
+    # 40 (was 20): a target moving on its own subtends up to ~19 deg/s of LOS
+    # from a close hover — a 20 deg/s sweep chasing it from behind closes at
+    # ~1 deg/s and takes forever to find it. 40 out-runs it decisively; the
+    # sweep stops the instant the tracker locks, so the higher rate does not
+    # cost lock stability. YOLO at ~12 fps still gets ~20 looks per FOV pass.
+    scan_yaw_rate_deg_s: 40.0
     scan_timeout_s: 12.0
     # goto step defaults (world-frame offset reposition via MAVSDK goto_location;
     # gated by telemetry_node.allow_mavsdk_actions like TAKEOFF/DO_ORBIT).
@@ -276,14 +292,43 @@ control_node:
     # the orbiting ball: mean|error_x| 0.105 -> 0.054 (-49%), peak 0.30 ->
     # 0.15, zero added sign-flips. Structurally zero for a still target.
     yaw_ff_gain: 1.0
-    yaw_ff_lpf_alpha: 0.25  # LOS-rate low-pass (vision + 10 Hz yaw jitter)
+    # 0.45 (was 0.25): the FF starts from ZERO at first lock and the low-pass
+    # sets how fast it learns the ball's motion. 0.25 took ~0.5 s to warm up,
+    # during which the drone lagged a moving ball right after acquisition.
+    yaw_ff_lpf_alpha: 0.45
     yaw_ff_limit: 1.5       # rad/s cap on the feed-forward term
+    # FF alignment gate: scale FF from 1 (centred) to 0 at this |error_x|. FF
+    # carries a centred moving target; during acquisition the state KF reads the
+    # re-lock position jump as a huge velocity and would spike the yaw as the
+    # feedback crosses centre (measured: swing to +0.9 err). Gating it off when
+    # off-centre lets the feedback+anti-swing own the reel-in. 0 disables.
+    yaw_ff_align_error_limit: 0.6
     # "los_diff" = differentiate the measured LOS angle (carries ~0.5 s vision
     # latency); "state" = LOS rate from the target state estimator's predicted
     # state (latency-cancelled; falls back to los_diff when estimate invalid).
-    yaw_ff_source: "los_diff"
+    # "state" also converges faster after first lock (KF vs filtered slope).
+    yaw_ff_source: "state"
     target_state_topic: "/drone/tracking/target_state"
     target_state_max_age_s: 1.0
+    # Delay-aware approach limiter (anti-swing). Caps the yaw CENTRING command
+    # (P+I+D, NOT the feed-forward) to a trapezoidal profile in bearing space so
+    # a target we start pointed far away from is closed on fast but decelerates
+    # into centre instead of sailing past and swinging back. Only bites at large
+    # bearing (acquisition); centred tracking is untouched. delay_s = the vision
+    # dead time the profile must stop within; decel = how hard we brake the yaw;
+    # min_rate keeps a little authority just outside the deadband. Tuned in SITL
+    # 2026-07-04 (far-off-bearing acquisition A/B). Disable for the old raw slew:
+    # ros2 param set /control_node yaw_approach_limit_enabled false
+    yaw_approach_limit_enabled: true
+    yaw_approach_delay_s: 0.35
+    yaw_approach_decel: 0.8
+    # 0.35 (was 0.15): the cap floor is what the feedback may still command
+    # right after first lock, while the feed-forward is still warming from
+    # zero. 0.15 starved it against a ball moving at ~0.3 rad/s LOS (lag grew
+    # until lock was lost). 0.35 tracks acquisition of a moving ball and only
+    # costs ~0.7 deg extra acquisition overshoot (closed-loop A/B).
+    yaw_approach_min_rate: 0.35
+    camera_half_fov_rad: 0.61  # 35 deg; fallback bearing when bearing_x_rad absent
     gain_down: 0.3
     gain_forward: 1.0
     gain_right: 1.0
@@ -309,6 +354,16 @@ control_node:
     # VELOCITY command is still gated by telemetry_node.allow_translation_commands.
     enable_approach_translation: false
     approach_distance_deadband_m: 0.15
+    # Professional approach profile (used when approach translation is enabled;
+    # the SIM launch enables both gates). Brake into the standoff distance
+    # instead of lunging past it: closing speed is capped by the same
+    # delay-aware trapezoidal law as yaw (approach_delay_s of stale vision,
+    # approach_decel m/s^2 of braking authority). approach_align_error_limit
+    # ramps the closing speed to zero as |error_x| reaches it, so the drone
+    # centres first and never charges off-axis at the ball (0 disables).
+    approach_delay_s: 0.35
+    approach_decel: 0.5
+    approach_align_error_limit: 0.5
 
 health_monitor_node:
   ros__parameters:

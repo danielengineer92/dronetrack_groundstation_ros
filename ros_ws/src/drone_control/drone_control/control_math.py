@@ -79,6 +79,10 @@ def approach_forward_velocity(
     max_speed: float,
     deadband_m: float = 0.0,
     target_locked: bool = True,
+    delay_s: float = 0.0,
+    decel_m_s2: float = 0.0,
+    error_x: float = 0.0,
+    align_error_limit: float = 0.0,
 ) -> float:
     """Forward velocity (m/s, body-frame +X) to close to ``desired_distance_m``.
 
@@ -91,6 +95,20 @@ def approach_forward_velocity(
     the target is farther than desired, negative (back off) when closer. The
     result is clamped to ``[-max_speed, max_speed]`` and zeroed inside
     ``deadband_m`` of the goal to avoid hunting.
+
+    Two professional-approach refinements, each opt-in via its parameter:
+
+    - **Delay-aware braking profile** (``decel_m_s2 > 0``): the speed is capped
+      by ``braking_speed_limit`` over the remaining distance error, so a far
+      target is closed on at ``max_speed`` but the vehicle decelerates INTO the
+      standoff instead of lunging past it (the vision distance is ``delay_s``
+      stale; a pure P law cannot brake in time once saturated).
+    - **Alignment gating** (``align_error_limit > 0``): the CLOSING (positive)
+      speed is scaled by ``alignment_scale`` of the normalized image error
+      ``error_x``, so the vehicle never charges forward while the target is
+      still far off-centre (forward is simply the wrong direction then).
+      Backing off (negative) is never alignment-gated — increasing separation
+      is safe regardless of centring.
     """
     if not target_locked or not distance_valid:
         return 0.0
@@ -105,7 +123,83 @@ def approach_forward_velocity(
 
     velocity = float(gain) * distance_error_m
     max_speed = abs(float(max_speed))
+
+    if decel_m_s2 > 0.0:
+        cap = braking_speed_limit(
+            remaining=distance_error_m,
+            delay_s=delay_s,
+            decel=decel_m_s2,
+            max_speed=max_speed,
+        )
+        velocity = clamp(velocity, -cap, cap)
+
+    if velocity > 0.0:
+        velocity *= alignment_scale(error_x=error_x, error_limit=align_error_limit)
+
     return clamp(velocity, -max_speed, max_speed)
+
+
+def braking_speed_limit(
+    *,
+    remaining: float,
+    delay_s: float,
+    decel: float,
+    max_speed: float,
+    min_speed: float = 0.0,
+) -> float:
+    """Largest speed MAGNITUDE that can still stop within ``remaining``, given
+    a measurement dead time. Dimension-agnostic: rad & rad/s & rad/s^2 for the
+    yaw axis, m & m/s & m/s^2 for translation.
+
+    A far-away target saturates a proportional controller, so it closes at the
+    configured max rate. But the vision measurement is delayed by ~``delay_s``
+    (YOLO + smoothing + pipeline), so a saturated controller keeps commanding
+    "go" for ``delay_s`` after it has actually arrived — it sails past the goal
+    and swings back (yaw), or lunges past the standoff distance (approach).
+
+    This returns the speed cap of a trapezoidal motion profile: the fastest
+    speed from which the ``remaining`` error can be arrested, allowing a
+    ``delay_s`` dead time during which we keep moving, then decelerating at
+    ``decel``. Solving ``|remaining| = v*delay + v^2 / (2*a)`` for ``v``:
+
+        v = -a*delay + sqrt((a*delay)^2 + 2*a*|remaining|)     (a = decel)
+
+    which tends to ``|remaining| / delay`` for small errors (dead-time limited)
+    and to ``sqrt(2*a*|remaining|)`` for large errors (decel limited). The
+    result is a non-negative magnitude clamped to ``[min_speed, max_speed]``.
+    The caller applies it as a symmetric clamp on its command, so it only ever
+    *reduces* an over-eager rate; near the goal the underlying command is
+    already ~0 so nothing changes. ``min_speed`` keeps a little authority for
+    fine corrections so the cap never fully strangles the loop just outside
+    the deadband.
+    """
+    err = abs(float(remaining))
+    a = max(float(decel), 1e-6)
+    delay = max(float(delay_s), 0.0)
+    hi = abs(float(max_speed))
+    lo = clamp(abs(float(min_speed)), 0.0, hi)
+
+    at = a * delay
+    speed = -at + math.sqrt(at * at + 2.0 * a * err)
+    return clamp(speed, lo, hi)
+
+
+def alignment_scale(*, error_x: float, error_limit: float) -> float:
+    """Forward-speed scale [0, 1] from how far off-centre the target is.
+
+    Translating toward a target whose bearing is still converging drives the
+    vehicle in the WRONG direction — the classic "launch at the target"
+    failure is full forward speed commanded while the yaw loop is still
+    swinging. This ramps the allowed closing speed linearly from 1 (target
+    centred) to 0 at ``|error_x| >= error_limit`` (normalized image error),
+    so the vehicle centres first, then closes.
+
+    ``error_limit <= 0`` disables the gate (returns 1.0).
+    """
+    limit = float(error_limit)
+    if limit <= 0.0:
+        return 1.0
+    return clamp(1.0 - abs(float(error_x)) / limit, 0.0, 1.0)
 
 
 def yaw_pid_step(

@@ -8,10 +8,20 @@ import os
 import sys
 
 try:
-    from drone_control.control_math import approach_forward_velocity, clamp
+    from drone_control.control_math import (
+        alignment_scale,
+        approach_forward_velocity,
+        braking_speed_limit,
+        clamp,
+    )
 except ImportError:  # pragma: no cover - direct-run convenience
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from drone_control.control_math import approach_forward_velocity, clamp  # noqa: E402
+    from drone_control.control_math import (  # noqa: E402
+        alignment_scale,
+        approach_forward_velocity,
+        braking_speed_limit,
+        clamp,
+    )
 
 
 def _v(**kw):
@@ -62,6 +72,63 @@ def test_clamp_helper():
     assert clamp(5, 0, 2) == 2
     assert clamp(-5, -1, 1) == -1
     assert clamp(0.5, 0, 1) == 0.5
+
+
+# ---- professional approach profile (delay-aware braking + alignment gate) ----
+
+def test_braking_cap_reduces_far_approach_speed():
+    # 5 m out, desired 2 m -> error 3 m. Raw P = 0.6*3 = 1.8 m/s, but the
+    # profile (delay 0.35 s, decel 0.5) allows only sqrt-ish of that.
+    capped = _v(delay_s=0.35, decel_m_s2=0.5)
+    raw = _v()
+    assert 0.0 < capped < raw, (capped, raw)
+    expected = braking_speed_limit(remaining=3.0, delay_s=0.35, decel=0.5, max_speed=2.0)
+    assert math.isclose(capped, expected), (capped, expected)
+
+
+def test_braking_cap_decelerates_into_standoff():
+    # Approaching the goal, the allowed speed must shrink monotonically.
+    prev = float("inf")
+    for d in (8.0, 6.0, 4.0, 3.0, 2.5, 2.2):
+        v = _v(distance_m=d, delay_s=0.35, decel_m_s2=0.5)
+        assert v <= prev + 1e-12, (d, v, prev)
+        prev = v
+
+
+def test_braking_cap_applies_to_backoff_too():
+    # Way too close: backing off is also profile-limited (symmetric clamp).
+    v = _v(distance_m=0.3, desired_distance_m=2.0, gain=5.0, delay_s=0.35, decel_m_s2=0.5)
+    cap = braking_speed_limit(remaining=1.7, delay_s=0.35, decel=0.5, max_speed=2.0)
+    assert math.isclose(v, -cap), (v, cap)
+
+
+def test_alignment_gate_zeroes_off_center_charge():
+    # Target far off-centre: closing speed must be zero, not a lunge.
+    assert _v(error_x=0.6, align_error_limit=0.5) == 0.0
+    assert _v(error_x=-0.6, align_error_limit=0.5) == 0.0
+
+
+def test_alignment_gate_ramps_linearly():
+    full = _v(error_x=0.0, align_error_limit=0.5)
+    half = _v(error_x=0.25, align_error_limit=0.5)
+    assert math.isclose(half, 0.5 * full), (half, full)
+
+
+def test_alignment_gate_never_blocks_backoff():
+    # Too close AND off-centre: increasing separation stays allowed.
+    v = _v(distance_m=1.0, desired_distance_m=2.0, error_x=0.9, align_error_limit=0.5)
+    assert v < 0.0, v
+
+
+def test_alignment_gate_disabled_by_zero_limit():
+    assert _v(error_x=0.9, align_error_limit=0.0) == _v()
+
+
+def test_alignment_scale_helper():
+    assert alignment_scale(error_x=0.0, error_limit=0.5) == 1.0
+    assert alignment_scale(error_x=0.5, error_limit=0.5) == 0.0
+    assert alignment_scale(error_x=-0.25, error_limit=0.5) == 0.5
+    assert alignment_scale(error_x=0.9, error_limit=0.0) == 1.0  # disabled
 
 
 def _run_all():

@@ -192,6 +192,69 @@ def test_los_rate_general_geometry():
     assert math.isclose(r, -0.8 / 4.0), r
 
 
+try:
+    from drone_control.control_math import braking_speed_limit
+except ImportError:  # pragma: no cover
+    from drone_control.control_math import braking_speed_limit  # noqa: F401
+
+
+def _cap(**kw):
+    base = dict(
+        remaining=0.6, delay_s=0.35, decel=0.8,
+        max_speed=1.0, min_speed=0.0,
+    )
+    base.update(kw)
+    return braking_speed_limit(**base)
+
+
+def test_approach_cap_zero_angle_is_floor():
+    # Centred target: cap collapses to the min-rate floor (0 by default).
+    assert _cap(remaining=0.0) == 0.0
+    assert _cap(remaining=0.0, min_speed=0.15) == 0.15
+
+
+def test_approach_cap_symmetric_in_sign():
+    assert _cap(remaining=0.3) == _cap(remaining=-0.3)
+
+
+def test_approach_cap_monotonic_increasing():
+    # Farther target -> higher allowed rate (up to the ceiling).
+    prev = -1.0
+    for ang in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        c = _cap(remaining=ang)
+        assert c >= prev, (ang, c, prev)
+        prev = c
+
+
+def test_approach_cap_deadtime_limited_small_angle():
+    # Small angle (<< a*delay^2): rate -> angle/delay (the sqrt term linearises).
+    c = _cap(remaining=0.005, delay_s=0.35, decel=0.8)
+    assert math.isclose(c, 0.005 / 0.35, rel_tol=0.05), c
+
+
+def test_approach_cap_decel_limited_large_angle():
+    # Large angle with no dead time: rate -> sqrt(2*a*angle).
+    c = _cap(remaining=1.0, delay_s=0.0, decel=0.8, max_speed=99.0)
+    assert math.isclose(c, math.sqrt(2 * 0.8 * 1.0)), c
+
+
+def test_approach_cap_respects_ceiling():
+    assert _cap(remaining=5.0, max_speed=1.0) == 1.0
+
+
+def test_approach_cap_prevents_full_rate_mid_approach():
+    # The whole point: at a moderate remaining bearing the cap is BELOW the
+    # saturated max rate, so the drone is already decelerating (no overshoot).
+    c = _cap(remaining=0.15, delay_s=0.35, decel=0.8, max_speed=1.0)
+    assert c < 1.0, c
+    assert c < 0.5, c  # meaningfully backed off, not a token reduction
+
+
+def test_approach_cap_never_below_floor_when_angle_positive():
+    c = _cap(remaining=0.001, min_speed=0.15)
+    assert c >= 0.15
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

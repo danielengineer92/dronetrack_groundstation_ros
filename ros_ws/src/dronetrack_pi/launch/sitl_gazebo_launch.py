@@ -187,9 +187,14 @@ def generate_launch_description() -> LaunchDescription:
                               description="SITL: allow TAKEOFF/ORBIT/LAND actions."),
         DeclareLaunchArgument("allow_arm_via_mavsdk", default_value="true",
                               description="SITL: allow the dashboard Arm button (hardware default is false)."),
-        DeclareLaunchArgument("allow_translation_commands", default_value="false",
+        # Translation is ON by default in SIM ONLY (hardware pi.yaml keeps both
+        # gates false). With these on, the approach step actually closes to its
+        # standoff under the profiled/alignment-gated velocity law, so the orbit
+        # step hands PX4 DO_ORBIT already ON the ring instead of letting ORBIT
+        # mode dash at the target from far away.
+        DeclareLaunchArgument("allow_translation_commands", default_value="true",
                               description="SITL: allow velocity/translation commands."),
-        DeclareLaunchArgument("enable_approach_translation", default_value="false",
+        DeclareLaunchArgument("enable_approach_translation", default_value="true",
                               description="Let control_node generate forward approach velocity."),
         DeclareLaunchArgument("allow_scan_without_lock", default_value="false",
                               description="Allow yaw-only SCAN while target is not locked."),

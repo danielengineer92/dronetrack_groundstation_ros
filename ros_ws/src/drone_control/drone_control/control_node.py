@@ -32,7 +32,9 @@ from std_msgs.msg import Bool
 from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError, TargetState
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
 from drone_control.control_math import (
+    alignment_scale,
     approach_forward_velocity,
+    braking_speed_limit,
     los_rate_from_state,
     yaw_feedforward_step,
     yaw_pid_step,
@@ -63,6 +65,11 @@ DYNAMIC_PARAMS = {
     "gain_forward", "gain_right", "gain_down", "gain_yaw",
     "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha",
     "yaw_ff_gain", "yaw_ff_lpf_alpha", "yaw_ff_limit", "yaw_ff_source",
+    "yaw_ff_align_error_limit",
+    "yaw_approach_limit_enabled", "yaw_approach_delay_s",
+    "yaw_approach_decel", "yaw_approach_min_rate", "camera_half_fov_rad",
+    "approach_delay_s", "approach_decel", "approach_align_error_limit",
+    "enable_approach_translation", "approach_distance_deadband_m",
     "deadband_x", "deadband_y",
     "max_velocity_forward", "max_velocity_right", "max_velocity_down", "max_yaw_rate",
     "max_accel_forward", "max_accel_right", "max_accel_down", "max_yaw_accel",
@@ -98,6 +105,10 @@ class ControlNode(Node):
         self.declare_parameter("yaw_ff_gain", 0.0)
         self.declare_parameter("yaw_ff_lpf_alpha", 0.25)  # LOS-rate low-pass
         self.declare_parameter("yaw_ff_limit", 1.5)       # rad/s cap on the FF term
+        # FF is scaled from 1 (target centred) to 0 at this normalized |error_x|,
+        # so a fresh-lock/off-centre FF estimate (esp. the state KF's velocity
+        # transient) cannot spike the yaw during acquisition. 0 disables the gate.
+        self.declare_parameter("yaw_ff_align_error_limit", 0.6)
         # FF source: "los_diff" differentiates the measured LOS angle (carries
         # the ~0.5 s vision latency); "state" computes the LOS rate
         # geometrically from the target state estimator's PREDICTED state
@@ -106,6 +117,22 @@ class ControlNode(Node):
         self.declare_parameter("yaw_ff_source", "los_diff")
         self.declare_parameter("target_state_topic", "/drone/tracking/target_state")
         self.declare_parameter("target_state_max_age_s", 1.0)
+        # Delay-aware approach limiter: caps the yaw CENTRING command (P+I+D, not
+        # the feed-forward) to a trapezoidal motion profile in bearing space so a
+        # target we start pointed far away from is closed on quickly but WITHOUT
+        # sailing past centre and swinging back. yaw_approach_delay_s is the vision
+        # dead time the profile must stop within; yaw_approach_decel is how hard we
+        # are willing to brake the yaw; yaw_approach_min_rate keeps a little
+        # authority for fine corrections just outside the deadband. Disable to get
+        # the old raw-P slew: ros2 param set /control_node yaw_approach_limit_enabled false
+        self.declare_parameter("yaw_approach_limit_enabled", True)
+        self.declare_parameter("yaw_approach_delay_s", 0.35)
+        self.declare_parameter("yaw_approach_decel", 0.8)
+        self.declare_parameter("yaw_approach_min_rate", 0.15)
+        # Fallback camera half-FOV (rad) used to convert normalized error_x to an
+        # approximate bearing angle when TargetError.bearing_x_rad is absent (old
+        # messages). ~0.61 rad = 35 deg = half of a 70 deg horizontal FOV.
+        self.declare_parameter("camera_half_fov_rad", 0.61)
 
         self.declare_parameter("deadband_x", 0.05)
         self.declare_parameter("deadband_y", 0.05)
@@ -145,6 +172,15 @@ class ControlNode(Node):
         # behaves exactly like TRACK_CENTER (position-hold + yaw only).
         self.declare_parameter("enable_approach_translation", False)
         self.declare_parameter("approach_distance_deadband_m", 0.15)
+        # Professional approach profile: brake into the standoff distance
+        # instead of lunging past it (the vision distance is ~delay_s stale),
+        # and never charge forward while the target is still off-centre.
+        # approach_decel is how hard we are willing to brake (m/s^2);
+        # approach_align_error_limit is the normalized |error_x| at which the
+        # closing speed reaches zero (0 disables the alignment gate).
+        self.declare_parameter("approach_delay_s", 0.35)
+        self.declare_parameter("approach_decel", 0.5)
+        self.declare_parameter("approach_align_error_limit", 0.5)
 
         autonomy_param = bool(self.get_parameter("autonomy_enabled").value)
         legacy_autonomous_param = bool(self.get_parameter("autonomous_enabled").value)
@@ -162,8 +198,14 @@ class ControlNode(Node):
         self.yaw_ff_gain = float(self.get_parameter("yaw_ff_gain").value)
         self.yaw_ff_lpf_alpha = float(self.get_parameter("yaw_ff_lpf_alpha").value)
         self.yaw_ff_limit = float(self.get_parameter("yaw_ff_limit").value)
+        self.yaw_ff_align_error_limit = float(self.get_parameter("yaw_ff_align_error_limit").value)
         self.yaw_ff_source = str(self.get_parameter("yaw_ff_source").value)
         self.target_state_max_age_s = float(self.get_parameter("target_state_max_age_s").value)
+        self.yaw_approach_limit_enabled = bool(self.get_parameter("yaw_approach_limit_enabled").value)
+        self.yaw_approach_delay_s = float(self.get_parameter("yaw_approach_delay_s").value)
+        self.yaw_approach_decel = float(self.get_parameter("yaw_approach_decel").value)
+        self.yaw_approach_min_rate = float(self.get_parameter("yaw_approach_min_rate").value)
+        self.camera_half_fov_rad = float(self.get_parameter("camera_half_fov_rad").value)
         self.last_target_state: Optional[TargetState] = None
         self.last_target_state_time = 0.0
         self._yaw_ff = 0.0
@@ -207,6 +249,9 @@ class ControlNode(Node):
         self.orbit_speed_m_s = float(self.get_parameter("orbit_speed_m_s").value)
         self.enable_approach_translation = bool(self.get_parameter("enable_approach_translation").value)
         self.approach_distance_deadband_m = float(self.get_parameter("approach_distance_deadband_m").value)
+        self.approach_delay_s = float(self.get_parameter("approach_delay_s").value)
+        self.approach_decel = float(self.get_parameter("approach_decel").value)
+        self.approach_align_error_limit = float(self.get_parameter("approach_align_error_limit").value)
 
         self.validate_parameters()
         self.control_period = 1.0 / self.control_rate
@@ -385,11 +430,27 @@ class ControlNode(Node):
                         reason="yaw_ff_source must be 'los_diff' or 'state'",
                     )
 
-            if param.name in ("yaw_ff_gain", "yaw_ff_limit"):
+            if param.name in ("yaw_ff_gain", "yaw_ff_limit", "yaw_ff_align_error_limit"):
                 if float(param.value) < 0.0:
                     return SetParametersResult(
                         successful=False,
                         reason=f"{param.name} must be >= 0",
+                    )
+
+            if param.name in ("yaw_approach_delay_s", "yaw_approach_min_rate", "camera_half_fov_rad",
+                              "approach_delay_s", "approach_decel", "approach_align_error_limit",
+                              "approach_distance_deadband_m"):
+                if float(param.value) < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{param.name} must be >= 0",
+                    )
+
+            if param.name == "yaw_approach_decel":
+                if float(param.value) <= 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="yaw_approach_decel must be > 0",
                     )
 
             if param.name.startswith(("max_", "min_")):
@@ -572,8 +633,35 @@ class ControlNode(Node):
             integral_limit=self.yaw_i_limit,
             derivative_alpha=self.yaw_d_lpf_alpha,
         )
+        # Delay-aware approach limiter. Cap the CENTRING command (P+I+D) so a
+        # far-off-bearing target is closed on without overshooting/swinging past
+        # centre. Applied here, before the feed-forward is added, so a fast-moving
+        # but already-centred target is never strangled (its rate comes from FF,
+        # not from a large centring error). Uses the true camera bearing when
+        # available; falls back to error_x scaled by the nominal half-FOV.
+        if self.yaw_approach_limit_enabled:
+            angle_rad = abs(float(bearing_x_rad))
+            if angle_rad <= 1e-6:
+                angle_rad = abs(float(error_x)) * self.camera_half_fov_rad
+            cap = braking_speed_limit(
+                remaining=angle_rad,
+                delay_s=self.yaw_approach_delay_s,
+                decel=self.yaw_approach_decel,
+                max_speed=self.max_yaw_rate,
+                min_speed=self.yaw_approach_min_rate,
+            )
+            output = self.clamp(output, -cap, cap)
         # Feed-forward runs on MEASURED/estimated quantities only; the
         # command never feeds back into its own estimate.
+        #
+        # Alignment gate: FF exists to carry an ALREADY-CENTRED moving target at
+        # its own LOS rate. During acquisition (target far off-centre) the FF
+        # estimate is both unnecessary and unreliable — the state KF reads the
+        # re-lock position jump as a huge velocity and would spike the yaw right
+        # as the feedback crosses centre, swinging past. So scale FF from 1 at
+        # centre to 0 at |error_x| >= yaw_ff_align_error_limit; the feedback
+        # (P+I+D + anti-swing cap) owns the reel-in, FF owns steady tracking.
+        ff_scale = alignment_scale(error_x=error_x, error_limit=self.yaw_ff_align_error_limit)
         if self.yaw_ff_gain > 0.0 and self.last_telemetry is not None:
             use_state = self.yaw_ff_source == "state" and self._target_state_usable()
             active = "state" if use_state else "los_diff"
@@ -592,7 +680,7 @@ class ControlNode(Node):
                     rel_velocity_east_m_s=float(ts.velocity_east) - float(tel.velocity_east),
                 )
                 self._yaw_ff = self.clamp(ff, -self.yaw_ff_limit, self.yaw_ff_limit)
-                output += self.yaw_ff_gain * self._yaw_ff
+                output += ff_scale * self.yaw_ff_gain * self._yaw_ff
                 # keep the los_diff state warm for a seamless fallback
                 self._yaw_ff_prev_los = float(tel.yaw) + float(bearing_x_rad)
                 self._yaw_ff_have_los = True
@@ -610,7 +698,7 @@ class ControlNode(Node):
                         lpf_alpha=self.yaw_ff_lpf_alpha,
                         limit_rad_s=self.yaw_ff_limit,
                     )
-                    output += self.yaw_ff_gain * self._yaw_ff
+                    output += ff_scale * self.yaw_ff_gain * self._yaw_ff
                 self._yaw_ff_prev_los = los
                 self._yaw_ff_have_los = True
         self._yaw_pid_prev_error = float(error_x)
@@ -1106,10 +1194,17 @@ class ControlNode(Node):
                 max_speed=self.max_velocity_forward,
                 deadband_m=self.approach_distance_deadband_m,
                 target_locked=True,  # target is verified visible + LOCKED above
+                delay_s=self.approach_delay_s,
+                decel_m_s2=self.approach_decel,
+                error_x=float(target.error_x),
+                align_error_limit=self.approach_align_error_limit,
             )
             forward, _, _, yaw = self.limit_motion(forward_cmd, 0.0, 0.0, desired_yaw)
+            # Status MUST start with STATUS_SENT: the telemetry bridge treats a
+            # SENT-prefixed execution_status as the control node's approval
+            # marker for VELOCITY commands and drops anything else.
             self.publish_velocity(
-                f"APPROACH_TRANSLATION(d={desired_distance_m:.2f}m)",
+                f"{STATUS_SENT}: APPROACH d={desired_distance_m:.2f}m",
                 velocity_forward=forward,
                 yaw_rate=yaw,
                 source_error_x=float(target.error_x),

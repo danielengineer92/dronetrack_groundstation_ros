@@ -1200,7 +1200,10 @@ class TelemetryNode(Node):
             )
             return decision
 
-        if command.execution_status != STATUS_SENT:
+        # SENT-prefixed = approved by the control node. The approach path adds
+        # detail after the prefix (e.g. "SENT: APPROACH d=2.00m"), so match the
+        # prefix, not the exact string.
+        if not str(command.execution_status).startswith(STATUS_SENT):
             decision['reason'] = (
                 f'{BRIDGE_COMMAND_NOT_APPROVED}: executed={command.executed}, '
                 f'status={command.execution_status}'
