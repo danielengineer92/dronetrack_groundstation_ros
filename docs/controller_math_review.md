@@ -306,3 +306,164 @@ ring and makes the approach stop short.
 4. **F5's k is model-specific** (the 1.36× fat factor is a `yolo11s` property). Re-fit k
    if the YOLO model or ball size changes; better, prefer the physical
    `ball_diameter_m·fx/diam` path with a single fat-factor multiplier.
+
+---
+
+## 9. Delay-aware motion profiling & acquisition math (2026-07-04)
+
+Live circling-ball runs (the §7/§8 "moving target during orbit / approach" gaps, now
+driven with `ball_motion:=circle`) exposed three *dynamics* problems the earlier
+*geometry* review could not see, because they only appear against a target that is
+moving and/or being closed on:
+
+1. **Yaw over-shoots and swings** when acquiring a target far off-bearing.
+2. **The drone lunges at / launches past the target** on approach and on orbit entry.
+3. **First-lock tracking is poor** — trails a moving ball, and the feed-forward *spikes*
+   the yaw right as the loop crosses centre.
+
+All three are the same root cause: a proportional law reacting to a **delayed**
+measurement (vision pipeline ≈ 0.35 s) closes at full commanded rate and cannot brake
+in time. The fix is one piece of math applied on every closing axis.
+
+### 9.1 Trapezoidal braking speed limit (`braking_speed_limit`)
+
+Given a remaining error `Δ` (rad for yaw, m for range), a measurement dead time `τ`
+during which we keep moving blind, and a deceleration `a` we are willing to apply, the
+distance covered before stopping from speed `v` is the dead-time run plus the ramp-down:
+
+```
+Δ = v·τ  +  v² / (2a)
+```
+
+Solving the quadratic for the largest `v` that still stops exactly on the target:
+
+```
+v(Δ) = −a·τ + √( (a·τ)² + 2a·|Δ| )
+```
+
+with the two asymptotics that make it correct across the whole range:
+
+| Regime | Limit | Behaviour |
+|---|---|---|
+| Small `Δ` (near goal) | `v → Δ/τ` | **dead-time limited** — never command more than the delay can arrest |
+| Large `Δ` (far) | `v → √(2a·Δ)` | **decel limited** — classic stopping distance |
+
+The result is a non-negative *magnitude* clamped to `[min_speed, max_speed]`; callers
+apply it as a symmetric clamp on their command, so it only ever **reduces** an
+over-eager closing rate. It is **dimension-agnostic** — the same function caps yaw rate
+(rad/s over a bearing `Δ`) and forward speed (m/s over a distance `Δ`). A `min_speed`
+floor preserves authority just outside the deadband (critical for yaw — see §9.3).
+
+Pure fn: `control_math.braking_speed_limit`. Tests: `test_yaw_pid.py`
+(`test_approach_cap_*`, 8 cases: monotonicity, both asymptotes, ceiling, floor).
+
+**Measured (closed-loop model, real `control_math` fns + 0.35 s transport delay + yaw
+plant), far-off acquisition at 30° bearing:**
+
+| | raw P slew | + braking cap |
+|---|---|---|
+| Peak overshoot past target | **20.5°** | **5.8°** (−72%) |
+| Settle to <3° | 5.0 s | **2.25 s** |
+| Peak yaw-rate cmd | 1.00 rad/s | 0.66 rad/s |
+
+Applied to yaw it is the anti-swing limiter (`yaw_approach_*` params); applied to the
+approach P-law (`approach_forward_velocity`, `approach_*` params) it brakes into the
+standoff distance instead of lunging past it.
+
+### 9.2 Alignment gate (`alignment_scale`)
+
+Translating toward a target whose *bearing* has not yet converged drives the vehicle in
+the wrong direction — the literal "launch at the target": full forward speed while the
+yaw loop is still swinging. Gate any forward/closing command by how centred the target
+is:
+
+```
+scale(error_x) = clamp( 1 − |error_x| / L , 0 , 1 )      (L = align error limit; L≤0 disables)
+```
+
+`scale = 1` centred → `0` at `|error_x| ≥ L`. Two consumers:
+
+- **Approach closing speed** (`approach_forward_velocity`): closing (positive) speed is
+  multiplied by `scale`; **backing off is never gated** (increasing separation is safe
+  regardless of centring). So the drone centres first, then closes.
+- **Yaw feed-forward** (§9.3).
+
+Pure fn: `control_math.alignment_scale`. Tests: `test_control_math.py`
+(`test_alignment_*`, incl. the never-blocks-backoff and disabled-by-zero cases).
+
+### 9.3 Feed-forward is a *steady-state* term — gate it during acquisition
+
+The yaw feed-forward commands the target's inertial LOS rate so the loop stops trailing
+a moving target (`yaw_ff_source: "state"` reads the KF's predicted relative velocity;
+latency-cancelled). But on a **fresh lock**, the state KF sees the re-acquisition
+position jump as a huge velocity and emits a spurious LOS rate. **Measured live:** as the
+feedback crossed centre (`error_x` −0.08), the FF drove `yaw_rate` to the **−1.0 rad/s
+saturation** and swung the ball back to **+0.92** — a self-inflicted swing *after* the
+reel-in had succeeded.
+
+Fix: FF carries an **already-centred** target, so scale it by the §9.2 alignment factor
+(`yaw_ff_align_error_limit`). FF is off during acquisition (large `error_x`, unreliable
+estimate) and ramps to full as the target centres. The feedback + §9.1 cap own the
+reel-in; FF owns steady tracking. This also required raising the yaw cap **floor**
+(`yaw_approach_min_rate` 0.15→0.35): with FF gated off at acquisition, the feedback must
+not be starved, or it cannot keep up with a moving ball while centring.
+
+**Measured live (circling ball ≈0.9 m/s, forced re-acquisition, `track_center`):**
+
+| | before | after (this section) |
+|---|---|---|
+| Steady-state mean \|error_x\| | 0.13 – 0.75 | **≈0.05** |
+| Lock stability | 0.7–1.3 s micro-locks (constant loss) | **sustained 12–58 s locks** |
+| Centre-crossing yaw | **saturates ±1.0, swings to +0.9** | smooth, no saturation |
+| Reel-in from frame edge | — | one controlled overshoot, centred ≈4 s |
+
+Supporting tuning (all in `pi.yaml`, documented inline): tracker `smoothing_alpha`
+0.35→0.5 (halves EMA lag at ~12 fps YOLO), and — outside the control loop — the mission
+`prime_offboard` keeps yaw on a locked target instead of freezing (a moving ball no
+longer walks out of frame during the prime window) and the scan sweep 20→40 °/s out-runs
+a moving target's LOS rate (~19 °/s worst case) instead of tail-chasing it.
+
+### 9.4 Orbit entry envelope (anti launch-at-target)
+
+PX4's `MAV_CMD_DO_ORBIT` captures the ring by flying **straight at the centre** from
+wherever the vehicle is. Handing it an orbit from far away therefore *dashes the drone
+at the target* — the geometry is correct (§F1/§8) but the entry trajectory is not. Gate
+the hand-off on range:
+
+```
+send DO_ORBIT  ⇔  distance_valid  ∧  distance ≤ radius·factor + slack
+```
+
+Outside the envelope the orbit step keeps commanding the §9.1/§9.2 profiled approach;
+the step timeout is the backstop. `orbit_entry_distance_factor` (1.75), `orbit_entry_slack_m`
+(0.5) in `mission_executor_node`. **Measured live:** DO_ORBIT handed over at ≈1.9 m for a
+2 m ring (drone already on the ring), zero dash — vs the earlier full-speed run across
+the map at the ball.
+
+### 9.5 Unit consistency (new math)
+
+| Quantity | Convention | Consistent? | Notes |
+|---|---|---|---|
+| `braking_speed_limit` (yaw) | Δ rad, τ s, a rad/s² → v rad/s | ✅ | dimensionless `a·τ` and `2a·Δ` both (rad/s)² under the root |
+| `braking_speed_limit` (approach) | Δ m, τ s, a m/s² → v m/s | ✅ | same form, m instead of rad |
+| `alignment_scale` | normalized `error_x` [−1,1] ÷ limit | ✅ | dimensionless [0,1]; FF and closing speed both dimensionless-scaled |
+| FF gate | `scale · gain · LOS_rate` | ✅ | LOS rate rad/s, scale [0,1], gain [-] → rad/s |
+| orbit entry | `radius·factor + slack` | ✅ | all metres; `factor` dimensionless |
+
+No unit inconsistencies. All new closing-axis math shares the one profiling law (§9.1),
+so the yaw and translation behaviours are guaranteed consistent by construction.
+
+### Fixes applied (2026-07-04, §9)
+
+| # | Change | File |
+|---|---|---|
+| C1 | `braking_speed_limit` (generalized from the yaw-only limiter) + `alignment_scale` | `control_math.py` |
+| C2 | `approach_forward_velocity`: braking profile + alignment gate on closing speed | `control_math.py` |
+| C3 | Yaw FF alignment-gated; approach-cap floor 0.15→0.35 | `control_node.py` |
+| C4 | Orbit entry envelope before `DO_ORBIT`; `prime_offboard` tracks locked target; OFFBOARD arm recovery; scan 20→40 °/s | `mission_executor_node.py` |
+| C5 | VELOCITY approval matches `SENT` status **prefix** | `telemetry_node.py` |
+| C6 | FF source `state`, `smoothing_alpha` 0.5, `yaw_ff_align_error_limit`, approach + orbit-entry params | `configs/pi.yaml` |
+
+**Test status:** `test_control_math.py` 15/15, `test_yaw_pid.py` (incl. 8 braking-cap
+cases) OK, full `drone_control` suite green (5+15+26+6 + yaw/lead). 23 new pure-math
+cases across the braking profile, alignment, and approach.
