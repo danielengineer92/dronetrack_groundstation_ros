@@ -140,11 +140,50 @@ cannot reintroduce the saturation lag described above; D runs through a low-pass
 jitter amplifier the original design avoided. PID state resets automatically on
 target loss/reacquisition and on any yaw-gain change.
 
-Where to take the tune next, using the sign-flip diagnostic: the final P-only
-tune still carries mean |error_x| ≈ 0.11 of steady lag on the orbiting ball —
-that standing component is what `yaw_ki ≈ 0.1` should remove (watch that
-sign-flips stay low). If a future gain hunt pushes past 1.5 and rings (the 22
-flips/min regime), `yaw_kd ≈ 0.05` is the tool that buys headroom, not more P.
+## Update 2 (2026-07-04): I and D measured — they don't help this workload
+
+Two live sweeps (10 combos each, drone airborne in `track_center` on the
+orbiting ball, 40 s captures) — first with the production guards, then a
+**pure-PID** sweep (D low-pass off, I clamp off, rate/slew raised to 3.0/20 so
+nothing reshapes the command). Every row landed at mean |error_x| ≈ 0.10–0.11
+with exactly 6 sign-flips/min, from ki up to 0.5 and raw kd up to 0.6.
+
+That flat table is *not* a plumbing failure. Regressing the live commanded
+`yaw_rate` against the deadbanded error and its derivative recovered
+**effective kp = 1.50, kd = 0.600** — precisely the values set. The PID is in
+the command; the closed loop just doesn't care, for measurable reasons:
+
+- **The residual error is a 0.05 Hz sinusoid** (the ball's 20 s orbit). The
+  6 flips/min in every row is just its 2 zero-crossings per period — a
+  geometry constant, not a controller signature.
+- **There is no DC error for I to remove**: mean *signed* error ≈ −0.015
+  (vs 0.105 mean magnitude). The error is velocity lag, alternating sign with
+  the orbit. An integrator only kills DC; on zero-mean AC it contributes
+  90°-lagged action (measured: ki rows equal-or-slightly-worse).
+- **D has no authority at 0.05 Hz**: D/P magnitude = kd·ω/kp = 13 % at
+  kd 0.6 (7° lead). Meaningful lead (45°) needs kd ≈ kp/ω ≈ **4.8** — but
+  vision-noise amplification already rings the loop at kd ≈ 1.0 (measured:
+  filtered kd 1.0 → mean 0.089, **20 flips/min**). The D benefit curve dead-ends
+  an order of magnitude short of usefulness.
+
+So for a continuously *moving* target, the error obeys ≈ LOS_rate / gain_yaw,
+and the earlier conclusion stands stronger: **P and the rate cap are the only
+effective feedback knobs, and 1.5/1.0 sits just under the ring ceiling.** The
+correction to Update 1: `yaw_ki` will *not* trim the ~0.11 standing component —
+that lag is AC, not bias. I/D remain worth keeping for the field, where slow
+DC disturbances P can't null (wind-induced trim, camera misalignment on the
+real airframe) are exactly what I is for.
+
+What would actually cut the remaining error, in order of leverage:
+1. **Feed-forward the target's LOS rate** (from the tracker's error slope or
+   ball-state estimate) added directly to the yaw-rate command — lead without
+   the feedback phase penalty.
+2. **Cut loop transport delay** (YOLO is capped at 15 fps; detection→command
+   latency is the phase lag that sets the P ring ceiling).
+
+If a future gain hunt pushes past 1.5 and rings (the 22 flips/min regime),
+`yaw_kd` buys a little headroom — but per the numbers above, expect ~10 %, not
+a new regime.
 
 ## How to re-run this
 
