@@ -100,7 +100,14 @@ tracker_node:
     # spanning 3.3-9m: k = diam_px * true_slant = 147 (mean). Pinhole predicts
     # fx*D=539*0.2=108; YOLO boxes run ~1.36x fat, hence 147. (was 100, tuned
     # for the old 960-wide fx=405 assumption -> read 32% low on the 1280 cam.)
+    # RE-CALIBRATE FOR REAL HARDWARE: put the ball at a tape-measured distance
+    # and run  scripts/ros_wsl.sh env python3 scripts/calibrate_distance.py \
+    #   --true-distance-m <m>   — it prints the k (and fat-factor) to set here.
+    # k is camera+model specific; re-run after retraining or swapping YOLO.
     distance_calibration_k: 147.0
+    # Sim ball is 0.20 m; the REAL DroneTrack ball is 8.5 in = 0.2159 m — set
+    # that on hardware (used by the pinhole fallback when k <= 0, and by the
+    # calibration tool's fat-factor report).
     ball_diameter_m: 0.20
     focal_length_px: 0.0
     # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad) at 1280x960,
