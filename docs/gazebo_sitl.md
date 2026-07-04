@@ -36,9 +36,9 @@ git checkout px4-gazebo-sim
 scripts/ros_wsl.sh build-sim       # builds, then auto-creates ~/ros_venv
 ```
 
-Put your trained red-ball model somewhere on the PC, e.g.
-`~/models/red_ball_yolo26s.pt` (referenced as `model_path:=` below). Without it,
-YOLO runs a generic COCO model and won't see the ball.
+The trained red-ball model ships with the repo at `models/red_ball_yolo11s.pt`
+(referenced as `model_path:=` below). Without a trained model, YOLO runs a
+generic COCO model and won't see the ball.
 
 ---
 
@@ -55,9 +55,9 @@ cd ~/PX4-Autopilot && make px4_sitl gz_x500_mono_cam
 **Terminal 2 — the DroneTrack stack (bridge + ball + YOLO + tracker + control):**
 ```bash
 cd <this-repo>
-scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=~/models/red_ball_yolo26s.pt
+scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=$PWD/models/red_ball_yolo11s.pt
 # native Linux equivalent:
-#   ros2 launch dronetrack_pi sitl_gazebo_launch.py device:=cuda:0 model_path:=~/models/red_ball_yolo26s.pt
+#   ros2 launch dronetrack_pi sitl_gazebo_launch.py device:=cuda:0 model_path:=$PWD/models/red_ball_yolo11s.pt
 ```
 This spawns the red ball, orbits it, runs YOLO, and runs the whole pipeline.
 
@@ -94,7 +94,7 @@ source /opt/ros/jazzy/setup.bash
 source ~/dronetrack_groundstation_ros_sim/install/setup.bash
 export ROS_DOMAIN_ID=9 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp   # MUST match the 5080
 scripts/ros_wsl.sh gazebo local_sim:=false device:=cpu \
-    model_path:=/mnt/c/Users/danie/Documents/Python/dronetrack_groundstation_ros/red_ball_yolo26s.pt \
+    model_path:=/mnt/c/Users/danie/Documents/Python/dronetrack_groundstation_ros/models/red_ball_yolo11s.pt \
     connection_url:=udp://<5080-ip>:14540
 ```
 Dashboard: `http://127.0.0.1:8091/`.

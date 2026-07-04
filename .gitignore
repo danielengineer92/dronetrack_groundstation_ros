@@ -11,12 +11,13 @@ ros_ws/log/
 configs/network.yaml
 configs/cyclonedds.xml
 ros_ws/src/*/config/
-models/
 
-# Model weights (downloaded at runtime, not source)
-*.pt
-*.onnx
-*.engine
+# Model weights (*.pt / *.onnx / *.engine) ARE tracked now, committed straight
+# into git — losing the trained red-ball model once was enough. They're small
+# (~19 MB), well under GitHub's 100 MB/file limit, so no LFS needed.
+# Datasets stay OUT of the repo — keep them under ~/Documents/Python/, not here.
+datasets/
+*.zip
 
 # Python
 __pycache__/

@@ -22,14 +22,14 @@ Gazebo camera topic:
 
 Usage (after PX4 SITL + Gazebo are running):
   scripts/ros_wsl.sh gazebo
-  scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=red_ball_yolo26s.pt
+  scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=$PWD/models/red_ball_yolo11s.pt
 
 Split setup (gz on a separate PC, e.g. a 5080):
   # On the sim PC (renders + owns the ball, publishes /sim/camera/image_raw):
   scripts/ros_wsl.sh gazebo            # local_sim defaults true
   # On the laptop (consumes the feed over the LAN, runs YOLO + the stack):
   scripts/ros_wsl.sh gazebo local_sim:=false device:=cuda:0 \
-      model_path:=red_ball_yolo26s.pt connection_url:=udp://<sim-pc-ip>:14540
+      model_path:=$PWD/models/red_ball_yolo11s.pt connection_url:=udp://<sim-pc-ip>:14540
   # Both machines: same ROS_DOMAIN_ID + RMW_IMPLEMENTATION on the same LAN.
 """
 

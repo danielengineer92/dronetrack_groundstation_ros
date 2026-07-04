@@ -33,7 +33,7 @@ docker/dt px4
 #     commander arm
 
 # Terminal 2 — the DroneTrack stack
-docker/dt run device:=cuda:0 model_path:=~/models/red_ball_yolo26s.pt
+docker/dt run device:=cuda:0 model_path:=models/red_ball_yolo11s.pt
 #   (no trained model yet? just `docker/dt run` — YOLO falls back to COCO and
 #    won't see the ball, but the camera/bridge/pipeline still come up.)
 ```

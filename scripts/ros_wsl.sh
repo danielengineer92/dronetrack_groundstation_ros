@@ -329,7 +329,7 @@ cmd_gazebo() {
   echo "  3. Vehicle armed (QGC or PX4 shell: commander arm)"
   echo ""
   echo "Red-ball model: target_class defaults to red_ball."
-  echo "Use a trained model: model_path:=path/to/red_ball_yolo26s.pt device:=cuda:0"
+  echo "Use a trained model: model_path:=\$PWD/models/red_ball_yolo11s.pt device:=cuda:0"
   echo "Override Gazebo camera: gz_camera_topic:=/world/MYWORLD/model/.../image"
   exec ros2 launch dronetrack_pi sitl_gazebo_launch.py "${args[@]}"
 }
