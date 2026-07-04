@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'tracker_node = drone_tracker.tracker_node:main',
+            'target_state_estimator_node = drone_tracker.target_state_estimator_node:main',
         ],
     },
 )

@@ -18,6 +18,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ControlCommand.msg"
   "msg/MissionCommand.msg"
   "msg/MavsdkActionCommand.msg"
+  "msg/TargetState.msg"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

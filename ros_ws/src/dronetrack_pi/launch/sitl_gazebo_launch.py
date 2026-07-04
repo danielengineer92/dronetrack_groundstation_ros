@@ -348,6 +348,14 @@ def generate_launch_description() -> LaunchDescription:
         output="screen", emulate_tty=True,
     )
 
+    target_state_estimator = Node(
+        package="drone_tracker",
+        executable="target_state_estimator_node",
+        name="target_state_estimator_node",
+        parameters=[params],
+        output="screen", emulate_tty=True,
+    )
+
     autonomy_manager = Node(
         package="drone_control",
         executable="autonomy_manager_node",
@@ -433,6 +441,7 @@ def generate_launch_description() -> LaunchDescription:
         ground_station_watchdog,
         telemetry,
         tracker,
+        target_state_estimator,
         autonomy_manager,
         control,
         mission_executor,
