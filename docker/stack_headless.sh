@@ -28,5 +28,5 @@ exec bash scripts/ros_wsl.sh gazebo \
   model_path:="$MODEL" \
   mission_plan_file:="$PLANFILE" \
   max_fps:=120.0 \
-  ball_radius:=0.0 \
+  ball_motion:=still \
   "$@" > /tmp/stack.log 2>&1

@@ -46,7 +46,8 @@ apt install -y \
   ros-jazzy-image-transport \
   ros-jazzy-compressed-image-transport \
   ros-jazzy-rmw-cyclonedds-cpp \
-  python3-pip python3-colcon-common-extensions
+  python3-pip python3-colcon-common-extensions \
+  python3.12-venv
 
 echo "[6/6] rosdep init/update"
 rosdep init 2>/dev/null || echo "  (rosdep already initialized)"

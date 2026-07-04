@@ -2,7 +2,16 @@
 
 Calls the Gazebo /world/<name>/set_pose service (bridged to ROS via
 ros_gz_bridge) at a configurable rate to drive the ball on a circular
-orbit: x = cx + r*cos(wt), y = cy + r*sin(wt), z = altitude.
+orbit: x = cx + r*cos(phase), y = cy + r*sin(phase), z = altitude.
+
+motion_mode selects between "circle" (orbit) and "still" (hold position)
+and can be flipped at runtime without relaunching:
+
+    ros2 param set /target_mover_node motion_mode still
+    ros2 param set /target_mover_node motion_mode circle
+
+Switching to "still" freezes the ball where it is; switching back resumes
+the orbit from that same point (phase accumulates only while circling).
 
 The node waits for the service to become available before starting the
 motion loop, so launch order does not matter.
@@ -11,10 +20,10 @@ motion loop, so launch order does not matter.
 from __future__ import annotations
 
 import math
-import time
 
 import rclpy
 from geometry_msgs.msg import Pose, Point, Quaternion
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 
 try:
@@ -31,6 +40,7 @@ class TargetMoverNode(Node):
 
         self.declare_parameter("world_name", "default")
         self.declare_parameter("entity_name", "red_ball")
+        self.declare_parameter("motion_mode", "circle")  # "circle" | "still"
         self.declare_parameter("center_x", 5.0)
         self.declare_parameter("center_y", 0.0)
         self.declare_parameter("altitude", 1.0)
@@ -40,6 +50,12 @@ class TargetMoverNode(Node):
 
         self.world_name = str(self.get_parameter("world_name").value)
         self.entity_name = str(self.get_parameter("entity_name").value)
+        self.motion_mode = str(self.get_parameter("motion_mode").value).lower()
+        if self.motion_mode not in ("circle", "still"):
+            self.get_logger().warning(
+                f"Unknown motion_mode '{self.motion_mode}' — using 'circle'."
+            )
+            self.motion_mode = "circle"
         self.cx = float(self.get_parameter("center_x").value)
         self.cy = float(self.get_parameter("center_y").value)
         self.alt = float(self.get_parameter("altitude").value)
@@ -47,6 +63,15 @@ class TargetMoverNode(Node):
         period = max(1.0, float(self.get_parameter("period_s").value))
         self.omega = 2.0 * math.pi / period
         rate = max(1.0, float(self.get_parameter("rate_hz").value))
+
+        # Orbit phase accumulates only while circling, so still→circle
+        # resumes from wherever the ball froze instead of teleporting.
+        self._phase = 0.0
+        # In "still" mode before any circling, hold at the spawn/center point.
+        self._x = self.cx
+        self._y = self.cy
+
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         if not _HAS_GZ_INTERFACES:
             self.get_logger().error(
@@ -57,7 +82,6 @@ class TargetMoverNode(Node):
 
         service_name = f"/world/{self.world_name}/set_pose"
         self.client = self.create_client(SetEntityPose, service_name)
-        self.start_time = time.monotonic()
         self.calls_sent = 0
         self.calls_ok = 0
         self._consecutive_fails = 0
@@ -66,10 +90,11 @@ class TargetMoverNode(Node):
 
         self.get_logger().info(
             f"Target mover up | entity={self.entity_name}, "
-            f"service={service_name}, "
+            f"service={service_name}, mode={self.motion_mode}, "
             f"orbit r={self.radius:.1f}m period={period:.0f}s "
             f"center=({self.cx:.1f}, {self.cy:.1f}, {self.alt:.1f}), "
-            f"rate={rate:.0f} Hz"
+            f"rate={rate:.0f} Hz | switch: ros2 param set "
+            f"{self.get_fully_qualified_name()} motion_mode still|circle"
         )
 
         self.get_logger().info(f"Waiting for service {service_name} ...")
@@ -79,11 +104,30 @@ class TargetMoverNode(Node):
         self.report_timer = self.create_timer(10.0, self._report)
         self._move_dt = 1.0 / rate
 
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """Runtime switch: ros2 param set <node> motion_mode still|circle."""
+        for p in params:
+            if p.name != "motion_mode":
+                continue
+            mode = str(p.value).lower()
+            if mode not in ("circle", "still"):
+                return SetParametersResult(
+                    successful=False,
+                    reason="motion_mode must be 'circle' or 'still'",
+                )
+            if mode != self.motion_mode:
+                self.motion_mode = mode
+                self.get_logger().info(
+                    f"motion_mode -> {mode} "
+                    + ("(orbit resumes from current position)"
+                       if mode == "circle" else "(ball frozen in place)")
+                )
+        return SetParametersResult(successful=True)
+
     def _wait_for_service(self) -> None:
         if self.client.service_is_ready():
             self.wait_timer.cancel()
             self.get_logger().info("set_pose service ready — starting motion loop")
-            self.start_time = time.monotonic()
             self.move_timer = self.create_timer(self._move_dt, self._move)
         else:
             self.get_logger().info(
@@ -95,16 +139,19 @@ class TargetMoverNode(Node):
         if self._paused:
             return
 
-        t = time.monotonic() - self.start_time
-        x = self.cx + self.radius * math.cos(self.omega * t)
-        y = self.cy + self.radius * math.sin(self.omega * t)
+        if self.motion_mode == "circle":
+            self._phase += self.omega * self._move_dt
+            self._x = self.cx + self.radius * math.cos(self._phase)
+            self._y = self.cy + self.radius * math.sin(self._phase)
+        # "still": keep re-sending the held position so the ball stays put
+        # (and the entity-missing retry logic keeps working) without motion.
 
         req = SetEntityPose.Request()
         req.entity = Entity()
         req.entity.name = self.entity_name
         req.entity.type = 2  # MODEL
         req.pose = Pose(
-            position=Point(x=x, y=y, z=self.alt),
+            position=Point(x=self._x, y=self._y, z=self.alt),
             orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
         )
 
@@ -140,7 +187,7 @@ class TargetMoverNode(Node):
         req.entity.name = self.entity_name
         req.entity.type = 2
         req.pose = Pose(
-            position=Point(x=self.cx, y=self.cy, z=self.alt),
+            position=Point(x=self._x, y=self._y, z=self.alt),
             orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
         )
         future = self.client.call_async(req)
@@ -155,7 +202,6 @@ class TargetMoverNode(Node):
                 )
                 self._paused = False
                 self._consecutive_fails = 0
-                self.start_time = time.monotonic()
                 if self._retry_timer:
                     self._retry_timer.cancel()
                     self._retry_timer = None
@@ -164,8 +210,8 @@ class TargetMoverNode(Node):
 
     def _report(self) -> None:
         self.get_logger().info(
-            f"Target mover | sent={self.calls_sent}, ok={self.calls_ok}, "
-            f"entity={self.entity_name}"
+            f"Target mover | mode={self.motion_mode}, sent={self.calls_sent}, "
+            f"ok={self.calls_ok}, entity={self.entity_name}"
         )
 
 

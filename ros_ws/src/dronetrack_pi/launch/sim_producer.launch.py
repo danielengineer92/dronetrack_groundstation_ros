@@ -106,6 +106,11 @@ def generate_launch_description() -> LaunchDescription:
             description="Gazebo transport camera topic — match your PX4 model."),
         DeclareLaunchArgument("gz_ros_image_topic", default_value="/sim/camera/image_raw"),
         DeclareLaunchArgument("ball_sdf", default_value=_resolve_ball_sdf()),
+        DeclareLaunchArgument(
+            "ball_motion", default_value="circle",
+            description="Ball motion: 'circle' orbits, 'still' holds position. "
+                        "Switch live: ros2 param set /target_mover_node "
+                        "motion_mode still|circle"),
         DeclareLaunchArgument("ball_center_x", default_value="5.0"),
         DeclareLaunchArgument("ball_center_y", default_value="0.0"),
         DeclareLaunchArgument("ball_altitude", default_value="1.0"),
@@ -119,6 +124,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             "world_name": LaunchConfiguration("gz_world_name"),
             "entity_name": "red_ball",
+            "motion_mode": LaunchConfiguration("ball_motion"),
             "center_x": ParameterValue(LaunchConfiguration("ball_center_x"), value_type=float),
             "center_y": ParameterValue(LaunchConfiguration("ball_center_y"), value_type=float),
             "altitude": ParameterValue(LaunchConfiguration("ball_altitude"), value_type=float),

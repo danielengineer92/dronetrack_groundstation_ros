@@ -23,7 +23,8 @@ Track a moving red ball in Gazebo with the real DroneTrack vision pipeline
 sudo apt update && sudo apt install -y \
     ros-jazzy-ros-gz ros-jazzy-ros-gz-image ros-jazzy-ros-gz-bridge \
     ros-jazzy-ros-gz-interfaces ros-jazzy-ros-gz-sim \
-    ros-jazzy-rmw-cyclonedds-cpp ros-jazzy-cv-bridge
+    ros-jazzy-rmw-cyclonedds-cpp ros-jazzy-cv-bridge \
+    python3.12-venv   # needed for `python3 -m venv ~/ros_venv` in build-sim
 
 # PX4 with the camera model
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive ~/PX4-Autopilot
@@ -59,6 +60,15 @@ scripts/ros_wsl.sh gazebo device:=cuda:0 model_path:=~/models/red_ball_yolo26s.p
 #   ros2 launch dronetrack_pi sitl_gazebo_launch.py device:=cuda:0 model_path:=~/models/red_ball_yolo26s.pt
 ```
 This spawns the red ball, orbits it, runs YOLO, and runs the whole pipeline.
+
+**Still vs. moving ball.** The ball orbits by default. Launch it stationary
+with `ball_motion:=still`, or flip it live at any time without relaunching:
+```bash
+ros2 param set /target_mover_node motion_mode still    # freeze in place
+ros2 param set /target_mover_node motion_mode circle   # resume the orbit
+```
+Switching to `circle` resumes from wherever the ball froze (no teleport).
+Works the same for `sim_producer.launch.py` in the split setup.
 
 **From the laptop (or any machine on the LAN):** open the dashboard at
 `http://<5080-ip>:8091/` and start the mission there.

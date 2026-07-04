@@ -228,6 +228,11 @@ def generate_launch_description() -> LaunchDescription:
                         "only republishes + runs YOLO + the mission stack."),
 
         # Target mover
+        DeclareLaunchArgument(
+            "ball_motion", default_value="circle",
+            description="Ball motion: 'circle' orbits, 'still' holds position. "
+                        "Switch live: ros2 param set /target_mover_node "
+                        "motion_mode still|circle"),
         DeclareLaunchArgument("ball_center_x", default_value="6.0",
                               description="Ball orbit center X (m, NED)."),
         DeclareLaunchArgument("ball_center_y", default_value="0.0",
@@ -276,6 +281,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             "world_name": LaunchConfiguration("gz_world_name"),
             "entity_name": "red_ball",
+            "motion_mode": LaunchConfiguration("ball_motion"),
             "center_x": ParameterValue(LaunchConfiguration("ball_center_x"), value_type=float),
             "center_y": ParameterValue(LaunchConfiguration("ball_center_y"), value_type=float),
             "altitude": ParameterValue(LaunchConfiguration("ball_altitude"), value_type=float),
@@ -412,8 +418,9 @@ def generate_launch_description() -> LaunchDescription:
                       " target_class=", LaunchConfiguration("target_class")]),
         LogInfo(msg=["Gazebo world: ", LaunchConfiguration("gz_world_name"),
                       " camera: ", LaunchConfiguration("gz_camera_topic")]),
-        LogInfo(msg=["Red ball orbit: r=", LaunchConfiguration("ball_radius"),
-                      "m, period=", LaunchConfiguration("ball_period"), "s"]),
+        LogInfo(msg=["Red ball motion: ", LaunchConfiguration("ball_motion"),
+                      " (r=", LaunchConfiguration("ball_radius"),
+                      "m, period=", LaunchConfiguration("ball_period"), "s)"]),
 
         # OpaqueFunction writes the bridge config and spawns the ball
         OpaqueFunction(function=_create_bridge_and_spawn),
