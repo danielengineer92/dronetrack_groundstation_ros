@@ -89,11 +89,19 @@ is badly underconfident (NIS 0.47), making the published std-devs untrustworthy.
   los-diff low-pass, so latency cancellation nets out. Default stays
   `los_diff`; the state source remains available.
 - **Orbit-ahead** (`orbit_lead_s` in mission_executor, default 0 = off):
-  leads the DO_ORBIT centre by `velocity × lead`. Validated live
-  (orbit_lead_s=2.0, 17 samples): |lead| = 85 % ± 19 % of the ball's true 2 s
-  displacement, lead direction rotating at the orbit rate (−0.341 vs ±0.314
-  rad/s expected, sign per the det=−1 frame map). PX4 flew the led orbit to
-  completion.
+  leads the DO_ORBIT centre to where the ball will be. Straight `v x lead`
+  overshoots and mis-aims on a turning target — the tangent isn't the chord.
+  `orbit_lead_curved: true` (default) extrapolates on a **constant-turn-rate
+  arc** (`curved_lead_offset` + `estimate_turn_rate` in control_math.py; turn
+  rate from the velocity heading slope). Swept straight vs curved across
+  q=0.3..30 (2 s lead): curved cut direction error ~23 deg -> ~9 deg,
+  q-robust. Live orbit mission (17 samples, curved): **direction error 4.8 deg
+  (was ~23), magnitude 106 % of true displacement (was ~114)** — ~4x smaller
+  lead-point placement error. PX4 flew the led orbit to completion.
+  Residual ~6 % magnitude overshoot = the estimator's velocity reads ~12 %
+  high on the orbit (candidate for a distance-calibration recheck; direction,
+  which dominates placement, is the fixed part).
+
 - **QoS trap (bit us once):** the estimator publishes BEST_EFFORT; any
   subscriber left at default RELIABLE QoS silently receives NOTHING. Both
   consumers subscribe BEST_EFFORT — do the same in new consumers.

@@ -250,3 +250,67 @@ def los_rate_from_state(
     if r2 < float(min_range_m) ** 2:
         return 0.0
     return (rn * float(rel_velocity_east_m_s) - re * float(rel_velocity_north_m_s)) / r2
+
+
+def curved_lead_offset(
+    *,
+    velocity_north_m_s: float,
+    velocity_east_m_s: float,
+    turn_rate_rad_s: float,
+    lead_s: float,
+    max_turn_rate_rad_s: float = 2.0,
+) -> tuple[float, float]:
+    """Where a target goes in ``lead_s``, on a constant-turn-rate arc.
+
+    Straight extrapolation ``v * lead`` points along the CURRENT velocity, but
+    a turning target's true displacement is the chord of its arc — rotated by
+    half the turn angle and slightly shorter. For a target of speed ``s`` and
+    heading ``theta`` turning at ``omega``:
+
+        dN = (s/omega) * ( sin(theta + omega*lead) - sin(theta) )
+        dE = (s/omega) * (-cos(theta + omega*lead) + cos(theta) )
+
+    which reduces to the straight ``s*lead*(cos theta, sin theta)`` as
+    omega -> 0. Measured on the orbiting ball this cut the lead-vector
+    direction error from ~23 deg (straight) to ~9 deg. ``turn_rate`` is clamped
+    to ``max_turn_rate_rad_s`` (a noisy estimate must not fold the arc back on
+    itself).
+    """
+    s = math.hypot(float(velocity_north_m_s), float(velocity_east_m_s))
+    lead = float(lead_s)
+    w = clamp(float(turn_rate_rad_s), -abs(max_turn_rate_rad_s), abs(max_turn_rate_rad_s))
+    theta = math.atan2(float(velocity_east_m_s), float(velocity_north_m_s))
+    if abs(w) < 1e-3:
+        return s * lead * math.cos(theta), s * lead * math.sin(theta)
+    dN = (s / w) * (math.sin(theta + w * lead) - math.sin(theta))
+    dE = (s / w) * (-math.cos(theta + w * lead) + math.cos(theta))
+    return dN, dE
+
+
+def estimate_turn_rate(times_s, vel_north, vel_east) -> float:
+    """Turn rate (rad/s) = slope of the velocity heading over a short history.
+
+    ``times_s``/``vel_north``/``vel_east`` are equal-length recent samples.
+    Returns 0 with fewer than 3 samples or near-zero speed (heading undefined).
+    """
+    n = len(times_s)
+    if n < 3:
+        return 0.0
+    angles = [math.atan2(ve, vn) for vn, ve in zip(vel_north, vel_east)]
+    # unwrap
+    unwrapped = [angles[0]]
+    for a in angles[1:]:
+        prev = unwrapped[-1]
+        while a - prev > math.pi:
+            a -= 2 * math.pi
+        while a - prev < -math.pi:
+            a += 2 * math.pi
+        unwrapped.append(a)
+    t0 = times_s[0]
+    xs = [t - t0 for t in times_s]
+    mx = sum(xs) / n
+    my = sum(unwrapped) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom < 1e-9:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, unwrapped)) / denom

@@ -184,6 +184,10 @@ mission_executor_node:
     orbit_lead_s: 0.0
     orbit_lead_min_speed_m_s: 0.3
     orbit_lead_max_state_age_s: 1.0
+    # Curved lead: extrapolate on a constant-turn-rate arc, not a straight
+    # v*lead tangent. SITL sweep (2026-07-04): cuts lead-vector direction
+    # error ~23 deg -> ~9 deg on the orbiting ball, robust across q.
+    orbit_lead_curved: true
     target_state_topic: "/drone/tracking/target_state"
     mission_enabled: true
     auto_start: false

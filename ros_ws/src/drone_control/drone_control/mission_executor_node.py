@@ -38,7 +38,12 @@ from std_msgs.msg import Bool, String
 
 from drone_interfaces.msg import DroneTelemetry, MavsdkActionCommand, MissionCommand, TargetError, TargetState
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
-from drone_control.control_math import offset_global, project_target_global
+from drone_control.control_math import (
+    curved_lead_offset,
+    estimate_turn_rate,
+    offset_global,
+    project_target_global,
+)
 from drone_control.mission_plan import (
     MissionPlan,
     MissionPlanError,
@@ -161,6 +166,10 @@ class MissionExecutorNode(Node):
         self.declare_parameter("orbit_lead_s", 0.0)
         self.declare_parameter("orbit_lead_min_speed_m_s", 0.3)
         self.declare_parameter("orbit_lead_max_state_age_s", 1.0)
+        # Curved lead: extrapolate the target on a constant-turn-rate arc
+        # instead of a straight v*lead tangent (cuts direction error ~23->9
+        # deg on a turning target). Turn rate from the velocity history.
+        self.declare_parameter("orbit_lead_curved", True)
         self.declare_parameter("target_state_topic", "/drone/tracking/target_state")
         self.declare_parameter("center_error_threshold", 0.15)
         self.declare_parameter("event_log_enabled", True)
@@ -248,6 +257,9 @@ class MissionExecutorNode(Node):
         self.last_target_time = 0.0
         self.last_telemetry: Optional[DroneTelemetry] = None
         self.last_telemetry_time = 0.0
+        self.last_target_state: Optional[TargetState] = None
+        self.last_target_state_time = 0.0
+        self._target_vel_hist: list = []
         self._event_log_file: Optional[TextIO] = None
         self._event_log_path: Optional[Path] = None
         self._event_log_error_reported = False
@@ -782,19 +794,36 @@ class MissionExecutorNode(Node):
             fresh = (ts is not None and ts.valid
                      and time.monotonic() - getattr(self, "last_target_state_time", 0.0) <= max_age)
             if fresh and float(ts.speed) >= min_speed:
-                north_lead = float(ts.velocity_north) * lead_s
-                east_lead = float(ts.velocity_east) * lead_s
+                if bool(self.get_parameter("orbit_lead_curved").value) and len(self._target_vel_hist) >= 3:
+                    ttimes = [h[0] for h in self._target_vel_hist]
+                    tvn = [h[1] for h in self._target_vel_hist]
+                    tve = [h[2] for h in self._target_vel_hist]
+                    w = estimate_turn_rate(ttimes, tvn, tve)
+                    north_lead, east_lead = curved_lead_offset(
+                        velocity_north_m_s=float(ts.velocity_north),
+                        velocity_east_m_s=float(ts.velocity_east),
+                        turn_rate_rad_s=w, lead_s=lead_s)
+                    mode = f"curved(w={w:+.2f})"
+                else:
+                    north_lead = float(ts.velocity_north) * lead_s
+                    east_lead = float(ts.velocity_east) * lead_s
+                    mode = "straight"
                 out_lat, out_lon = offset_global(out_lat, out_lon, north_lead, east_lead)
                 self.get_logger().info(
-                    f"Orbit-ahead: leading centre by {lead_s:.1f}s x "
-                    f"({ts.velocity_north:+.2f}, {ts.velocity_east:+.2f}) m/s "
-                    f"= ({north_lead:+.2f} N, {east_lead:+.2f} E) m"
+                    f"Orbit-ahead [{mode}]: leading centre by {lead_s:.1f}s | "
+                    f"v=({ts.velocity_north:+.2f}, {ts.velocity_east:+.2f}) m/s "
+                    f"-> ({north_lead:+.2f} N, {east_lead:+.2f} E) m"
                 )
         return out_lat, out_lon, alt
 
     def on_target_state(self, msg: TargetState) -> None:
         self.last_target_state = msg
         self.last_target_state_time = time.monotonic()
+        # Short velocity history for the turn-rate estimate (curved lead).
+        self._target_vel_hist.append(
+            (time.monotonic(), float(msg.velocity_north), float(msg.velocity_east)))
+        if len(self._target_vel_hist) > 15:
+            self._target_vel_hist.pop(0)
 
     def publish_state(self, detail: str) -> None:
         msg = String()
