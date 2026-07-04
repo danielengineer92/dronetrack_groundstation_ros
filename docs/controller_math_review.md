@@ -467,3 +467,153 @@ so the yaw and translation behaviours are guaranteed consistent by construction.
 **Test status:** `test_control_math.py` 15/15, `test_yaw_pid.py` (incl. 8 braking-cap
 cases) OK, full `drone_control` suite green (5+15+26+6 + yaw/lead). 23 new pure-math
 cases across the braking profile, alignment, and approach.
+
+## 10. Steady-tracking wobble: pose-pairing bug + PD damping (2026-07-04)
+
+After §9, tracking of the circling ball was good on average (mean |error_x| ≈ 0.05)
+but the drone **hunted side-to-side (~1–2 s period)** whenever the ball passed its
+**nearest and farthest** orbit points — exactly where the ball's LOS angular rate
+peaks (motion purely tangential there). The yaw law is now explicitly:
+
+```
+yaw_rate = PD(image error) + FF(KF LOS rate)
+```
+
+with `gain_yaw` (P), `yaw_kd` (D), `yaw_ki` (I, kept 0) all runtime-tunable.
+
+### 10.1 Root cause: stale bearing paired with fresh yaw (the dominant one)
+
+The state estimator projected each detection to world NED using the **latest**
+telemetry pose — but the bearing in that detection is ~0.35 s old. While yawing at
+rate ω, the projection error is ω·0.35 in LOS angle (~0.1 rad at 0.3 rad/s —
+0.6–0.9 m of phantom cross-range at 3–9 m). That error oscillates **with our own
+yaw motion**, corrupts the KF velocity, and returns through the yaw feed-forward:
+a self-excited loop that peaks exactly at the LOS-rate extremes.
+
+**Closed-loop model** (real `control_math` + real `ConstantVelocityKF`, 12 fps ZOH
+vision, 0.35 s transport delay, EMA 0.5, 20 Hz control, PX4 lag; orbiting ball
+r=3 m T=20 s from 6 m):
+
+| | mean\|error_x\| | sign-flips/min | p2p error @ LOS-rate peaks |
+|---|---|---|---|
+| shipped pairing (latest yaw) | 0.109 | 32.0 | **0.407** |
+| kd=0.3 alone (pairing unfixed) | 0.110 | 27.2 | 0.397 |
+| **pairing fixed** | **0.056** | **5.2** | **0.062** (−85%) |
+
+PID tuning barely moves the wobble while the contamination is present — the fix is
+structural, not a gain. Fix: the tracker now publishes the **camera capture stamp**
+in `TargetError.stamp` (propagated from the Pi camera / gz republisher through
+YOLO's `Detection.stamp`; no consumer read the old publish-time stamp), and the
+estimator keeps a ~2 s pose history, **interpolating the drone pose (N, E, yaw —
+wrap-aware) at the detection's capture stamp** before projecting. Falls back to
+the latest telemetry when the stamp can't be resolved (counted as
+`pair_fallback` in the node log; `paired@capture` counts the good path).
+Runtime A/B: `ros2 param set /target_state_estimator_node pair_at_capture_stamp false`.
+Verified live: 454/454 measurements paired, 0 fallbacks.
+
+### 10.2 D term: the damping nothing else provides
+
+Does the §9 tuning already do what a PID would? **No.** The braking cap (§9.1) is
+an acquisition-phase *magnitude* limiter — during centred tracking the P output
+(~0.1–0.2 rad/s) is far below the cap's own `min_rate` floor (0.35), so the clamp
+is inert and contributes **zero damping**. The FF does the *I-term's* job (carries
+the standing rate so feedback holds near-zero error without integrator lag). But
+nothing injected output ∝ error *slope* — phase lead near crossover. The loop was
+pure P (K ≈ kp/half_fov ≈ 2.46 s⁻¹) through ~0.5–0.6 s of effective delay:
+K·L ≈ 1.2–1.5 vs the π/2 pure-delay instability threshold — thin margin, lightly
+damped ringing at ~4·delay ≈ 1.4–2.4 s, matching the observed wobble period.
+
+Enabled `yaw_kd: 0.3` (Td = 0.2 s → ≈ +13° net phase margin after the D-LPF's own
+lag). Offline: neutral at T=20 s once pairing is fixed, **−20% peak wobble at
+T=12 s**, mean|error_x| best of all arms. D noise at 12 fps ZOH quantified ≈
+0.04 rad/s command jitter at kd=0.3 with `yaw_d_lpf_alpha` 0.35 — below the slew
+step (0.06 rad/s per tick). ki stays 0: I adds phase lag (the wrong direction for
+wobble) and the FF already carries the standing rate.
+
+**D runs on the RAW pre-deadband error** (`yaw_pid_step(derivative_error=...)`,
+new kwarg; P and I keep the deadbanded error). The deadband rescale zeroes the
+slope inside the band and kinks it at the boundary — precisely where a centred
+loop lives — so D on the deadbanded error is blind inside the band and sees
+phantom discontinuities at every crossing. Inert at kd=0 (hardware-safe).
+
+### 10.3 Knobs added but left OFF (offline A/B said unnecessary once 10.1 landed)
+
+- `yaw_ff_state_lpf_alpha` (1.0 = off): low-pass on the state-FF branch,
+  symmetric with the `los_diff` branch's filter. The state LOS rate divides by
+  range² (noisiest at the nearest point) — but with capture-stamp pairing the
+  estimate is clean and the filter only added ~90 ms lag for no p2p gain.
+- `yaw_ff_align_inner` (0.0 = original ramp): flat zone of the FF alignment gate
+  (`alignment_scale(inner=...)`) — full FF for |error_x| ≤ inner. Removes the
+  gate's in-band modulation (slope 1/0.6 ≈ 1.67 couples the error wobble into the
+  FF as sign-switching gain, up to +50% effective loop gain at FF ≈ 0.3–0.5 rad/s).
+  Not needed in sim after 10.1; live knob for hardware where delays are larger.
+
+### 10.4 Verification & tuning assets
+
+- Offline harness: `orbit_ab.py` (job tmp) — real `control_math` + real KF through
+  the full sensing chain; metrics: mean|error_x|, sign-flips/min, p2p error in
+  ±2 s windows at the LOS-rate extremes, FF-vs-truth phase lag. Reproduces the
+  wobble with the old pairing and its disappearance with the fix.
+- Unit tests: `test_yaw_pid.py` +4 (derivative_error semantics incl.
+  alive-inside-deadband), `test_control_math.py` +4 (alignment knee, incl.
+  inner=0 regression-identity). All suites green.
+- Live smoke: 16 nodes up, new params live, 454/454 paired@capture, LOCKED.
+
+| # | Change | File |
+|---|---|---|
+| D1 | `TargetError.stamp` = camera capture stamp of the current target | `tracker_node.py` |
+| D2 | Pose history + capture-stamp pairing (`pair_at_capture_stamp`) | `target_state_estimator_node.py` |
+| D3 | `yaw_pid_step(derivative_error=, prev_derivative_error=)`; `alignment_scale(inner=)` | `control_math.py` |
+| D4 | D fed raw error; `yaw_ff_state_lpf_alpha`; `yaw_ff_align_inner` | `control_node.py` |
+| D5 | `yaw_kd: 0.3`, `pair_at_capture_stamp: true`, new knobs documented | `configs/pi.yaml` |
+
+Gain tuning (kp/kd/ki sweep against live SITL data) is the designated follow-up.
+
+## 11. Live SITL gain tuning (2026-07-04)
+
+Staged tuning against live SITL data (P → D → FF → clamps → I), each term isolated
+before the next was added. Full method, 54 recorded runs, sweep tables and
+oscilloscope traces are in the tuning artifact; the outcome:
+
+| term | shipped | **SITL candidate** | why |
+|---|---|---|---|
+| `gain_yaw` (P) | 1.5 | **2.0** | pure-P sweep knee; lag 0.13→0.094; kp=3.0 unstable |
+| `yaw_kd` (D) | 0 | **0.3** | phase-lead margin; kd≥0.7 destabilises |
+| `yaw_ff_gain` | 1.0 | **0.8** | full FF over-drives the near pass (1/r² LOS spike → saturation); 0.8 keeps nominal optimal |
+| `yaw_ki` (I) | 0 | **0** | near≈far error (no standing bias); FF carries the rate |
+| `max_yaw_accel` | 1.2 | **1.2** | raising it made hunting WORSE — the slew limit is load-bearing damping |
+
+Key findings: (1) at the nominal 20 s orbit the loop was already fine in every config —
+the wobble is a **high-LOS-rate** phenomenon that only surfaces on a fast (10 s) target;
+(2) the near-pass residual is bounded by **phase margin, not actuation** (more yaw accel
+= worse); (3) low-pass filtering the FF made it worse (adds phase lag that mistimes the
+1/r² spike) — the clean lever is the FF gain, not a filter.
+
+**Status: SITL candidate, NOT flight-validated.**
+
+## 12. Hardware bring-up plan (before first real flight)
+
+The §11 gains live in the shared `configs/pi.yaml`, so they also load on the aircraft.
+They are SITL-only. Real vision latency and yaw dynamics differ — bring the loop up
+conservatively, not at the SITL candidate values:
+
+1. **Instrument.** `ros2 param set /control_node log_yaw_terms true` — logs, at ~2 Hz
+   while tracking: `P / D / FF / I` terms, braking `cap`, `raw` (pre-limit) command,
+   `clamped` command actually sent, and `achieved` yaw rate (differentiated telemetry).
+2. **Start low, P/D minimal.** `gain_yaw ≈ 1.0`, `yaw_kd ≈ 0.1`, `yaw_ff_gain ≈ 0.4`,
+   `yaw_ki = 0`.
+3. **Confirm FF sign first.** On a moving, off-centre target the **FF term must share the
+   P term's sign** (both drive yaw the same way). If FF opposes P, the LOS-rate sign or a
+   frame convention is wrong — stop and fix before raising any gain. (SITL preview,
+   verified 2026-07-04: `err=+0.048 → P=+0.097, FF=+0.145`; `err=−0.033 → P=−0.067,
+   FF=−0.065` — same sign, FF assists.)
+4. **Raise P**, then **FF**, toward the SITL candidates while watching `raw` vs `clamped`
+   (how hard the limiter clips) and `achieved` (does the airframe follow the command).
+5. **Add D last, and judge it.** Watch whether the `D` term is coherent on transients
+   (real damping) or just sign-flipping noise at centre (in SITL it is already noticeably
+   noisy near centre) — back it off if it is feeding jitter into the command.
+6. **Keep `yaw_ki = 0`** unless a *measured* standing bias appears (near vs far error
+   asymmetric); I only adds phase lag against a moving target.
+
+Instrumentation: `log_yaw_terms` (`control_node.py`, off by default); the `_log_yaw_terms`
+line is the single source for all six signals above.

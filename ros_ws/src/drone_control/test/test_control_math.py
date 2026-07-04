@@ -131,6 +131,33 @@ def test_alignment_scale_helper():
     assert alignment_scale(error_x=0.9, error_limit=0.0) == 1.0  # disabled
 
 
+def test_alignment_scale_inner_knee_flat_region():
+    # Full FF anywhere inside the knee — no in-band modulation.
+    for e in (0.0, 0.1, -0.19, 0.2):
+        assert alignment_scale(error_x=e, error_limit=0.6, inner=0.2) == 1.0
+
+
+def test_alignment_scale_inner_knee_ramp():
+    # Ramp runs knee -> limit: midpoint of [0.2, 0.6] gives 0.5.
+    mid = alignment_scale(error_x=0.4, error_limit=0.6, inner=0.2)
+    assert math.isclose(mid, 0.5), mid
+    assert alignment_scale(error_x=0.6, error_limit=0.6, inner=0.2) == 0.0
+    assert alignment_scale(error_x=-0.6, error_limit=0.6, inner=0.2) == 0.0
+
+
+def test_alignment_scale_inner_zero_reproduces_original():
+    for e in (-0.9, -0.3, 0.0, 0.25, 0.5, 0.75):
+        assert alignment_scale(error_x=e, error_limit=0.5, inner=0.0) == \
+            alignment_scale(error_x=e, error_limit=0.5)
+
+
+def test_alignment_scale_inner_at_or_above_limit_hard_gate():
+    # Degenerate knee >= limit: on/off gate at the limit, no divide-by-zero.
+    assert alignment_scale(error_x=0.59, error_limit=0.6, inner=0.6) == 1.0
+    assert alignment_scale(error_x=0.61, error_limit=0.6, inner=0.6) == 0.0
+    assert alignment_scale(error_x=0.3, error_limit=0.6, inner=0.9) == 1.0
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0

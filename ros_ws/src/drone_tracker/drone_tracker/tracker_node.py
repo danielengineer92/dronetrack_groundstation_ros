@@ -171,6 +171,14 @@ class TrackerNode(Node):
 
         self.detection_message_count = 0
         self.target_error_publish_count = 0
+        # Camera capture stamp of the detection behind the current publishable
+        # target. Published as TargetError.stamp so downstream consumers (the
+        # world-frame estimator) can pair the measurement with the drone pose
+        # AT CAPTURE TIME — pairing a ~0.35 s stale bearing with the CURRENT
+        # yaw leaks our own rotation into the target estimate (wobble at high
+        # LOS rate). None until the first valid detection; publish falls back
+        # to now() while no target is visible.
+        self.current_capture_stamp = None
         self.last_published_tracking_state = self.state.value
         self.last_published_target_visible = False
         self.last_logged_state = self.state
@@ -342,6 +350,7 @@ class TrackerNode(Node):
         self.current_target_center_y = float(detection.center_y)
         self.current_target_confidence = float(detection.confidence)
         self.current_target_area = float(detection.width * detection.height)
+        self.current_capture_stamp = detection.stamp
         self.update_target_geometry(detection)
 
         self.last_valid_target_time = current_time
@@ -438,6 +447,7 @@ class TrackerNode(Node):
         self.current_raw_distance_m = 0.0
         self.current_bearing_x_rad = 0.0
         self.current_bearing_y_rad = 0.0
+        self.current_capture_stamp = None
         self.distance_filter.reset()
 
         if reset_memory:
@@ -556,6 +566,10 @@ class TrackerNode(Node):
         self.expire_target_if_needed(current_time)
 
         msg = TargetError()
+        # Measurement-time stamp (ROS convention): the camera capture stamp of
+        # the detection this error is derived from, so the estimator can pair
+        # the bearing with the drone pose at capture. Falls back to now() when
+        # no capture stamp exists (no target yet / YOLO upstream didn't stamp).
         msg.stamp = self.get_clock().now().to_msg()
         msg.target_class = self.target_class
         msg.tracking_state = self.state.value
@@ -569,6 +583,8 @@ class TrackerNode(Node):
         )
 
         if target_visible:
+            if self.current_capture_stamp is not None:
+                msg.stamp = self.current_capture_stamp
             raw_error_x = self.current_target_center_x - 0.5
             raw_error_y = self.current_target_center_y - 0.5
 

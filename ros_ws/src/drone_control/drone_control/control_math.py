@@ -184,7 +184,7 @@ def braking_speed_limit(
     return clamp(speed, lo, hi)
 
 
-def alignment_scale(*, error_x: float, error_limit: float) -> float:
+def alignment_scale(*, error_x: float, error_limit: float, inner: float = 0.0) -> float:
     """Forward-speed scale [0, 1] from how far off-centre the target is.
 
     Translating toward a target whose bearing is still converging drives the
@@ -194,12 +194,28 @@ def alignment_scale(*, error_x: float, error_limit: float) -> float:
     centred) to 0 at ``|error_x| >= error_limit`` (normalized image error),
     so the vehicle centres first, then closes.
 
+    ``inner`` (optional) flattens the gate to exactly 1.0 for
+    ``|error_x| <= inner`` and ramps only between ``inner`` and
+    ``error_limit``. Rationale: a sloped gate MODULATES its term with the
+    error oscillation during steady tracking — for the yaw feed-forward that
+    coupling acts as extra proportional gain that switches sign at every
+    centre crossing. A small flat zone removes the in-band modulation while
+    keeping the acquisition gating above it. ``inner = 0`` reproduces the
+    original pure ramp; ``inner >= error_limit`` degrades to a hard on/off
+    gate at ``error_limit``.
+
     ``error_limit <= 0`` disables the gate (returns 1.0).
     """
     limit = float(error_limit)
     if limit <= 0.0:
         return 1.0
-    return clamp(1.0 - abs(float(error_x)) / limit, 0.0, 1.0)
+    knee = clamp(float(inner), 0.0, limit)
+    e = abs(float(error_x))
+    if e <= knee:
+        return 1.0
+    if limit - knee <= 1e-9:
+        return 0.0
+    return clamp(1.0 - (e - knee) / (limit - knee), 0.0, 1.0)
 
 
 def yaw_pid_step(
@@ -216,6 +232,8 @@ def yaw_pid_step(
     output_limit: float,
     integral_limit: float,
     derivative_alpha: float,
+    derivative_error: float | None = None,
+    prev_derivative_error: float = 0.0,
 ) -> tuple[float, float, float]:
     """One step of the yaw-tracking PID. Pure; the caller owns the state.
 
@@ -231,6 +249,13 @@ def yaw_pid_step(
       slope into the previous filtered value (1 = unfiltered). The raw
       derivative of YOLO pixel error is jittery; kd on the raw slope would
       amplify it (why the original controller was P-only).
+    - **D can run on a separate error signal**: pass ``derivative_error`` (and
+      ``prev_derivative_error``) to differentiate the RAW pre-deadband error
+      while P and I keep the deadbanded one. The deadband rescale zeroes the
+      slope inside the band and kinks it at the boundary — exactly where a
+      centred tracking loop lives — so D on the deadbanded error produces
+      phantom slope discontinuities at every band crossing. Omitting
+      ``derivative_error`` keeps the original single-error behaviour.
     - **First sample after a reset produces no D** (no meaningful slope yet).
     - **I has two guards**: the integral is clamped so its contribution
       ``|ki * integral|`` never exceeds ``integral_limit`` (rad/s), and it does
@@ -250,7 +275,10 @@ def yaw_pid_step(
 
     if kd > 0.0 and not first_sample:
         alpha = clamp(float(derivative_alpha), 1e-3, 1.0)
-        raw_derivative = (error - float(prev_error)) / dt
+        if derivative_error is not None:
+            raw_derivative = (float(derivative_error) - float(prev_derivative_error)) / dt
+        else:
+            raw_derivative = (error - float(prev_error)) / dt
         new_derivative = alpha * raw_derivative + (1.0 - alpha) * float(filtered_derivative)
     else:
         new_derivative = 0.0

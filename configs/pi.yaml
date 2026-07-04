@@ -267,6 +267,15 @@ target_state_estimator_node:
     reset_timeout_s: 4.0
     min_updates_for_valid: 8
     max_telemetry_age_s: 0.5
+    # Pair each detection with the drone pose AT ITS CAPTURE STAMP
+    # (interpolated from a short telemetry history) instead of the latest
+    # telemetry. The bearing is ~0.35 s old on arrival; projecting it with the
+    # CURRENT yaw leaks our own rotation into the target estimate and feeds
+    # back through the yaw FF — closed-loop model showed this was THE dominant
+    # cause of the side-to-side wobble at high LOS rate (peak-window error
+    # 0.41 -> 0.06 when fixed). Runtime-tunable for live A/B:
+    # ros2 param set /target_state_estimator_node pair_at_capture_stamp false
+    pair_at_capture_stamp: true
 
 control_node:
   ros__parameters:
@@ -275,23 +284,47 @@ control_node:
     control_command_topic: "/drone/control/command"
     mission_command_topic: "/drone/mission/command"
     autonomy_enabled: false
-    # Yaw tracking PID. gain_yaw is the P term (tuned 2026-07-03, see
-    # docs/pid_tuning_report.md). ki/kd default 0 = the flight-proven pure-P
-    # law; both are runtime-tunable (ros2 param set /control_node yaw_ki 0.1).
-    # ki trims the standing lag on a continuously moving target (start ~0.1,
-    # anti-windup + yaw_i_limit cap its authority); kd damps overshoot at
-    # high gain (start ~0.05 — D is low-pass filtered, yaw_d_lpf_alpha).
-    gain_yaw: 1.5
+    # ============================================================
+    # SITL CANDIDATE — NOT FLIGHT-VALIDATED. These yaw gains were tuned in
+    # PX4/Gazebo SITL only (2026-07-04). Do NOT treat them as hardware-proven.
+    # Before the first real flight, follow the bring-up in
+    # docs/controller_math_review.md §12: set log_yaw_terms:=true and start
+    # LOWER, roughly  gain_yaw 1.0 / yaw_kd 0.1 / yaw_ff_gain 0.4 , confirm the
+    # FF term shares the P term's sign on a moving off-centre target, then raise
+    # each toward the SITL candidate while watching the logged term breakdown
+    # (raw vs clamped command, achieved yaw rate, and whether D is signal or
+    # noise). Keep yaw_ki = 0. Real vision latency and yaw dynamics differ from
+    # SITL — expect to re-trim, especially yaw_ff_gain.
+    # ============================================================
+    # Yaw tracking law: PD(image error) + FF(KF LOS rate). Gains LIVE-TUNED in
+    # SITL 2026-07-04 (P->D->FF, staged; see docs/controller_math_review.md §11
+    # and the tuning artifact). All three gains are runtime-tunable
+    # (ros2 param set /control_node gain_yaw 2.0).
+    #   gain_yaw (P): 1.5->2.0. Pure-P sweep knee — lag falls to kp~2.0 then
+    #     flattens; kp=3.0 goes unstable (saturation, lock loss). 2.0 cut
+    #     steady mean|error_x| 0.13->0.094 with good margin.
+    #   yaw_kd (D): 0->0.3. Phase-lead margin through the ~0.5 s vision delay;
+    #     differentiates the RAW pre-deadband error (control_node passes it) so
+    #     damping stays alive inside the deadband. kd>=0.7 destabilises.
+    #   ki stays 0 — near==far tracking error (no standing bias) and FF carries
+    #     the rate, so I only adds phase lag. Enable only for a measured bias.
+    gain_yaw: 2.0
     yaw_ki: 0.0
-    yaw_kd: 0.0
+    yaw_kd: 0.3
     yaw_i_limit: 0.3       # max integral contribution, rad/s
     yaw_d_lpf_alpha: 0.35  # D low-pass blend (0,1]; 1 = raw derivative
-    # LOS-rate feed-forward: commands the rate the ball is moving at (from
-    # MEASURED telemetry yaw + camera bearing — never the command itself), so
-    # the drone aims at the ball's motion instead of trailing it. SITL A/B on
-    # the orbiting ball: mean|error_x| 0.105 -> 0.054 (-49%), peak 0.30 ->
-    # 0.15, zero added sign-flips. Structurally zero for a still target.
-    yaw_ff_gain: 1.0
+    # LOS-rate feed-forward: commands the rate the ball is moving at (from the
+    # capture-stamp-paired KF state — never the command itself), so the drone
+    # aims at the ball's motion instead of trailing it. Live SITL A/B:
+    # FF 0 -> 0.8 halves the steady error (0.088 -> 0.046). Gain 0.8 (not 1.0):
+    # at high LOS rate (near pass of a fast target) full FF OVER-DRIVES — its
+    # 1/r^2 LOS-rate spike stacks on P+D and pushes yaw into saturation
+    # (peak_err 0.55 @ff1.0 vs 0.30 @ff0.7 on a 10 s ball). 0.8 keeps nominal
+    # tracking optimal (mean 0.046, ties ff1.0) while trimming the over-drive.
+    # Drop toward 0.6 if operating at consistently high LOS rate; filtering the
+    # FF (yaw_ff_state_lpf_alpha) made it WORSE (adds phase lag, mistimes the
+    # spike) — reduce the gain instead. Structurally zero for a still target.
+    yaw_ff_gain: 0.8
     # 0.45 (was 0.25): the FF starts from ZERO at first lock and the low-pass
     # sets how fast it learns the ball's motion. 0.25 took ~0.5 s to warm up,
     # during which the drone lagged a moving ball right after acquisition.
@@ -303,6 +336,23 @@ control_node:
     # feedback crosses centre (measured: swing to +0.9 err). Gating it off when
     # off-centre lets the feedback+anti-swing own the reel-in. 0 disables.
     yaw_ff_align_error_limit: 0.6
+    # Optional flat zone of the FF gate: full FF for |error_x| <= inner, ramp
+    # only between inner and the limit (removes the gate's in-band modulation
+    # during steady tracking). 0 = original pure ramp. Offline A/B: NOT needed
+    # once pair_at_capture_stamp is on (the FF is clean); keep 0 in sim, it is
+    # a live knob for hardware where delays are larger.
+    yaw_ff_align_inner: 0.0
+    # Optional low-pass on the "state"-source FF (1.0 = off). The state LOS
+    # rate divides by range^2 — noisiest at a passing target's nearest point.
+    # Offline A/B: unnecessary with capture-stamp pairing (adds ~90 ms lag for
+    # no p2p gain); live knob if hardware FF looks jittery: try 0.35.
+    yaw_ff_state_lpf_alpha: 1.0
+    # Bring-up instrumentation (default OFF). true -> log the yaw-law term
+    # breakdown at ~2 Hz while tracking: P / D / FF / I terms, the braking cap,
+    # the raw (pre-limit) command, the clamped command actually sent, and the
+    # achieved yaw rate (differentiated telemetry). The §12 hardware checklist.
+    # Enable live: ros2 param set /control_node log_yaw_terms true
+    log_yaw_terms: false
     # "los_diff" = differentiate the measured LOS angle (carries ~0.5 s vision
     # latency); "state" = LOS rate from the target state estimator's predicted
     # state (latency-cancelled; falls back to los_diff when estimate invalid).

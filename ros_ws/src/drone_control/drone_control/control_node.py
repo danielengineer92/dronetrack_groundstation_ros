@@ -65,7 +65,8 @@ DYNAMIC_PARAMS = {
     "gain_forward", "gain_right", "gain_down", "gain_yaw",
     "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha",
     "yaw_ff_gain", "yaw_ff_lpf_alpha", "yaw_ff_limit", "yaw_ff_source",
-    "yaw_ff_align_error_limit",
+    "yaw_ff_align_error_limit", "yaw_ff_align_inner", "yaw_ff_state_lpf_alpha",
+    "log_yaw_terms",
     "yaw_approach_limit_enabled", "yaw_approach_delay_s",
     "yaw_approach_decel", "yaw_approach_min_rate", "camera_half_fov_rad",
     "approach_delay_s", "approach_decel", "approach_align_error_limit",
@@ -109,6 +110,28 @@ class ControlNode(Node):
         # so a fresh-lock/off-centre FF estimate (esp. the state KF's velocity
         # transient) cannot spike the yaw during acquisition. 0 disables the gate.
         self.declare_parameter("yaw_ff_align_error_limit", 0.6)
+        # Optional flat zone of the FF alignment gate: full FF (scale 1.0) for
+        # |error_x| <= inner, ramp only between inner and the limit. Removes the
+        # gate's in-band modulation during steady tracking (the sloped gate
+        # couples the error wobble into the FF as sign-switching extra gain).
+        # 0 = original pure ramp. Offline A/B on the orbiting ball showed the
+        # capture-stamp pairing fix makes this unnecessary in sim; kept as a
+        # live knob for hardware, where delays are larger.
+        self.declare_parameter("yaw_ff_align_inner", 0.0)
+        # Optional low-pass on the "state"-source FF (same blend the los_diff
+        # branch already has): 1.0 = off (current behaviour). The state LOS
+        # rate divides by range^2, so its noise blows up exactly at the
+        # nearest point of a passing target; a small filter (e.g. 0.35) trades
+        # ~90 ms of FF lag for a quieter rate command.
+        self.declare_parameter("yaw_ff_state_lpf_alpha", 1.0)
+        # Bring-up instrumentation (default OFF). When true, log the yaw-law
+        # term breakdown at ~2 Hz while tracking: P / D / FF terms, the capped
+        # centring command, the raw (pre-limit) command, the clamped command
+        # actually sent, and the achieved yaw rate (differentiated telemetry).
+        # For hardware first-flight: confirm the FF term has the SAME sign as
+        # the P term when the target is off-centre and moving, and watch whether
+        # the D term is doing useful work or just tracking sensor noise.
+        self.declare_parameter("log_yaw_terms", False)
         # FF source: "los_diff" differentiates the measured LOS angle (carries
         # the ~0.5 s vision latency); "state" computes the LOS rate
         # geometrically from the target state estimator's PREDICTED state
@@ -199,6 +222,9 @@ class ControlNode(Node):
         self.yaw_ff_lpf_alpha = float(self.get_parameter("yaw_ff_lpf_alpha").value)
         self.yaw_ff_limit = float(self.get_parameter("yaw_ff_limit").value)
         self.yaw_ff_align_error_limit = float(self.get_parameter("yaw_ff_align_error_limit").value)
+        self.yaw_ff_align_inner = float(self.get_parameter("yaw_ff_align_inner").value)
+        self.yaw_ff_state_lpf_alpha = float(self.get_parameter("yaw_ff_state_lpf_alpha").value)
+        self.log_yaw_terms = bool(self.get_parameter("log_yaw_terms").value)
         self.yaw_ff_source = str(self.get_parameter("yaw_ff_source").value)
         self.target_state_max_age_s = float(self.get_parameter("target_state_max_age_s").value)
         self.yaw_approach_limit_enabled = bool(self.get_parameter("yaw_approach_limit_enabled").value)
@@ -215,7 +241,11 @@ class ControlNode(Node):
         self._yaw_pid_integral = 0.0
         self._yaw_pid_derivative = 0.0
         self._yaw_pid_prev_error = 0.0
+        self._yaw_pid_prev_raw_error = 0.0
         self._yaw_pid_last_time = 0.0
+        self._yaw_terms = {}
+        self._log_prev_yaw = None
+        self._log_prev_yaw_t = 0.0
 
         self.deadband_x = float(self.get_parameter("deadband_x").value)
         self.deadband_y = float(self.get_parameter("deadband_y").value)
@@ -416,7 +446,8 @@ class ControlNode(Node):
                         reason=f"{param.name} must be >= 0",
                     )
 
-            if param.name in ("yaw_d_lpf_alpha", "yaw_ff_lpf_alpha"):
+            if param.name in ("yaw_d_lpf_alpha", "yaw_ff_lpf_alpha",
+                              "yaw_ff_state_lpf_alpha"):
                 if not 0.0 < float(param.value) <= 1.0:
                     return SetParametersResult(
                         successful=False,
@@ -430,7 +461,8 @@ class ControlNode(Node):
                         reason="yaw_ff_source must be 'los_diff' or 'state'",
                     )
 
-            if param.name in ("yaw_ff_gain", "yaw_ff_limit", "yaw_ff_align_error_limit"):
+            if param.name in ("yaw_ff_gain", "yaw_ff_limit", "yaw_ff_align_error_limit",
+                              "yaw_ff_align_inner"):
                 if float(param.value) < 0.0:
                     return SetParametersResult(
                         successful=False,
@@ -601,14 +633,22 @@ class ControlNode(Node):
         self._yaw_pid_integral = 0.0
         self._yaw_pid_derivative = 0.0
         self._yaw_pid_prev_error = 0.0
+        self._yaw_pid_prev_raw_error = 0.0
         self._yaw_pid_last_time = 0.0
         self._yaw_ff = 0.0
         self._yaw_ff_prev_los = 0.0
         self._yaw_ff_have_los = False
 
     def step_yaw_pid(self, error_x: float, current_time: float,
-                     bearing_x_rad: float = 0.0) -> float:
+                     bearing_x_rad: float = 0.0,
+                     raw_error_x: float | None = None) -> float:
         """Yaw PID on the deadbanded image error (gain_yaw = P term).
+
+        ``raw_error_x`` (pre-deadband) feeds the D term when provided: the
+        deadband rescale zeroes the slope inside the band and kinks it at the
+        boundary — exactly where a centred tracking loop lives — so D on the
+        deadbanded error would see phantom slope discontinuities at every
+        band crossing. P and I stay on the deadbanded error.
 
         State auto-resets after any interruption: if this was not called for
         a few control periods (target lost/stale, SCAN, IDLE, autonomy off),
@@ -632,6 +672,8 @@ class ControlNode(Node):
             output_limit=self.max_yaw_rate,
             integral_limit=self.yaw_i_limit,
             derivative_alpha=self.yaw_d_lpf_alpha,
+            derivative_error=raw_error_x,
+            prev_derivative_error=self._yaw_pid_prev_raw_error,
         )
         # Delay-aware approach limiter. Cap the CENTRING command (P+I+D) so a
         # far-off-bearing target is closed on without overshooting/swinging past
@@ -639,6 +681,11 @@ class ControlNode(Node):
         # but already-centred target is never strangled (its rate comes from FF,
         # not from a large centring error). Uses the true camera bearing when
         # available; falls back to error_x scaled by the nominal half-FOV.
+        # Per-term breakdown for bring-up logging (log_yaw_terms). P/I/D are the
+        # individual contributions BEFORE the braking cap clips their sum; FF is
+        # captured below as (raw - pid_capped).
+        pid_sum = output
+        cap_val = None
         if self.yaw_approach_limit_enabled:
             angle_rad = abs(float(bearing_x_rad))
             if angle_rad <= 1e-6:
@@ -650,7 +697,9 @@ class ControlNode(Node):
                 max_speed=self.max_yaw_rate,
                 min_speed=self.yaw_approach_min_rate,
             )
+            cap_val = cap
             output = self.clamp(output, -cap, cap)
+        pid_capped = output  # centring command after the cap, before FF is added
         # Feed-forward runs on MEASURED/estimated quantities only; the
         # command never feeds back into its own estimate.
         #
@@ -661,7 +710,9 @@ class ControlNode(Node):
         # as the feedback crosses centre, swinging past. So scale FF from 1 at
         # centre to 0 at |error_x| >= yaw_ff_align_error_limit; the feedback
         # (P+I+D + anti-swing cap) owns the reel-in, FF owns steady tracking.
-        ff_scale = alignment_scale(error_x=error_x, error_limit=self.yaw_ff_align_error_limit)
+        ff_scale = alignment_scale(error_x=error_x,
+                                   error_limit=self.yaw_ff_align_error_limit,
+                                   inner=self.yaw_ff_align_inner)
         if self.yaw_ff_gain > 0.0 and self.last_telemetry is not None:
             use_state = self.yaw_ff_source == "state" and self._target_state_usable()
             active = "state" if use_state else "los_diff"
@@ -679,7 +730,13 @@ class ControlNode(Node):
                     rel_velocity_north_m_s=float(ts.velocity_north) - float(tel.velocity_north),
                     rel_velocity_east_m_s=float(ts.velocity_east) - float(tel.velocity_east),
                 )
-                self._yaw_ff = self.clamp(ff, -self.yaw_ff_limit, self.yaw_ff_limit)
+                ff = self.clamp(ff, -self.yaw_ff_limit, self.yaw_ff_limit)
+                # Optional low-pass (yaw_ff_state_lpf_alpha < 1): the state
+                # LOS rate divides by range^2, so it is noisiest exactly at a
+                # passing target's nearest point. alpha=1.0 = original
+                # unfiltered behaviour.
+                a = self.clamp(self.yaw_ff_state_lpf_alpha, 1e-3, 1.0)
+                self._yaw_ff = a * ff + (1.0 - a) * self._yaw_ff
                 output += ff_scale * self.yaw_ff_gain * self._yaw_ff
                 # keep the los_diff state warm for a seamless fallback
                 self._yaw_ff_prev_los = float(tel.yaw) + float(bearing_x_rad)
@@ -702,8 +759,55 @@ class ControlNode(Node):
                 self._yaw_ff_prev_los = los
                 self._yaw_ff_have_los = True
         self._yaw_pid_prev_error = float(error_x)
+        if raw_error_x is not None:
+            self._yaw_pid_prev_raw_error = float(raw_error_x)
         self._yaw_pid_last_time = float(current_time)
+        # Term breakdown for the bring-up log (raw = pid_capped + FF).
+        self._yaw_terms = {
+            "p": self.gain_yaw * error_x,
+            "i": self.yaw_ki * self._yaw_pid_integral,
+            "d": self.yaw_kd * self._yaw_pid_derivative,
+            "pid": pid_sum,
+            "cap": cap_val,
+            "ff": output - pid_capped,
+            "raw": output,
+        }
         return output
+
+    def _log_yaw_terms(self, error_x: float, raw_yaw: float, clamped_yaw: float,
+                       current_time: float) -> None:
+        """Bring-up log: yaw-law term breakdown + achieved rate (~2 Hz).
+
+        Off unless ``log_yaw_terms`` is set. ``achieved`` is the yaw rate the
+        airframe actually reached, differentiated from telemetry yaw (there is
+        no telemetry yaw-rate field). Use it to (1) confirm the FF term shares
+        the P term's sign on a moving off-centre target, (2) judge whether the
+        D term is real signal or sensor noise, and (3) see how hard the limiter
+        is clipping (raw vs clamped)."""
+        if not self.log_yaw_terms:
+            return
+        t = self._yaw_terms
+        achieved = float("nan")
+        tel = self.last_telemetry
+        if tel is not None:
+            yaw = float(tel.yaw)
+            if self._log_prev_yaw is not None:
+                dt = current_time - self._log_prev_yaw_t
+                if dt > 1e-3:
+                    dyaw = math.atan2(math.sin(yaw - self._log_prev_yaw),
+                                      math.cos(yaw - self._log_prev_yaw))
+                    achieved = dyaw / dt
+            self._log_prev_yaw = yaw
+            self._log_prev_yaw_t = current_time
+        cap = t.get("cap")
+        cap_s = f"{cap:.3f}" if cap is not None else "off"
+        self.get_logger().info(
+            "YAWTERMS "
+            f"err={error_x:+.3f} | P={t.get('p', 0.0):+.3f} D={t.get('d', 0.0):+.3f} "
+            f"FF={t.get('ff', 0.0):+.3f} I={t.get('i', 0.0):+.3f} | cap={cap_s} "
+            f"raw={raw_yaw:+.3f} clamped={clamped_yaw:+.3f} achieved={achieved:+.3f} rad/s",
+            throttle_duration_sec=0.5,
+        )
 
     @staticmethod
     def apply_deadband(value: float, deadband: float) -> float:
@@ -1167,6 +1271,7 @@ class ControlNode(Node):
         desired_yaw = self.step_yaw_pid(
             error_x, current_time,
             bearing_x_rad=float(getattr(target, "bearing_x_rad", 0.0)),
+            raw_error_x=float(target.error_x),
         )
 
         if not (target.target_visible and target.tracking_state == "LOCKED"):
@@ -1215,6 +1320,7 @@ class ControlNode(Node):
         # No forward/right/down in this stage. APPROACH/ORBIT stay in the same
         # position-hold+yaw behavior until we add true NED waypoint math.
         _, _, _, yaw = self.limit_motion(0.0, 0.0, 0.0, desired_yaw)
+        self._log_yaw_terms(error_x, desired_yaw, yaw, current_time)
 
         if mission_mode not in ("TRACK_CENTER", "APPROACH_TARGET", "ORBIT_TARGET"):
             self.publish_position_hold(

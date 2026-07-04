@@ -255,6 +255,55 @@ def test_approach_cap_never_below_floor_when_angle_positive():
     assert c >= 0.15
 
 
+# ---- D on a separate (pre-deadband) error signal ------------------------
+
+def test_derivative_error_uses_raw_slope():
+    # P sees the deadbanded error; D differentiates the raw error.
+    out, _, d = _step(
+        0.0,                      # deadbanded error inside the band -> P = 0
+        kd=0.5, derivative_alpha=1.0,
+        derivative_error=0.04, prev_derivative_error=0.02,
+    )
+    expected_d = (0.04 - 0.02) / DT
+    assert math.isclose(d, expected_d), d
+    assert math.isclose(out, 0.5 * expected_d), out
+
+
+def test_derivative_error_omitted_reproduces_single_error_behavior():
+    a = _step(0.2, prev_error=0.1, kd=0.5, derivative_alpha=1.0)
+    b = _step(0.2, prev_error=0.1, kd=0.5, derivative_alpha=1.0,
+              derivative_error=None)
+    assert a == b
+
+
+def test_derivative_error_first_sample_no_d():
+    _, _, d = _step(0.1, first=True, kd=0.5,
+                    derivative_error=0.3, prev_derivative_error=0.0)
+    assert d == 0.0
+
+
+def test_derivative_error_alive_inside_deadband():
+    # The deadband zeroes the rescaled error for |raw| < band, so D computed
+    # on the deadbanded signal is BLIND to motion inside the band — exactly
+    # where a centred tracking loop lives. D fed from the raw error keeps
+    # damping there.
+    def db(v, band=0.05):
+        if abs(v) < band:
+            return 0.0
+        s = 1.0 if v > 0 else -1.0
+        return s * (abs(v) - band) / (1.0 - band)
+
+    raw_prev, raw_now = 0.02, 0.04     # moving within the band
+    assert db(raw_prev) == db(raw_now) == 0.0
+    _, _, d_raw = _step(db(raw_now), prev_error=db(raw_prev), kd=0.5,
+                        derivative_alpha=1.0,
+                        derivative_error=raw_now, prev_derivative_error=raw_prev)
+    _, _, d_db = _step(db(raw_now), prev_error=db(raw_prev), kd=0.5,
+                       derivative_alpha=1.0)
+    assert d_db == 0.0, d_db                                  # blind
+    assert math.isclose(d_raw, (raw_now - raw_prev) / DT)     # alive
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):
