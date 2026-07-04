@@ -178,6 +178,13 @@ autonomy_manager_node:
 
 mission_executor_node:
   ros__parameters:
+    # Orbit-ahead: lead the DO_ORBIT centre along the estimated target
+    # velocity by this many seconds (0 = centre on where the ball IS; only
+    # applies when the state estimate is valid, fresh, and moving).
+    orbit_lead_s: 0.0
+    orbit_lead_min_speed_m_s: 0.3
+    orbit_lead_max_state_age_s: 1.0
+    target_state_topic: "/drone/tracking/target_state"
     mission_enabled: true
     auto_start: false
     mission_request_topic: "/drone/mission/request"
@@ -224,8 +231,10 @@ target_state_estimator_node:
     target_state_topic: "/drone/tracking/target_state"
     publish_rate_hz: 10.0
     # CV-Kalman process noise: how hard the target may maneuver (m^2/s^3).
-    # 0.3 tracks the sim ball's orbit accel (~0.3 m/s^2); raise for agile
-    # targets (faster response, noisier velocity).
+    # Swept 0.1/0.3/1.0/3.0 against gz truth (2026-07-04, see
+    # docs/target_state_estimator.md): 0.3 gives prediction error within 4%
+    # of best AND the only healthy NIS (1.71 ~ 2.0) -> trustworthy std-devs.
+    # Runtime-tunable; watch avg_nis in the node log when changing.
     accel_noise_density: 0.3
     # Measurement noise model: cross-range from bearing (~0.23 deg), radial
     # from monocular k/diam (a fixed pixel jitter is a fixed FRACTION of
@@ -265,6 +274,12 @@ control_node:
     yaw_ff_gain: 1.0
     yaw_ff_lpf_alpha: 0.25  # LOS-rate low-pass (vision + 10 Hz yaw jitter)
     yaw_ff_limit: 1.5       # rad/s cap on the feed-forward term
+    # "los_diff" = differentiate the measured LOS angle (carries ~0.5 s vision
+    # latency); "state" = LOS rate from the target state estimator's predicted
+    # state (latency-cancelled; falls back to los_diff when estimate invalid).
+    yaw_ff_source: "los_diff"
+    target_state_topic: "/drone/tracking/target_state"
+    target_state_max_age_s: 1.0
     gain_down: 0.3
     gain_forward: 1.0
     gain_right: 1.0

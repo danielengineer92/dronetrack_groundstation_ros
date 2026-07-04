@@ -87,6 +87,12 @@ class ConstantVelocityKF:
         self.P = np.eye(4)
         self.initialized = False
         self.updates = 0
+        #: NIS (normalized innovation squared) of the last update attempt —
+        #: the standard KF consistency metric. For a healthy 2-DOF filter its
+        #: AVERAGE is ~2.0: persistently higher = filter overconfident
+        #: (R and/or q too small), lower = underconfident. Usable on real
+        #: hardware where no ground truth exists.
+        self.last_nis = 0.0
 
     def reset(self, north_m: float, east_m: float) -> None:
         self.x = np.array([float(north_m), float(east_m), 0.0, 0.0])
@@ -124,7 +130,8 @@ class ConstantVelocityKF:
         innov = z - H @ self.x
         S = H @ self.P @ H.T + R
         S_inv = np.linalg.inv(S)
-        if float(innov @ S_inv @ innov) > self.GATE:
+        self.last_nis = float(innov @ S_inv @ innov)
+        if self.last_nis > self.GATE:
             return False  # outlier (bbox glitch, misdetection) — coast instead
         K = self.P @ H.T @ S_inv
         self.x = self.x + K @ innov

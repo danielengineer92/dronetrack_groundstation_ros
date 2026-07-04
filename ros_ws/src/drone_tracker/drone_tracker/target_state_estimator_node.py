@@ -19,6 +19,7 @@ import time
 from typing import Optional
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -72,6 +73,10 @@ class TargetStateEstimatorNode(Node):
         self.meas_count = 0
         self.gated_count = 0
         self.skipped_no_pose = 0
+        # Rolling NIS window (~20 s at 15 Hz) for the consistency metric.
+        self._nis_window: list[float] = []
+
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST, depth=5)
@@ -127,11 +132,40 @@ class TargetStateEstimatorNode(Node):
             self.kf.initialized = False  # long gap: stale kinematics, restart
 
         self._advance(now)
-        if self.kf.update(north, east, R):
+        accepted = self.kf.update(north, east, R)
+        self._nis_window.append(self.kf.last_nis)
+        if len(self._nis_window) > 300:
+            self._nis_window.pop(0)
+        if accepted:
             self.last_meas_time = now
             self.meas_count += 1
         else:
             self.gated_count += 1
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """Runtime tuning: accel_noise_density (q) and the noise model, so
+        sweeps don't need node restarts (params are otherwise cached at init —
+        the same foot-gun the tracker intrinsics had)."""
+        for p in params:
+            if p.name == "accel_noise_density":
+                if float(p.value) <= 0.0:
+                    return SetParametersResult(successful=False,
+                                               reason="accel_noise_density must be > 0")
+                self.kf.q = float(p.value)
+                self._nis_window.clear()
+                self.get_logger().info(f"accel_noise_density -> {self.kf.q}")
+            elif p.name in ("sigma_bearing_rad", "sigma_range_fraction",
+                            "sigma_range_floor_m", "prediction_horizon_s"):
+                if float(p.value) <= 0.0:
+                    return SetParametersResult(successful=False,
+                                               reason=f"{p.name} must be > 0")
+                attr = {"sigma_bearing_rad": "sigma_bearing",
+                        "sigma_range_fraction": "sigma_range_frac",
+                        "sigma_range_floor_m": "sigma_range_floor",
+                        "prediction_horizon_s": "pred_horizon"}[p.name]
+                setattr(self, attr, float(p.value))
+                self._nis_window.clear()
+        return SetParametersResult(successful=True)
 
     # -- filter time base --------------------------------------------------
 
@@ -174,7 +208,10 @@ class TargetStateEstimatorNode(Node):
             f"speed={self.kf.speed():.2f} m/s, "
             f"heading={math.degrees(self.kf.heading_rad()):.0f} deg, "
             f"pos_std={self.kf.position_std_m():.2f} m, "
-            f"vel_std={self.kf.velocity_std_m_s():.2f} m/s"
+            f"vel_std={self.kf.velocity_std_m_s():.2f} m/s, "
+            f"avg_nis={sum(self._nis_window)/max(len(self._nis_window),1):.2f} "
+            f"(healthy~2.0), gated_pct="
+            f"{100.0*self.gated_count/max(self.meas_count+self.gated_count,1):.1f}%"
         )
 
 

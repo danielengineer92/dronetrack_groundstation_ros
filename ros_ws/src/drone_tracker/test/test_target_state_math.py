@@ -128,6 +128,36 @@ def test_covariance_shrinks_with_updates():
     assert kf.velocity_std_m_s() < v0 / 5
 
 
+def test_nis_averages_two_for_consistent_filter():
+    # Feed white noise matched to R: NIS must average ~2 (2-DOF chi-square).
+    kf = ConstantVelocityKF(accel_noise_density=0.3)
+    rng = np.random.default_rng(3)
+    sigma = 0.05
+    R = np.diag([sigma**2, sigma**2])
+    nis = []
+    for k in range(400):
+        kf.predict(1 / 15)
+        kf.update(rng.normal(0, sigma), rng.normal(0, sigma), R)
+        if k > 30:
+            nis.append(kf.last_nis)
+    avg = sum(nis) / len(nis)
+    assert 1.4 < avg < 2.6, avg
+
+
+def test_nis_inflates_when_overconfident():
+    # Claim 10x less noise than reality: NIS average must blow past 2.
+    kf = ConstantVelocityKF(accel_noise_density=0.3)
+    rng = np.random.default_rng(4)
+    R = np.diag([0.005**2, 0.005**2])   # claimed
+    nis = []
+    for k in range(400):
+        kf.predict(1 / 15)
+        kf.update(rng.normal(0, 0.05), rng.normal(0, 0.05), R)  # actual 10x
+        if k > 30:
+            nis.append(kf.last_nis)
+    assert sum(nis) / len(nis) > 4.0
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

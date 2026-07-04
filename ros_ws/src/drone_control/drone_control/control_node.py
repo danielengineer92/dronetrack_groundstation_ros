@@ -29,10 +29,11 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 
-from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError
+from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError, TargetState
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
 from drone_control.control_math import (
     approach_forward_velocity,
+    los_rate_from_state,
     yaw_feedforward_step,
     yaw_pid_step,
 )
@@ -61,7 +62,7 @@ DYNAMIC_PARAMS = {
     "autonomy_enabled", "autonomous_enabled",
     "gain_forward", "gain_right", "gain_down", "gain_yaw",
     "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha",
-    "yaw_ff_gain", "yaw_ff_lpf_alpha", "yaw_ff_limit",
+    "yaw_ff_gain", "yaw_ff_lpf_alpha", "yaw_ff_limit", "yaw_ff_source",
     "deadband_x", "deadband_y",
     "max_velocity_forward", "max_velocity_right", "max_velocity_down", "max_yaw_rate",
     "max_accel_forward", "max_accel_right", "max_accel_down", "max_yaw_accel",
@@ -97,6 +98,14 @@ class ControlNode(Node):
         self.declare_parameter("yaw_ff_gain", 0.0)
         self.declare_parameter("yaw_ff_lpf_alpha", 0.25)  # LOS-rate low-pass
         self.declare_parameter("yaw_ff_limit", 1.5)       # rad/s cap on the FF term
+        # FF source: "los_diff" differentiates the measured LOS angle (carries
+        # the ~0.5 s vision latency); "state" computes the LOS rate
+        # geometrically from the target state estimator's PREDICTED state
+        # (latency-cancelled), falling back to los_diff when the estimate is
+        # invalid/stale.
+        self.declare_parameter("yaw_ff_source", "los_diff")
+        self.declare_parameter("target_state_topic", "/drone/tracking/target_state")
+        self.declare_parameter("target_state_max_age_s", 1.0)
 
         self.declare_parameter("deadband_x", 0.05)
         self.declare_parameter("deadband_y", 0.05)
@@ -153,6 +162,10 @@ class ControlNode(Node):
         self.yaw_ff_gain = float(self.get_parameter("yaw_ff_gain").value)
         self.yaw_ff_lpf_alpha = float(self.get_parameter("yaw_ff_lpf_alpha").value)
         self.yaw_ff_limit = float(self.get_parameter("yaw_ff_limit").value)
+        self.yaw_ff_source = str(self.get_parameter("yaw_ff_source").value)
+        self.target_state_max_age_s = float(self.get_parameter("target_state_max_age_s").value)
+        self.last_target_state: Optional[TargetState] = None
+        self.last_target_state_time = 0.0
         self._yaw_ff = 0.0
         self._yaw_ff_prev_los = 0.0
         self._yaw_ff_have_los = False
@@ -250,6 +263,11 @@ class ControlNode(Node):
             self.telemetry_callback,
             qos,
         )
+        self.target_state_sub = self.create_subscription(
+            TargetState, str(self.get_parameter("target_state_topic").value),
+            self.on_target_state,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       history=HistoryPolicy.KEEP_LAST, depth=5))
 
         self.autonomy_sub = self.create_subscription(
             Bool,
@@ -360,6 +378,13 @@ class ControlNode(Node):
                         reason=f"{param.name} must be in (0, 1]",
                     )
 
+            if param.name == "yaw_ff_source":
+                if str(param.value) not in ("los_diff", "state"):
+                    return SetParametersResult(
+                        successful=False,
+                        reason="yaw_ff_source must be 'los_diff' or 'state'",
+                    )
+
             if param.name in ("yaw_ff_gain", "yaw_ff_limit"):
                 if float(param.value) < 0.0:
                     return SetParametersResult(
@@ -400,7 +425,7 @@ class ControlNode(Node):
 
             if param.name in ("gain_yaw", "yaw_ki", "yaw_kd", "yaw_i_limit",
                               "yaw_d_lpf_alpha", "yaw_ff_gain", "yaw_ff_lpf_alpha",
-                              "yaw_ff_limit"):
+                              "yaw_ff_limit", "yaw_ff_source"):
                 self._reset_yaw_pid()
 
         return SetParametersResult(successful=True)
@@ -498,6 +523,19 @@ class ControlNode(Node):
             summary=f"messages={self.telemetry_count}, connected={msg.connected}, battery={msg.battery_remaining_percent:.1f}%",
         )
 
+    def on_target_state(self, msg: TargetState) -> None:
+        self.last_target_state = msg
+        self.last_target_state_time = time.monotonic()
+
+    def _target_state_usable(self) -> bool:
+        return (
+            self.last_target_state is not None
+            and self.last_target_state.valid
+            and time.monotonic() - self.last_target_state_time <= self.target_state_max_age_s
+            and self.last_telemetry is not None
+            and bool(getattr(self.last_telemetry, "local_position_valid", False))
+        )
+
     def _reset_yaw_pid(self) -> None:
         self._yaw_pid_integral = 0.0
         self._yaw_pid_derivative = 0.0
@@ -534,25 +572,47 @@ class ControlNode(Node):
             integral_limit=self.yaw_i_limit,
             derivative_alpha=self.yaw_d_lpf_alpha,
         )
-        # Feed-forward runs on MEASURED quantities only (telemetry yaw +
-        # camera bearing = inertial LOS angle); the command never feeds back.
+        # Feed-forward runs on MEASURED/estimated quantities only; the
+        # command never feeds back into its own estimate.
         if self.yaw_ff_gain > 0.0 and self.last_telemetry is not None:
-            los = float(self.last_telemetry.yaw) + float(bearing_x_rad)
-            if not self._yaw_ff_have_los or first_sample:
-                self._yaw_ff = 0.0
-            else:
-                self._yaw_ff = yaw_feedforward_step(
-                    los_angle_rad=los,
-                    prev_los_angle_rad=self._yaw_ff_prev_los,
-                    dt=self.control_period,
-                    prev_ff_rad_s=self._yaw_ff,
-                    first_sample=False,
-                    lpf_alpha=self.yaw_ff_lpf_alpha,
-                    limit_rad_s=self.yaw_ff_limit,
+            use_state = self.yaw_ff_source == "state" and self._target_state_usable()
+            active = "state" if use_state else "los_diff"
+            if active != getattr(self, "_ff_active_source", None):
+                self._ff_active_source = active
+                self.get_logger().info(f"Yaw FF source active: {active}")
+            if use_state:
+                # Latency-cancelled: LOS rate from the estimator's PREDICTED
+                # relative state (KF already smooths; clamp only).
+                ts = self.last_target_state
+                tel = self.last_telemetry
+                ff = los_rate_from_state(
+                    rel_north_m=float(ts.predicted_north) - float(tel.local_position_north),
+                    rel_east_m=float(ts.predicted_east) - float(tel.local_position_east),
+                    rel_velocity_north_m_s=float(ts.velocity_north) - float(tel.velocity_north),
+                    rel_velocity_east_m_s=float(ts.velocity_east) - float(tel.velocity_east),
                 )
+                self._yaw_ff = self.clamp(ff, -self.yaw_ff_limit, self.yaw_ff_limit)
                 output += self.yaw_ff_gain * self._yaw_ff
-            self._yaw_ff_prev_los = los
-            self._yaw_ff_have_los = True
+                # keep the los_diff state warm for a seamless fallback
+                self._yaw_ff_prev_los = float(tel.yaw) + float(bearing_x_rad)
+                self._yaw_ff_have_los = True
+            else:
+                los = float(self.last_telemetry.yaw) + float(bearing_x_rad)
+                if not self._yaw_ff_have_los or first_sample:
+                    self._yaw_ff = 0.0
+                else:
+                    self._yaw_ff = yaw_feedforward_step(
+                        los_angle_rad=los,
+                        prev_los_angle_rad=self._yaw_ff_prev_los,
+                        dt=self.control_period,
+                        prev_ff_rad_s=self._yaw_ff,
+                        first_sample=False,
+                        lpf_alpha=self.yaw_ff_lpf_alpha,
+                        limit_rad_s=self.yaw_ff_limit,
+                    )
+                    output += self.yaw_ff_gain * self._yaw_ff
+                self._yaw_ff_prev_los = los
+                self._yaw_ff_have_los = True
         self._yaw_pid_prev_error = float(error_x)
         self._yaw_pid_last_time = float(current_time)
         return output

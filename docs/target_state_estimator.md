@@ -52,9 +52,48 @@ transient after the ball teleports to the leg start.
   calibration (`scripts/calibrate_distance.py`) is re-fit, revisit.
 - `prediction_horizon_s` (0.5): lead time for the predicted position.
 
-## Consumers (future)
+## Tuning (2026-07-04)
 
-Nothing consumes `/drone/tracking/target_state` yet. Natural next steps:
-orbit-ahead-of-target in the mission executor, and feeding the yaw
-feed-forward from the prediction to cancel the ~0.5 s pipeline latency
-(the residual 0.054 error in pid_tuning_report.md Update 3).
+Knobs, the variables tracked while tuning, and the measured sweep.
+
+**Tracked variables** — vs gz truth (sim): prediction-error-at-horizon
+|p̂(t+h) − p_true(t+h)| (the deliverable metric), speed/heading error;
+filter-internal (works on hardware, no truth needed): **avg NIS** (normalized
+innovation squared, logged by the node every 10 s — healthy ≈ 2.0 for 2-DOF;
+higher = overconfident, lower = underconfident) and **gated %** (target <3%).
+`accel_noise_density` and the sigma params are runtime-settable
+(`ros2 param set /target_state_estimator_node ...`) for live sweeps.
+
+q sweep on the orbiting ball (40 s each, prediction horizon 0.5 s):
+
+| q | pred@h err (m) | no-lead err (m) | avg NIS | gated % | still→circle recovery |
+|---|---|---|---|---|---|
+| 0.1 | 0.546 | 0.654 | 0.52 | 2.6 | 1.0 s |
+| **0.3** | **0.483** | 0.626 | **1.71** | 2.6 | 0.5 s |
+| 1.0 | 0.466 | 0.607 | 0.47 | 2.3 | 0.2 s |
+| 3.0 | 0.485 | 0.625 | 1.40 | 2.3 | 0.1 s |
+
+**q = 0.3 is the tuned choice**: prediction error within 4 % of best while the
+only NIS in the healthy band (1.71 ≈ 2) — q=1.0 predicts marginally better but
+is badly underconfident (NIS 0.47), making the published std-devs untrustworthy.
+`sigma_range_fraction: 0.08` is corroborated by the k-fit spread (±10 % over
+19 ground-truth samples) and the near-2 NIS.
+
+## Consumers (validated 2026-07-04)
+
+- **State-fed yaw feed-forward** (`yaw_ff_source: state` in control_node):
+  LOS rate computed geometrically from the predicted relative state
+  (`los_rate_from_state` in control_math.py) instead of differentiating the
+  delayed camera angle. Measured **parity** with `los_diff` (mean|e| 0.053 vs
+  0.056) — on curved motion the KF velocity carries similar lag to the
+  los-diff low-pass, so latency cancellation nets out. Default stays
+  `los_diff`; the state source remains available.
+- **Orbit-ahead** (`orbit_lead_s` in mission_executor, default 0 = off):
+  leads the DO_ORBIT centre by `velocity × lead`. Validated live
+  (orbit_lead_s=2.0, 17 samples): |lead| = 85 % ± 19 % of the ball's true 2 s
+  displacement, lead direction rotating at the orbit rate (−0.341 vs ±0.314
+  rad/s expected, sign per the det=−1 frame map). PX4 flew the led orbit to
+  completion.
+- **QoS trap (bit us once):** the estimator publishes BEST_EFFORT; any
+  subscriber left at default RELIABLE QoS silently receives NOTHING. Both
+  consumers subscribe BEST_EFFORT — do the same in new consumers.

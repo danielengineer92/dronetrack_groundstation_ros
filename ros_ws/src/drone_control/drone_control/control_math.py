@@ -55,10 +55,17 @@ def project_target_global(
     north_m = horizontal_m * math.cos(global_bearing)
     east_m = horizontal_m * math.sin(global_bearing)
 
+    return offset_global(lat_deg, lon_deg, north_m, east_m)
+
+
+def offset_global(
+    lat_deg: float, lon_deg: float, north_m: float, east_m: float
+) -> tuple[float, float]:
+    """Offset a global (lat, lon) by metres north/east (equirectangular)."""
     lat_rad = math.radians(float(lat_deg))
-    out_lat = float(lat_deg) + math.degrees(north_m / _EARTH_RADIUS_M)
+    out_lat = float(lat_deg) + math.degrees(float(north_m) / _EARTH_RADIUS_M)
     out_lon = float(lon_deg) + math.degrees(
-        east_m / (_EARTH_RADIUS_M * max(math.cos(lat_rad), 1e-6))
+        float(east_m) / (_EARTH_RADIUS_M * max(math.cos(lat_rad), 1e-6))
     )
     return out_lat, out_lon
 
@@ -214,3 +221,32 @@ def yaw_feedforward_step(
     ff = alpha * raw + (1.0 - alpha) * float(prev_ff_rad_s)
     lim = abs(float(limit_rad_s))
     return clamp(ff, -lim, lim)
+
+
+def los_rate_from_state(
+    *,
+    rel_north_m: float,
+    rel_east_m: float,
+    rel_velocity_north_m_s: float,
+    rel_velocity_east_m_s: float,
+    min_range_m: float = 0.5,
+) -> float:
+    """Inertial LOS rate (rad/s, NED +CW) from relative position & velocity.
+
+    For target at r = (rN, rE) relative to us, moving at relative velocity
+    v = (vN, vE), the bearing lambda = atan2(rE, rN) rotates at
+
+        d(lambda)/dt = (rN*vE - rE*vN) / |r|^2
+
+    (the 2D cross product picks the tangential velocity component; radial
+    motion contributes nothing). This replaces differentiating the delayed
+    camera angle: fed from the target state estimator's PREDICTED state, the
+    feed-forward carries no vision-pipeline latency. Returns 0 inside
+    ``min_range_m`` (the rate blows up as 1/r at point-blank range and the
+    estimate is least reliable exactly there).
+    """
+    rn, re = float(rel_north_m), float(rel_east_m)
+    r2 = rn * rn + re * re
+    if r2 < float(min_range_m) ** 2:
+        return 0.0
+    return (rn * float(rel_velocity_east_m_s) - re * float(rel_velocity_north_m_s)) / r2

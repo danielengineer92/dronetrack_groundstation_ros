@@ -147,6 +147,51 @@ def test_ff_clamped():
     assert ff == 1.5
 
 
+try:
+    from drone_control.control_math import los_rate_from_state
+except ImportError:  # pragma: no cover
+    from drone_control.control_math import los_rate_from_state  # noqa: F401
+
+
+def _los(**kw):
+    base = dict(rel_north_m=5.0, rel_east_m=0.0,
+                rel_velocity_north_m_s=0.0, rel_velocity_east_m_s=0.0)
+    base.update(kw)
+    return los_rate_from_state(**base)
+
+
+def test_los_rate_still_target_zero():
+    assert _los() == 0.0
+
+
+def test_los_rate_crossing_target_positive_cw():
+    # Target 5 m north, moving east at 1 m/s: LOS rotates toward east,
+    # NED yaw is +CW toward east -> positive rate, magnitude v/r.
+    assert math.isclose(_los(rel_velocity_east_m_s=1.0), 1.0 / 5.0)
+
+
+def test_los_rate_crossing_west_negative():
+    assert math.isclose(_los(rel_velocity_east_m_s=-1.0), -0.2)
+
+
+def test_los_rate_radial_motion_zero():
+    # Straight at us: bearing unchanged.
+    assert _los(rel_velocity_north_m_s=-2.0) == 0.0
+
+
+def test_los_rate_point_blank_guard():
+    assert _los(rel_north_m=0.2, rel_velocity_east_m_s=5.0) == 0.0
+
+
+def test_los_rate_general_geometry():
+    # Target due east 4 m, moving north 0.8: lambda=atan2(rE,rN)=90deg,
+    # moving north swings LOS back toward north = CCW = negative.
+    r = los_rate_from_state(rel_north_m=0.0, rel_east_m=4.0,
+                            rel_velocity_north_m_s=0.8,
+                            rel_velocity_east_m_s=0.0)
+    assert math.isclose(r, -0.8 / 4.0), r
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

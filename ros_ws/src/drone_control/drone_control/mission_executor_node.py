@@ -36,9 +36,9 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
-from drone_interfaces.msg import DroneTelemetry, MavsdkActionCommand, MissionCommand, TargetError
+from drone_interfaces.msg import DroneTelemetry, MavsdkActionCommand, MissionCommand, TargetError, TargetState
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
-from drone_control.control_math import project_target_global
+from drone_control.control_math import offset_global, project_target_global
 from drone_control.mission_plan import (
     MissionPlan,
     MissionPlanError,
@@ -154,6 +154,14 @@ class MissionExecutorNode(Node):
         self.declare_parameter("use_mavsdk_do_orbit", True)
         self.declare_parameter("require_distance_for_orbit", True)
         self.declare_parameter("require_target_centered_for_orbit", True)
+        # Orbit-ahead: lead the orbit centre along the target state estimator's
+        # velocity by this many seconds (0 = off, centre on where the ball IS).
+        # Only applies when the estimate is valid, fresh, and the target is
+        # actually moving (orbit_lead_min_speed_m_s).
+        self.declare_parameter("orbit_lead_s", 0.0)
+        self.declare_parameter("orbit_lead_min_speed_m_s", 0.3)
+        self.declare_parameter("orbit_lead_max_state_age_s", 1.0)
+        self.declare_parameter("target_state_topic", "/drone/tracking/target_state")
         self.declare_parameter("center_error_threshold", 0.15)
         self.declare_parameter("event_log_enabled", True)
         self.declare_parameter("event_log_directory", "~/drone_mission_logs")
@@ -248,6 +256,12 @@ class MissionExecutorNode(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=5)
         self.request_sub = self.create_subscription(Bool, self.mission_request_topic, self.mission_request_callback, qos)
         self.target_sub = self.create_subscription(TargetError, self.target_error_topic, self.target_callback, qos)
+
+        self.create_subscription(
+            TargetState, str(self.get_parameter("target_state_topic").value),
+            self.on_target_state,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       history=HistoryPolicy.KEEP_LAST, depth=5))
         self.telemetry_sub = self.create_subscription(DroneTelemetry, self.telemetry_topic, self.telemetry_callback, qos)
         self.plan_ack_pub = None
         self.plan_sub = None
@@ -758,7 +772,29 @@ class MissionExecutorNode(Node):
             bearing_y_rad=bearing_y,
             slant_distance_m=distance_m,
         )
+        # Orbit-ahead: shift the centre to where the ball will be. Read at
+        # call time so `ros2 param set` works without a reconfigure callback.
+        lead_s = float(self.get_parameter("orbit_lead_s").value)
+        if lead_s > 0.0:
+            ts = getattr(self, "last_target_state", None)
+            min_speed = float(self.get_parameter("orbit_lead_min_speed_m_s").value)
+            max_age = float(self.get_parameter("orbit_lead_max_state_age_s").value)
+            fresh = (ts is not None and ts.valid
+                     and time.monotonic() - getattr(self, "last_target_state_time", 0.0) <= max_age)
+            if fresh and float(ts.speed) >= min_speed:
+                north_lead = float(ts.velocity_north) * lead_s
+                east_lead = float(ts.velocity_east) * lead_s
+                out_lat, out_lon = offset_global(out_lat, out_lon, north_lead, east_lead)
+                self.get_logger().info(
+                    f"Orbit-ahead: leading centre by {lead_s:.1f}s x "
+                    f"({ts.velocity_north:+.2f}, {ts.velocity_east:+.2f}) m/s "
+                    f"= ({north_lead:+.2f} N, {east_lead:+.2f} E) m"
+                )
         return out_lat, out_lon, alt
+
+    def on_target_state(self, msg: TargetState) -> None:
+        self.last_target_state = msg
+        self.last_target_state_time = time.monotonic()
 
     def publish_state(self, detail: str) -> None:
         msg = String()
