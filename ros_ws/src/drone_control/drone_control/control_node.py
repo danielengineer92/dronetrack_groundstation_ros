@@ -31,7 +31,7 @@ from std_msgs.msg import Bool
 
 from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
-from drone_control.control_math import approach_forward_velocity
+from drone_control.control_math import approach_forward_velocity, yaw_pid_step
 
 
 CMD_IDLE = "IDLE"
@@ -56,6 +56,7 @@ STATUS_BLOCKED_NO_LOCAL_POSITION = "BLOCKED_NO_LOCAL_POSITION"
 DYNAMIC_PARAMS = {
     "autonomy_enabled", "autonomous_enabled",
     "gain_forward", "gain_right", "gain_down", "gain_yaw",
+    "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha",
     "deadband_x", "deadband_y",
     "max_velocity_forward", "max_velocity_right", "max_velocity_down", "max_yaw_rate",
     "max_accel_forward", "max_accel_right", "max_accel_down", "max_yaw_accel",
@@ -79,6 +80,12 @@ class ControlNode(Node):
         self.declare_parameter("gain_right", 1.0)    # reserved; strafe disabled for now
         self.declare_parameter("gain_down", 0.5)
         self.declare_parameter("gain_yaw", 0.8)
+        # Yaw PID extras (gain_yaw is the P term). Defaults keep the
+        # controller pure-P; tune live: ros2 param set /control_node yaw_ki 0.1
+        self.declare_parameter("yaw_ki", 0.0)
+        self.declare_parameter("yaw_kd", 0.0)
+        self.declare_parameter("yaw_i_limit", 0.3)      # max |I| contribution, rad/s
+        self.declare_parameter("yaw_d_lpf_alpha", 0.35)  # D low-pass, (0,1], 1=raw
 
         self.declare_parameter("deadband_x", 0.05)
         self.declare_parameter("deadband_y", 0.05)
@@ -128,6 +135,15 @@ class ControlNode(Node):
         self.gain_right = float(self.get_parameter("gain_right").value)
         self.gain_down = float(self.get_parameter("gain_down").value)
         self.gain_yaw = float(self.get_parameter("gain_yaw").value)
+        self.yaw_ki = float(self.get_parameter("yaw_ki").value)
+        self.yaw_kd = float(self.get_parameter("yaw_kd").value)
+        self.yaw_i_limit = float(self.get_parameter("yaw_i_limit").value)
+        self.yaw_d_lpf_alpha = float(self.get_parameter("yaw_d_lpf_alpha").value)
+        # Yaw PID state (owned here; yaw_pid_step is pure).
+        self._yaw_pid_integral = 0.0
+        self._yaw_pid_derivative = 0.0
+        self._yaw_pid_prev_error = 0.0
+        self._yaw_pid_last_time = 0.0
 
         self.deadband_x = float(self.get_parameter("deadband_x").value)
         self.deadband_y = float(self.get_parameter("deadband_y").value)
@@ -313,6 +329,20 @@ class ControlNode(Node):
                         reason=f"{param.name} must be in [0, 1)",
                     )
 
+            if param.name in ("yaw_ki", "yaw_kd", "yaw_i_limit"):
+                if float(param.value) < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{param.name} must be >= 0",
+                    )
+
+            if param.name == "yaw_d_lpf_alpha":
+                if not 0.0 < float(param.value) <= 1.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="yaw_d_lpf_alpha must be in (0, 1]",
+                    )
+
             if param.name.startswith(("max_", "min_")):
                 if float(param.value) < 0.0:
                     return SetParametersResult(
@@ -343,6 +373,9 @@ class ControlNode(Node):
 
             if param.name in ("autonomy_enabled", "autonomous_enabled"):
                 self.set_autonomy_enabled(bool(param.value), source=f"parameter:{param.name}")
+
+            if param.name in ("gain_yaw", "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha"):
+                self._reset_yaw_pid()
 
         return SetParametersResult(successful=True)
 
@@ -438,6 +471,42 @@ class ControlNode(Node):
             self.telemetry_topic,
             summary=f"messages={self.telemetry_count}, connected={msg.connected}, battery={msg.battery_remaining_percent:.1f}%",
         )
+
+    def _reset_yaw_pid(self) -> None:
+        self._yaw_pid_integral = 0.0
+        self._yaw_pid_derivative = 0.0
+        self._yaw_pid_prev_error = 0.0
+        self._yaw_pid_last_time = 0.0
+
+    def step_yaw_pid(self, error_x: float, current_time: float) -> float:
+        """Yaw PID on the deadbanded image error (gain_yaw = P term).
+
+        State auto-resets after any interruption: if this was not called for
+        a few control periods (target lost/stale, SCAN, IDLE, autonomy off),
+        the integral and derivative history are meaningless — start fresh.
+        """
+        gap = current_time - self._yaw_pid_last_time
+        first_sample = self._yaw_pid_last_time <= 0.0 or gap > 3.0 * self.control_period
+        if first_sample:
+            self._reset_yaw_pid()
+
+        output, self._yaw_pid_integral, self._yaw_pid_derivative = yaw_pid_step(
+            error=error_x,
+            dt=self.control_period,
+            kp=self.gain_yaw,
+            ki=self.yaw_ki,
+            kd=self.yaw_kd,
+            integral=self._yaw_pid_integral,
+            filtered_derivative=self._yaw_pid_derivative,
+            prev_error=self._yaw_pid_prev_error,
+            first_sample=first_sample,
+            output_limit=self.max_yaw_rate,
+            integral_limit=self.yaw_i_limit,
+            derivative_alpha=self.yaw_d_lpf_alpha,
+        )
+        self._yaw_pid_prev_error = float(error_x)
+        self._yaw_pid_last_time = float(current_time)
+        return output
 
     @staticmethod
     def apply_deadband(value: float, deadband: float) -> float:
@@ -898,7 +967,7 @@ class ControlNode(Node):
 
         target = self.last_target_error
         error_x = self.apply_deadband(float(target.error_x), self.deadband_x)
-        desired_yaw = error_x * self.gain_yaw
+        desired_yaw = self.step_yaw_pid(error_x, current_time)
 
         if not (target.target_visible and target.tracking_state == "LOCKED"):
             self.publish_position_hold(

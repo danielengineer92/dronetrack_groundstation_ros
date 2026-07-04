@@ -121,6 +121,31 @@ orbit**.
    ball continuously from 3.2 m out to 11.6 m. Lesson: when a target is lost as it
    recedes, check the size gate before the confidence gate.
 
+## Update (2026-07-04): the controller is now full PID
+
+The yaw law gained optional I and D terms (`yaw_pid_step` in
+`control_math.py`, unit-tested). **Defaults are `yaw_ki: 0`, `yaw_kd: 0` — the
+committed behavior is still exactly the pure-P law tuned above.** All knobs are
+runtime-tunable for live sweeps with the same measurement method:
+
+```bash
+ros2 param set /control_node yaw_ki 0.1    # trims standing lag on a moving target
+ros2 param set /control_node yaw_kd 0.05   # damps overshoot near the gain ceiling
+```
+
+Guard rails built in: the integral contribution is capped at `yaw_i_limit`
+(0.3 rad/s) and frozen while the command is rate-saturated (anti-windup), so I
+cannot reintroduce the saturation lag described above; D runs through a low-pass
+(`yaw_d_lpf_alpha`, 0.35) because the raw vision-error derivative is exactly the
+jitter amplifier the original design avoided. PID state resets automatically on
+target loss/reacquisition and on any yaw-gain change.
+
+Where to take the tune next, using the sign-flip diagnostic: the final P-only
+tune still carries mean |error_x| ≈ 0.11 of steady lag on the orbiting ball —
+that standing component is what `yaw_ki ≈ 0.1` should remove (watch that
+sign-flips stay low). If a future gain hunt pushes past 1.5 and rings (the 22
+flips/min regime), `yaw_kd ≈ 0.05` is the tool that buys headroom, not more P.
+
 ## How to re-run this
 
 ```bash

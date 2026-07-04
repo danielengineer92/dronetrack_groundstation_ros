@@ -99,3 +99,74 @@ def approach_forward_velocity(
     velocity = float(gain) * distance_error_m
     max_speed = abs(float(max_speed))
     return clamp(velocity, -max_speed, max_speed)
+
+
+def yaw_pid_step(
+    *,
+    error: float,
+    dt: float,
+    kp: float,
+    ki: float,
+    kd: float,
+    integral: float,
+    filtered_derivative: float,
+    prev_error: float,
+    first_sample: bool,
+    output_limit: float,
+    integral_limit: float,
+    derivative_alpha: float,
+) -> tuple[float, float, float]:
+    """One step of the yaw-tracking PID. Pure; the caller owns the state.
+
+    ``error`` is the deadbanded normalized image error in [-1, 1] (setpoint is
+    always 0 = target centred, so derivative-of-error == derivative-of-
+    measurement and there is no setpoint kick). Returns
+    ``(output_rad_s, new_integral, new_filtered_derivative)``; the caller
+    stores the last two plus ``error`` for the next call.
+
+    Design notes, matched to a noisy vision error signal:
+
+    - **D is low-pass filtered**: ``derivative_alpha`` in (0, 1] blends the raw
+      slope into the previous filtered value (1 = unfiltered). The raw
+      derivative of YOLO pixel error is jittery; kd on the raw slope would
+      amplify it (why the original controller was P-only).
+    - **First sample after a reset produces no D** (no meaningful slope yet).
+    - **I has two guards**: the integral is clamped so its contribution
+      ``|ki * integral|`` never exceeds ``integral_limit`` (rad/s), and it does
+      not accumulate while the unsaturated output already exceeds
+      ``output_limit`` in the direction of the error (conditional
+      anti-windup — a saturated yaw command means more integral cannot help,
+      only overshoot later).
+    - **ki == 0 zeroes the integral** so no stale windup is replayed when I is
+      enabled live via ``ros2 param set``.
+
+    The output is NOT clamped here: the control node's ``limit_motion`` owns
+    saturation (``max_yaw_rate``) and slew (``max_yaw_accel``); this function
+    only needs ``output_limit`` to know when to freeze the integrator.
+    """
+    dt = max(float(dt), 1e-6)
+    error = float(error)
+
+    if kd > 0.0 and not first_sample:
+        alpha = clamp(float(derivative_alpha), 1e-3, 1.0)
+        raw_derivative = (error - float(prev_error)) / dt
+        new_derivative = alpha * raw_derivative + (1.0 - alpha) * float(filtered_derivative)
+    else:
+        new_derivative = 0.0
+
+    if ki > 0.0:
+        new_integral = float(integral) + error * dt
+        max_integral = abs(float(integral_limit)) / ki
+        new_integral = clamp(new_integral, -max_integral, max_integral)
+    else:
+        new_integral = 0.0
+
+    output = kp * error + ki * new_integral + kd * new_derivative
+
+    # Conditional anti-windup: if we are saturated and the error keeps pushing
+    # the same way, back the integral out so it does not wind up.
+    if abs(output) > abs(output_limit) and error * output > 0.0:
+        new_integral = float(integral) if ki > 0.0 else 0.0
+        output = kp * error + ki * new_integral + kd * new_derivative
+
+    return output, new_integral, new_derivative

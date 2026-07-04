@@ -217,7 +217,17 @@ control_node:
     control_command_topic: "/drone/control/command"
     mission_command_topic: "/drone/mission/command"
     autonomy_enabled: false
+    # Yaw tracking PID. gain_yaw is the P term (tuned 2026-07-03, see
+    # docs/pid_tuning_report.md). ki/kd default 0 = the flight-proven pure-P
+    # law; both are runtime-tunable (ros2 param set /control_node yaw_ki 0.1).
+    # ki trims the standing lag on a continuously moving target (start ~0.1,
+    # anti-windup + yaw_i_limit cap its authority); kd damps overshoot at
+    # high gain (start ~0.05 — D is low-pass filtered, yaw_d_lpf_alpha).
     gain_yaw: 1.5
+    yaw_ki: 0.0
+    yaw_kd: 0.0
+    yaw_i_limit: 0.3       # max integral contribution, rad/s
+    yaw_d_lpf_alpha: 0.35  # D low-pass blend (0,1]; 1 = raw derivative
     gain_down: 0.3
     gain_forward: 1.0
     gain_right: 1.0
