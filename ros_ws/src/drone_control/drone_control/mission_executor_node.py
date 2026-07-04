@@ -38,6 +38,7 @@ from std_msgs.msg import Bool, String
 
 from drone_interfaces.msg import DroneTelemetry, MavsdkActionCommand, MissionCommand, TargetError
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
+from drone_control.control_math import project_target_global
 from drone_control.mission_plan import (
     MissionPlan,
     MissionPlanError,
@@ -743,15 +744,20 @@ class MissionExecutorNode(Node):
 
         distance_m = float(self.last_target.distance_m)
         bearing_x = float(getattr(self.last_target, "bearing_x_rad", 0.0))
+        bearing_y = float(getattr(self.last_target, "bearing_y_rad", 0.0))
         yaw = float(self.last_telemetry.yaw)
-        global_bearing = yaw + bearing_x
-        north_m = distance_m * math.cos(global_bearing)
-        east_m = distance_m * math.sin(global_bearing)
 
-        earth_radius_m = 6378137.0
-        lat_rad = math.radians(lat)
-        out_lat = lat + math.degrees(north_m / earth_radius_m)
-        out_lon = lon + math.degrees(east_m / (earth_radius_m * max(math.cos(lat_rad), 1e-6)))
+        # distance_m is the pinhole SLANT range; project_target_global
+        # foreshortens it by the camera elevation (bearing_y) so a target seen
+        # below the horizon does not push the orbit centre outward.
+        out_lat, out_lon = project_target_global(
+            lat_deg=lat,
+            lon_deg=lon,
+            yaw_rad=yaw,
+            bearing_x_rad=bearing_x,
+            bearing_y_rad=bearing_y,
+            slant_distance_m=distance_m,
+        )
         return out_lat, out_lon, alt
 
     def publish_state(self, detail: str) -> None:

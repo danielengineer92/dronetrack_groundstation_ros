@@ -96,18 +96,20 @@ tracker_node:
     estimate_distance: true
     # Empirical: distance_m = k / diameter_px. Calibrated against gz truth in
     # SITL (k = true_dist * bbox_diam_px: 3.2m*30.5px=98, 6.3m*16.6px=105).
-    # Pure pinhole math (ball_diameter*fx/diam) predicts k=81, but YOLO boxes
-    # on a 15-30 px ball run ~1.2x fat, so calibrate the whole chain instead.
-    distance_calibration_k: 100.0
+    # Empirically fit to 19 SITL ground-truth samples (drone-vs-ball gz pose)
+    # spanning 3.3-9m: k = diam_px * true_slant = 147 (mean). Pinhole predicts
+    # fx*D=539*0.2=108; YOLO boxes run ~1.36x fat, hence 147. (was 100, tuned
+    # for the old 960-wide fx=405 assumption -> read 32% low on the 1280 cam.)
+    distance_calibration_k: 147.0
     ball_diameter_m: 0.20
     focal_length_px: 0.0
-    # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad, 960x720),
-    # NOT a webcam guess: fx=fy=405 px. Wrong FOV skews bearing_x/bearing_y
+    # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad) at 1280x960,
+    # fx=fy=539 px. MUST equal the resolution YOLO runs on: Wrong FOV skews bearing_x/bearing_y
     # (and the pinhole distance fallback) by fx_err.
     horizontal_fov_deg: 99.7
     vertical_fov_deg: 83.3
-    image_width_px: 960
-    image_height_px: 720
+    image_width_px: 1280
+    image_height_px: 960
     min_distance_m: 0.25
     max_distance_m: 12.0
     distance_filter_alpha: 0.25

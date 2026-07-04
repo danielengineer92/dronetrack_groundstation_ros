@@ -18,7 +18,6 @@ Safety posture for this first command bridge:
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import threading
 import time
@@ -62,22 +61,6 @@ ACTION_SENT = "MAVSDK_ACTION_SENT"
 ACTION_FAILED = "MAVSDK_ACTION_FAILED"
 ACTION_IGNORED = "MAVSDK_ACTION_IGNORED"
 ACTION_BLOCKED = "MAVSDK_ACTION_BLOCKED"
-
-MAV_CMD_DO_ORBIT = 34
-MAV_COMP_ID_AUTOPILOT1 = 1
-
-# MAVLink ORBIT_YAW_BEHAVIOUR values. Keep these local so the telemetry bridge
-# can send MAV_CMD_DO_ORBIT through MavlinkDirect without depending on a
-# Python enum that may not exist in the installed MAVSDK-Python package.
-ORBIT_YAW_BEHAVIOR_VALUES = {
-    'HOLD_FRONT_TO_CIRCLE_CENTER': 0,
-    'FRONT_TO_CIRCLE_CENTER': 0,
-    'HOLD_INITIAL_HEADING': 1,
-    'UNCONTROLLED': 2,
-    'HOLD_FRONT_TANGENT_TO_CIRCLE': 3,
-    'RC_CONTROLLED': 4,
-}
-
 
 class TelemetryNode(Node):
     """ROS 2 node that bridges PX4/MAVSDK telemetry and position-hold yaw commands."""
@@ -877,103 +860,14 @@ class TelemetryNode(Node):
         return getattr(orbit_yaw_behavior, candidate,
                        orbit_yaw_behavior.HOLD_FRONT_TO_CIRCLE_CENTER)
 
-    async def _send_do_orbit_mavlink_direct(self, drone, command: MavsdkActionCommand) -> None:
-        """Send MAV_CMD_DO_ORBIT through MAVSDK MavlinkDirect.
-
-        MAVSDK action.do_orbit() is nice, but it does not expose MAV_CMD_DO_ORBIT
-        param4, which is the orbit amount in radians. MavlinkDirect lets the
-        mission layer request a fixed number of revolutions while telemetry_node
-        remains the only owner of the MAVSDK connection.
-        """
-        radius_m = float(command.radius_m)
-        velocity_m_s = float(command.velocity_m_s)
-        revolutions = float(command.orbit_revolutions)
-        orbit_angle_rad = 0.0 if revolutions <= 0.0 else revolutions * 2.0 * math.pi
-        yaw_behavior = self._orbit_yaw_behavior_value(command.yaw_behavior)
-
-        fields = {
-            'target_system': self._get_target_system_id(drone),
-            'target_component': MAV_COMP_ID_AUTOPILOT1,
-            'command': MAV_CMD_DO_ORBIT,
-            'confirmation': 0,
-            'param1': radius_m,
-            'param2': velocity_m_s,
-            'param3': float(yaw_behavior),
-            'param4': orbit_angle_rad,
-            'param5': self._json_float_or_null(float(command.latitude_deg)),
-            'param6': self._json_float_or_null(float(command.longitude_deg)),
-            'param7': self._json_float_or_null(float(command.absolute_altitude_m)),
-        }
-
-        mavlink_direct = getattr(drone, 'mavlink_direct', None)
-        if mavlink_direct is None:
-            raise RuntimeError('MAVSDK-Python has no mavlink_direct plugin on this install')
-        if not hasattr(mavlink_direct, 'send_message'):
-            raise RuntimeError('MAVSDK-Python mavlink_direct plugin has no send_message() method')
-
-        try:
-            from mavsdk.mavlink_direct import MavlinkMessage
-        except ImportError as exc:
-            raise RuntimeError('mavsdk.mavlink_direct.MavlinkMessage import failed') from exc
-
-        # MAVSDK-Python generated structs use positional construction. Keep this
-        # intentionally simple so COMMAND_LONG matches the documented
-        # MavlinkMessage fields: name, sender ids, target ids, JSON fields.
-        message = MavlinkMessage(
-            'COMMAND_LONG',
-            0,
-            0,
-            int(fields['target_system']),
-            int(fields['target_component']),
-            json.dumps(fields, allow_nan=False),
-        )
-
-        self.get_logger().warning(
-            'Sending MAV_CMD_DO_ORBIT via MavlinkDirect | '
-            f'radius={radius_m:.2f}m, velocity={velocity_m_s:.2f}m/s, '
-            f'revolutions={revolutions:.2f}, orbit_angle={orbit_angle_rad:.3f}rad, '
-            f'yaw_behavior={yaw_behavior}, center=({fields["param5"]}, {fields["param6"]}, {fields["param7"]})'
-        )
-
-        # In MAVSDK-Python, plugin calls normally raise on failure. Some generated
-        # variants return None/False-ish values even when the message was accepted,
-        # so do not convert the return value into a second failure gate.
-        await mavlink_direct.send_message(message)
-
-    def _get_target_system_id(self, drone) -> int:
-        """Best-effort target system id for COMMAND_LONG.
-
-        MAVSDK normally talks to one system in this project. Use target_system=1
-        as the practical default, but take an exposed value if this package gives
-        us one.
-        """
-        mavlink_direct = getattr(drone, 'mavlink_direct', None)
-        for attr in ('target_system_id', 'target_sysid', 'system_id'):
-            value = getattr(mavlink_direct, attr, None) if mavlink_direct is not None else None
-            if isinstance(value, int) and value > 0:
-                return value
-        return 1
-
-    def _orbit_yaw_behavior_value(self, behavior_name: str) -> int:
-        name = str(behavior_name).strip().upper()
-        if not name:
-            return ORBIT_YAW_BEHAVIOR_VALUES['HOLD_FRONT_TO_CIRCLE_CENTER']
-        if name in ORBIT_YAW_BEHAVIOR_VALUES:
-            return ORBIT_YAW_BEHAVIOR_VALUES[name]
-        self._log_throttled(
-            'unknown_orbit_yaw_behavior',
-            'warning',
-            f'Unknown orbit yaw_behavior={behavior_name!r}; using HOLD_FRONT_TO_CIRCLE_CENTER.',
-            2.0,
-        )
-        return ORBIT_YAW_BEHAVIOR_VALUES['HOLD_FRONT_TO_CIRCLE_CENTER']
-
-    @staticmethod
-    def _json_float_or_null(value: float):
-        # MavlinkDirect represents MAVLink NaN/infinity as JSON null.
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return float(value)
+    # NOTE: A bounded-revolutions orbit via MavlinkDirect was removed here. It
+    # built a COMMAND_LONG, but PX4's orbit handler only accepts the global
+    # centre in a COMMAND_INT (int32-scaled lat/lon) — see _send_do_orbit_action
+    # above — so a COMMAND_LONG silently never entered ORBIT. Revolution count is
+    # already honoured indirectly: the mission executor derives the orbit-step
+    # timeout from radius/speed/revolutions (_orbit_default_timeout). If a hard
+    # in-firmware revolution limit is ever needed, send MAV_CMD_DO_ORBIT as a
+    # COMMAND_INT (x=round(lat*1e7), y=round(lon*1e7)), not a COMMAND_LONG.
 
     async def _offboard_command_loop(self, drone) -> None:
         try:
