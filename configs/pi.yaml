@@ -235,6 +235,14 @@ control_node:
     yaw_kd: 0.0
     yaw_i_limit: 0.3       # max integral contribution, rad/s
     yaw_d_lpf_alpha: 0.35  # D low-pass blend (0,1]; 1 = raw derivative
+    # LOS-rate feed-forward: commands the rate the ball is moving at (from
+    # MEASURED telemetry yaw + camera bearing — never the command itself), so
+    # the drone aims at the ball's motion instead of trailing it. SITL A/B on
+    # the orbiting ball: mean|error_x| 0.105 -> 0.054 (-49%), peak 0.30 ->
+    # 0.15, zero added sign-flips. Structurally zero for a still target.
+    yaw_ff_gain: 1.0
+    yaw_ff_lpf_alpha: 0.25  # LOS-rate low-pass (vision + 10 Hz yaw jitter)
+    yaw_ff_limit: 1.5       # rad/s cap on the feed-forward term
     gain_down: 0.3
     gain_forward: 1.0
     gain_right: 1.0

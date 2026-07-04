@@ -185,6 +185,37 @@ If a future gain hunt pushes past 1.5 and rings (the 22 flips/min regime),
 `yaw_kd` buys a little headroom — but per the numbers above, expect ~10 %, not
 a new regime.
 
+## Update 3 (2026-07-04): LOS-rate feed-forward — error halved, no jitter
+
+Built the feed-forward recommended above (`yaw_feedforward_step` in
+`control_math.py`): estimate the ball's inertial line-of-sight rate and add it
+to the yaw command, so error no longer has to be nonzero to sustain rotation.
+
+**The first attempt self-excited — and the failure is instructive.** Using
+`d(bearing)/dt + commanded_yaw_rate` as the LOS-rate estimate puts the command
+inside its own estimator; PX4 doesn't achieve the command instantly, the
+commanded-vs-actual mismatch doesn't cancel, and the loop rings (measured:
+mean 0.105 → 0.42, 31 flips/min, lock lost). The fix: differentiate the
+**measured inertial LOS angle** = telemetry yaw + camera bearing — both
+measurements, no command feedback path, structurally zero for a still ball
+(wrap-aware, low-passed, clamped; unit-tested).
+
+A/B on the orbiting ball (40 s / 2 orbit periods each, same P baseline):
+
+| | lock % | mean \|error_x\| | peak | flips/min |
+|---|---|---|---|---|
+| P-only baseline | 100 | 0.105 | 0.30 | 6.0 |
+| **`yaw_ff_gain: 1.0`** | **100** | **0.054 (−49 %)** | **0.15** | **6.0** |
+| `yaw_ff_gain: 0.7` | 100 | 0.063 | 0.17 | 6.0 |
+
+Feed-forward achieved what no P/I/D setting could (Update 2): half the error
+with **zero** added sign-flips — because it adds phase lead outside the
+feedback loop, it doesn't trade against noise amplification. `yaw_ff_gain: 1.0`
+is now the committed default in `pi.yaml` (guarded by `yaw_ff_lpf_alpha` 0.25
+and `yaw_ff_limit` 1.5 rad/s; runtime-tunable; set 0.0 to fall back to the
+pure-P law). Residual ~0.054 is transport delay (YOLO 15 fps → command),
+which remains the next lever.
+
 ## How to re-run this
 
 ```bash

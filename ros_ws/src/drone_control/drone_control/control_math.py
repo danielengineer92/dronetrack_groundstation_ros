@@ -170,3 +170,47 @@ def yaw_pid_step(
         output = kp * error + ki * new_integral + kd * new_derivative
 
     return output, new_integral, new_derivative
+
+
+def yaw_feedforward_step(
+    *,
+    los_angle_rad: float,
+    prev_los_angle_rad: float,
+    dt: float,
+    prev_ff_rad_s: float,
+    first_sample: bool,
+    lpf_alpha: float,
+    limit_rad_s: float,
+) -> float:
+    """Estimate the target's inertial LOS rate for yaw feed-forward.
+
+    A pure error controller must keep the target OFF-centre to generate any
+    yaw rate at all — it trails a moving target by design. Feed-forward
+    commands the rate the target is actually moving at, so feedback only
+    cleans up residuals.
+
+    ``los_angle_rad`` is the target's inertial line-of-sight angle: the
+    vehicle's MEASURED yaw (telemetry) plus the camera bearing
+    (``TargetError.bearing_x_rad``). Both inputs are measurements — the
+    command never appears in this estimate. That matters: a first attempt
+    used ``d(bearing)/dt + commanded_yaw_rate``, and because PX4 does not
+    achieve the command instantly, the commanded-vs-actual mismatch fed back
+    through the estimator and self-excited (measured: mean error 0.105 ->
+    0.42, 31 sign-flips/min). With the measured LOS angle, a stationary
+    target gives a constant angle regardless of our own rotation, so the
+    feed-forward is structurally zero for a still ball.
+
+    The angle delta is wrap-aware; the rate is low-passed (``lpf_alpha`` in
+    (0, 1]) and clamped to ``±limit_rad_s``. Returns the new filtered
+    feed-forward (also the state for the next call).
+    """
+    if first_sample:
+        return 0.0
+    dt = max(float(dt), 1e-6)
+    delta = float(los_angle_rad) - float(prev_los_angle_rad)
+    delta = math.atan2(math.sin(delta), math.cos(delta))  # wrap to [-pi, pi]
+    raw = delta / dt
+    alpha = clamp(float(lpf_alpha), 1e-3, 1.0)
+    ff = alpha * raw + (1.0 - alpha) * float(prev_ff_rad_s)
+    lim = abs(float(limit_rad_s))
+    return clamp(ff, -lim, lim)

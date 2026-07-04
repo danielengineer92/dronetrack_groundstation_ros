@@ -100,6 +100,53 @@ def test_derivative_damps_overshoot_direction():
     assert out_pd < out_p, "D on a shrinking error must reduce the command"
 
 
+try:
+    from drone_control.control_math import yaw_feedforward_step
+except ImportError:  # pragma: no cover
+    from drone_control.control_math import yaw_feedforward_step  # noqa: F401
+
+
+def _ff(**kw):
+    base = dict(
+        los_angle_rad=0.0, prev_los_angle_rad=0.0, dt=DT,
+        prev_ff_rad_s=0.0, first_sample=False, lpf_alpha=1.0, limit_rad_s=1.5,
+    )
+    base.update(kw)
+    return yaw_feedforward_step(**base)
+
+
+def test_ff_first_sample_is_zero():
+    assert _ff(los_angle_rad=0.4, first_sample=True) == 0.0
+
+
+def test_ff_still_target_is_structurally_zero():
+    # Still ball: inertial LOS angle constant no matter how we rotate.
+    assert _ff(los_angle_rad=1.234, prev_los_angle_rad=1.234) == 0.0
+
+
+def test_ff_recovers_target_rate():
+    # Ball moving at +0.3 rad/s inertially: LOS advances 0.3*dt per tick.
+    ff = _ff(los_angle_rad=0.3 * DT, prev_los_angle_rad=0.0)
+    assert math.isclose(ff, 0.3), ff
+
+
+def test_ff_wraps_across_pi():
+    # LOS crossing the +/-pi seam must not produce a 2*pi/dt spike.
+    ff = _ff(los_angle_rad=-math.pi + 0.01, prev_los_angle_rad=math.pi - 0.01,
+             limit_rad_s=100.0)
+    assert math.isclose(ff, 0.02 / DT, rel_tol=1e-6), ff
+
+
+def test_ff_lowpass_blends():
+    ff = _ff(los_angle_rad=0.3 * DT, prev_los_angle_rad=0.0, lpf_alpha=0.25)
+    assert math.isclose(ff, 0.25 * 0.3), ff
+
+
+def test_ff_clamped():
+    ff = _ff(los_angle_rad=1.0, prev_los_angle_rad=0.0, limit_rad_s=1.5)
+    assert ff == 1.5
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

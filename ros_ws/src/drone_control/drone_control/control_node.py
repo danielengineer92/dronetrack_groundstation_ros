@@ -31,7 +31,11 @@ from std_msgs.msg import Bool
 
 from drone_interfaces.msg import ControlCommand, DroneTelemetry, MissionCommand, TargetError
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
-from drone_control.control_math import approach_forward_velocity, yaw_pid_step
+from drone_control.control_math import (
+    approach_forward_velocity,
+    yaw_feedforward_step,
+    yaw_pid_step,
+)
 
 
 CMD_IDLE = "IDLE"
@@ -57,6 +61,7 @@ DYNAMIC_PARAMS = {
     "autonomy_enabled", "autonomous_enabled",
     "gain_forward", "gain_right", "gain_down", "gain_yaw",
     "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha",
+    "yaw_ff_gain", "yaw_ff_lpf_alpha", "yaw_ff_limit",
     "deadband_x", "deadband_y",
     "max_velocity_forward", "max_velocity_right", "max_velocity_down", "max_yaw_rate",
     "max_accel_forward", "max_accel_right", "max_accel_down", "max_yaw_accel",
@@ -86,6 +91,12 @@ class ControlNode(Node):
         self.declare_parameter("yaw_kd", 0.0)
         self.declare_parameter("yaw_i_limit", 0.3)      # max |I| contribution, rad/s
         self.declare_parameter("yaw_d_lpf_alpha", 0.35)  # D low-pass, (0,1], 1=raw
+        # LOS-rate feed-forward: command the rate the target is moving at so
+        # the loop stops trailing a moving target (error no longer has to be
+        # nonzero to sustain yaw). 0 = off; 1 = full estimated LOS rate.
+        self.declare_parameter("yaw_ff_gain", 0.0)
+        self.declare_parameter("yaw_ff_lpf_alpha", 0.25)  # LOS-rate low-pass
+        self.declare_parameter("yaw_ff_limit", 1.5)       # rad/s cap on the FF term
 
         self.declare_parameter("deadband_x", 0.05)
         self.declare_parameter("deadband_y", 0.05)
@@ -139,6 +150,12 @@ class ControlNode(Node):
         self.yaw_kd = float(self.get_parameter("yaw_kd").value)
         self.yaw_i_limit = float(self.get_parameter("yaw_i_limit").value)
         self.yaw_d_lpf_alpha = float(self.get_parameter("yaw_d_lpf_alpha").value)
+        self.yaw_ff_gain = float(self.get_parameter("yaw_ff_gain").value)
+        self.yaw_ff_lpf_alpha = float(self.get_parameter("yaw_ff_lpf_alpha").value)
+        self.yaw_ff_limit = float(self.get_parameter("yaw_ff_limit").value)
+        self._yaw_ff = 0.0
+        self._yaw_ff_prev_los = 0.0
+        self._yaw_ff_have_los = False
         # Yaw PID state (owned here; yaw_pid_step is pure).
         self._yaw_pid_integral = 0.0
         self._yaw_pid_derivative = 0.0
@@ -336,11 +353,18 @@ class ControlNode(Node):
                         reason=f"{param.name} must be >= 0",
                     )
 
-            if param.name == "yaw_d_lpf_alpha":
+            if param.name in ("yaw_d_lpf_alpha", "yaw_ff_lpf_alpha"):
                 if not 0.0 < float(param.value) <= 1.0:
                     return SetParametersResult(
                         successful=False,
-                        reason="yaw_d_lpf_alpha must be in (0, 1]",
+                        reason=f"{param.name} must be in (0, 1]",
+                    )
+
+            if param.name in ("yaw_ff_gain", "yaw_ff_limit"):
+                if float(param.value) < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{param.name} must be >= 0",
                     )
 
             if param.name.startswith(("max_", "min_")):
@@ -374,7 +398,9 @@ class ControlNode(Node):
             if param.name in ("autonomy_enabled", "autonomous_enabled"):
                 self.set_autonomy_enabled(bool(param.value), source=f"parameter:{param.name}")
 
-            if param.name in ("gain_yaw", "yaw_ki", "yaw_kd", "yaw_i_limit", "yaw_d_lpf_alpha"):
+            if param.name in ("gain_yaw", "yaw_ki", "yaw_kd", "yaw_i_limit",
+                              "yaw_d_lpf_alpha", "yaw_ff_gain", "yaw_ff_lpf_alpha",
+                              "yaw_ff_limit"):
                 self._reset_yaw_pid()
 
         return SetParametersResult(successful=True)
@@ -477,8 +503,12 @@ class ControlNode(Node):
         self._yaw_pid_derivative = 0.0
         self._yaw_pid_prev_error = 0.0
         self._yaw_pid_last_time = 0.0
+        self._yaw_ff = 0.0
+        self._yaw_ff_prev_los = 0.0
+        self._yaw_ff_have_los = False
 
-    def step_yaw_pid(self, error_x: float, current_time: float) -> float:
+    def step_yaw_pid(self, error_x: float, current_time: float,
+                     bearing_x_rad: float = 0.0) -> float:
         """Yaw PID on the deadbanded image error (gain_yaw = P term).
 
         State auto-resets after any interruption: if this was not called for
@@ -504,6 +534,25 @@ class ControlNode(Node):
             integral_limit=self.yaw_i_limit,
             derivative_alpha=self.yaw_d_lpf_alpha,
         )
+        # Feed-forward runs on MEASURED quantities only (telemetry yaw +
+        # camera bearing = inertial LOS angle); the command never feeds back.
+        if self.yaw_ff_gain > 0.0 and self.last_telemetry is not None:
+            los = float(self.last_telemetry.yaw) + float(bearing_x_rad)
+            if not self._yaw_ff_have_los or first_sample:
+                self._yaw_ff = 0.0
+            else:
+                self._yaw_ff = yaw_feedforward_step(
+                    los_angle_rad=los,
+                    prev_los_angle_rad=self._yaw_ff_prev_los,
+                    dt=self.control_period,
+                    prev_ff_rad_s=self._yaw_ff,
+                    first_sample=False,
+                    lpf_alpha=self.yaw_ff_lpf_alpha,
+                    limit_rad_s=self.yaw_ff_limit,
+                )
+                output += self.yaw_ff_gain * self._yaw_ff
+            self._yaw_ff_prev_los = los
+            self._yaw_ff_have_los = True
         self._yaw_pid_prev_error = float(error_x)
         self._yaw_pid_last_time = float(current_time)
         return output
@@ -967,7 +1016,10 @@ class ControlNode(Node):
 
         target = self.last_target_error
         error_x = self.apply_deadband(float(target.error_x), self.deadband_x)
-        desired_yaw = self.step_yaw_pid(error_x, current_time)
+        desired_yaw = self.step_yaw_pid(
+            error_x, current_time,
+            bearing_x_rad=float(getattr(target, "bearing_x_rad", 0.0)),
+        )
 
         if not (target.target_visible and target.tracking_state == "LOCKED"):
             self.publish_position_hold(
