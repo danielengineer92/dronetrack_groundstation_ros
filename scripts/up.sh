@@ -27,6 +27,11 @@ bash "${HERE}/discover_ips.sh"
 
 USER_AT="$(pi_target)"
 
+# The Pi launcher defaults ROS_DOMAIN_ID to 0; the ground station reads it from
+# network.yaml. If we don't forward it, the two land on different domains and
+# never discover each other (observed: Pi on 0, GS on 42, no cross-machine data).
+PI_DOMAIN="$(yaml_get ros_domain_id)"; PI_DOMAIN="${PI_DOMAIN:-0}"
+
 echo "==> [2/5] Deploying Pi launcher to ${USER_AT} ..."
 scp "${PI_SSH_OPTS[@]}" "${HERE}/pi_split_launcher.sh" "${USER_AT}:run_pi_split.sh" >/dev/null
 pi_run 'chmod +x ~/run_pi_split.sh'
@@ -35,7 +40,7 @@ echo "==> [3/5] Clean-slate the Pi (kill any orphaned nodes holding the camera) 
 pi_run 'pkill -9 -f "[r]os2 launch" 2>/dev/null; pkill -9 -f "[d]rone_ws/install" 2>/dev/null; pkill -9 -f "[c]amera_compressor" 2>/dev/null; sleep 2; true'
 
 echo "==> [4/5] Launching Pi stack (detached; survives SSH drops) ..."
-pi_run "setsid env PI_CONN='${PI_CONN:-}' PI_ALLOW_ACTIONS='${PI_ALLOW_ACTIONS:-false}' bash ~/run_pi_split.sh >/tmp/pi_launch.log 2>&1 </dev/null & sleep 1; echo '  launcher started'"
+pi_run "setsid env ROS_DOMAIN_ID='${PI_DOMAIN}' PI_CONN='${PI_CONN:-}' PI_ALLOW_ACTIONS='${PI_ALLOW_ACTIONS:-false}' bash ~/run_pi_split.sh >/tmp/pi_launch.log 2>&1 </dev/null & sleep 1; echo '  launcher started'"
 
 echo -n "    waiting for Pi nodes "
 pi_up=""

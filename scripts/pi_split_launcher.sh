@@ -13,6 +13,17 @@ cd "$HOME/drone_ws"
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 
+# `ros2 launch` runs node console-scripts under the SYSTEM python3 (their
+# shebang), which cannot see the venv where mavsdk lives. Without this the
+# telemetry bridge imports nothing and reports MAVSDK_NOT_INSTALLED. Put the
+# venv's site-packages on PYTHONPATH so the nodes can import it. Same technique
+# as the sim runner (scripts/ros_wsl.sh).
+PI_VENV="${PI_VENV:-$HOME/venv}"
+if [ -d "${PI_VENV}" ]; then
+  _vsp="$(ls -d "${PI_VENV}"/lib/python*/site-packages 2>/dev/null | head -1)"
+  [ -n "${_vsp}" ] && export PYTHONPATH="${_vsp}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 # IP-pinned unicast config, kept current by the laptop's discover_ips.sh.

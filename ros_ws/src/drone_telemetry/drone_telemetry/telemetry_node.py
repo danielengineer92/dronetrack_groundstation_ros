@@ -142,6 +142,12 @@ class TelemetryNode(Node):
         self._action_in_progress: bool = False
         self._prime_hold_position: Optional[tuple[float, float, float, float]] = None
         self._last_position_time: float = 0.0
+        # Any-telemetry liveness mark (fed by the high-rate attitude stream).
+        # Used to veto spurious connection_state=False events — MAVSDK's event
+        # stream is edge-triggered and flaps at startup when a transient second
+        # system (e.g. a peripheral that sent a few frames) times out; the real
+        # autopilot link is proven alive by data still arriving.
+        self._last_any_telemetry_time: float = 0.0
         self._last_local_position_time: float = 0.0
         self._last_armed_time: float = 0.0
         self._last_landed_state_time: float = 0.0
@@ -429,13 +435,25 @@ class TelemetryNode(Node):
                 await asyncio.sleep(grace_s)
             except asyncio.CancelledError:
                 return
-            if self._running and self._connected:
-                self._connected = False
-                self._connection_status = "DISCONNECTED"
-                self._offboard_active = False
-                self._prime_hold_position = None
-                self.get_logger().error(
-                    f'PX4 connection LOST (no MAVSDK heartbeat for {grace_s:.0f}s).')
+            if not (self._running and self._connected):
+                return
+            # Liveness veto: connection_state is edge-triggered and emits a
+            # spurious False at startup when a transient second system times
+            # out; no True follows because the autopilot's state never changed.
+            # If telemetry data kept arriving through the grace window, the
+            # link is demonstrably alive — ignore the stale event (observed on
+            # the real FMUv6C over USB: connected -> "LOST" at +3 s while
+            # attitude/flight-mode streamed the whole time).
+            if time.monotonic() - self._last_any_telemetry_time < grace_s:
+                self.get_logger().warning(
+                    'Ignoring stale MAVSDK disconnect event: telemetry is still streaming.')
+                return
+            self._connected = False
+            self._connection_status = "DISCONNECTED"
+            self._offboard_active = False
+            self._prime_hold_position = None
+            self.get_logger().error(
+                f'PX4 connection LOST (no MAVSDK heartbeat for {grace_s:.0f}s).')
 
         async for state in drone.core.connection_state():
             if not self._running:
@@ -502,6 +520,7 @@ class TelemetryNode(Node):
         async for attitude in drone.telemetry.attitude_euler():
             if not self._running:
                 return
+            self._last_any_telemetry_time = time.monotonic()
             with self._data_lock:
                 self._telemetry_data['roll'] = math.radians(attitude.roll_deg)
                 self._telemetry_data['pitch'] = math.radians(attitude.pitch_deg)
