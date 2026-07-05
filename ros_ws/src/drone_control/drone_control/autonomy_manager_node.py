@@ -95,6 +95,11 @@ class AutonomyManagerNode(Node):
         # is in a SCAN step, so the drone can yaw-sweep to search for a target.
         # Yaw-only is enforced by control_node's SCAN behavior (position-hold + yaw).
         self.declare_parameter("allow_scan_without_lock", False)
+        # When false, autonomy is granted on request+safety alone — no target
+        # lock needed. Mission steps (prime_offboard, goto, orbit hand-off) can
+        # then command the vehicle pre-lock; control_node still degrades to
+        # HOLD/IDLE without a target. Keep true on hardware.
+        self.declare_parameter("require_target_lock", True)
         self.declare_parameter("mission_command_timeout", 1.0)  # SCAN command freshness
 
         # Safety requirements
@@ -123,6 +128,7 @@ class AutonomyManagerNode(Node):
         self.request_timeout = float(self.get_parameter("request_timeout").value)
         self.enable_offboard_when_ready = bool(self.get_parameter("enable_offboard_when_ready").value)
         self.allow_scan_without_lock = bool(self.get_parameter("allow_scan_without_lock").value)
+        self.require_target_lock = bool(self.get_parameter("require_target_lock").value)
         self.mission_command_timeout = float(self.get_parameter("mission_command_timeout").value)
 
         self.require_connected = bool(self.get_parameter("require_connected").value)
@@ -381,6 +387,12 @@ class AutonomyManagerNode(Node):
 
         if self._target_locked(now):
             return MissionState.TRACKING, "TARGET_LOCKED"
+
+        # Opt-out (SITL/dev): grant autonomy without a lock so the mission can
+        # command the vehicle pre-lock. Request freshness and telemetry safety
+        # have already passed above; control_node holds without a target.
+        if not self.require_target_lock:
+            return MissionState.TRACKING, "NO_LOCK_REQUIRED"
 
         # Opt-in pre-lock yaw-only autonomy while the mission is in a SCAN step.
         # We are past the request-fresh, safety-ok, and not-locked checks here.

@@ -62,6 +62,12 @@ class TrackerNode(Node):
         self.declare_parameter("smoothing_alpha", 0.4)
         self.declare_parameter("target_area_min", 0.001)
         self.declare_parameter("target_area_max", 0.8)
+        # Ball bboxes are ~square. Reject strongly elongated detections —
+        # observed: the drone's own red airframe piece at a frame corner reads
+        # as a 24x66 px "red_ball" (aspect 0.36) at 0.87 conf and, being
+        # rigidly attached, out-scores the real ball forever. 0 disables.
+        self.declare_parameter("target_aspect_min", 0.5)
+        self.declare_parameter("target_aspect_max", 2.0)
         self.declare_parameter("publish_rate", 30.0)
         self.declare_parameter("proximity_threshold", 0.15)
 
@@ -98,6 +104,8 @@ class TrackerNode(Node):
         self.smoothing_alpha = float(self.get_parameter("smoothing_alpha").value)
         self.target_area_min = float(self.get_parameter("target_area_min").value)
         self.target_area_max = float(self.get_parameter("target_area_max").value)
+        self.target_aspect_min = float(self.get_parameter("target_aspect_min").value)
+        self.target_aspect_max = float(self.get_parameter("target_aspect_max").value)
         self.publish_rate = float(self.get_parameter("publish_rate").value)
         self.proximity_threshold = float(self.get_parameter("proximity_threshold").value)
         self.stale_detection_timeout = float(self.get_parameter("stale_detection_timeout").value)
@@ -316,6 +324,21 @@ class TrackerNode(Node):
 
             if area < self.target_area_min or area > self.target_area_max:
                 continue
+
+            # Shape gate: a ball is ~square; drop elongated boxes (own-airframe
+            # slivers, pole edges). True PIXEL aspect (normalized w/h would be
+            # skewed 4:3 by the 1280x960 frame). Disabled when a bound is <= 0.
+            if self.target_aspect_min > 0.0 and self.target_aspect_max > 0.0:
+                w_px = float(detection.pixel_width)
+                h_px = float(detection.pixel_height)
+                if w_px <= 0.0:
+                    w_px = float(detection.width) * float(self.image_width_px)
+                if h_px <= 0.0:
+                    h_px = float(detection.height) * float(self.image_height_px)
+                if w_px > 0.0 and h_px > 0.0:
+                    aspect = w_px / h_px
+                    if aspect < self.target_aspect_min or aspect > self.target_aspect_max:
+                        continue
 
             usable_target_count += 1
             score = float(detection.confidence)

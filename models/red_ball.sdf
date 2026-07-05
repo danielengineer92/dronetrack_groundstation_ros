@@ -11,7 +11,9 @@
         </inertia>
       </inertial>
       <visual name="v">
-        <geometry><sphere><radius>0.1</radius></sphere></geometry>
+        <!-- 8.5 in = 0.2159 m diameter — matches the real DroneTrack ball
+             (and tracker ball_diameter_m / distance_calibration_k). -->
+        <geometry><sphere><radius>0.10795</radius></sphere></geometry>
         <material>
           <ambient>1 0 0 1</ambient>
           <diffuse>1 0 0 1</diffuse>
@@ -19,7 +21,7 @@
         </material>
       </visual>
       <collision name="c">
-        <geometry><sphere><radius>0.1</radius></sphere></geometry>
+        <geometry><sphere><radius>0.10795</radius></sphere></geometry>
       </collision>
     </link>
   </model>

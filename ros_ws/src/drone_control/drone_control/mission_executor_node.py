@@ -181,6 +181,15 @@ class MissionExecutorNode(Node):
         # instead of a straight v*lead tangent (cuts direction error ~23->9
         # deg on a turning target). Turn rate from the velocity history.
         self.declare_parameter("orbit_lead_curved", True)
+        # Orbit centre from the target state estimator's Kalman position
+        # (capture-stamp-paired, filtered over many frames) instead of
+        # re-projecting the latest raw bearing with the CURRENT telemetry yaw.
+        # The raw projection pairs a ~0.35 s-stale bearing with the pose now,
+        # so any yaw motion during centering biases the centre tangentially —
+        # the same pairing bug fixed for yaw tracking (63d41c1). Falls back to
+        # the raw projection when the estimate is invalid or stale.
+        self.declare_parameter("orbit_center_use_state_estimate", True)
+        self.declare_parameter("orbit_center_state_max_age_s", 1.0)
         self.declare_parameter("target_state_topic", "/drone/tracking/target_state")
         self.declare_parameter("center_error_threshold", 0.15)
         self.declare_parameter("event_log_enabled", True)
@@ -484,6 +493,12 @@ class MissionExecutorNode(Node):
                 self.publish_autonomy_request(False)
                 self.publish_offboard_request(False)
                 return
+            if self.mission_active:
+                # A steady/repeated request stream (dashboard keep-alive, a
+                # periodic publisher) must NOT restart the plan from step 0
+                # every message — observed: a 1 Hz `request=true` pub churned
+                # takeoff->prime forever, engaging offboard on the ground.
+                return
             self.get_logger().warning(f"*** SMART MISSION REQUESTED | plan='{self.plan.name}' ***")
             self.mission_active = True
             self.actions_sent.clear()
@@ -768,15 +783,38 @@ class MissionExecutorNode(Node):
             takeoff_altitude_m=round(float(msg.takeoff_altitude_m), 3),
         )
 
-    def estimate_target_global_center(self) -> Optional[tuple[float, float, float]]:
-        if self.last_target is None or self.last_telemetry is None:
+    def _center_from_state_estimate(
+        self, lat: float, lon: float
+    ) -> Optional[tuple[float, float]]:
+        """Orbit centre from the KF target estimate (preferred path).
+
+        The estimator already pairs each bearing with the drone pose at the
+        image CAPTURE stamp and filters across frames, so its NED position
+        carries neither the latest-yaw pairing bias nor single-frame distance
+        noise. Convert (target NED - drone NED now) to a global offset from
+        the same telemetry snapshot that supplied (lat, lon).
+        """
+        if not bool(self.get_parameter("orbit_center_use_state_estimate").value):
             return None
-        if not self.target_distance_ready():
+        ts = getattr(self, "last_target_state", None)
+        if ts is None or not bool(ts.valid):
             return None
-        lat = float(self.last_telemetry.latitude)
-        lon = float(self.last_telemetry.longitude)
-        alt = float(self.last_telemetry.absolute_altitude)
-        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+        max_age = float(self.get_parameter("orbit_center_state_max_age_s").value)
+        if time.monotonic() - getattr(self, "last_target_state_time", 0.0) > max_age:
+            return None
+        if not bool(getattr(self.last_telemetry, "local_position_valid", False)):
+            return None
+        north_off = float(ts.position_north) - float(self.last_telemetry.local_position_north)
+        east_off = float(ts.position_east) - float(self.last_telemetry.local_position_east)
+        if not (math.isfinite(north_off) and math.isfinite(east_off)):
+            return None
+        return offset_global(lat, lon, north_off, east_off)
+
+    def _center_from_raw_projection(
+        self, lat: float, lon: float
+    ) -> Optional[tuple[float, float]]:
+        """Fallback: single-sample pinhole projection with the latest yaw."""
+        if self.last_target is None or not self.target_distance_ready():
             return None
 
         distance_m = float(self.last_target.distance_m)
@@ -787,7 +825,7 @@ class MissionExecutorNode(Node):
         # distance_m is the pinhole SLANT range; project_target_global
         # foreshortens it by the camera elevation (bearing_y) so a target seen
         # below the horizon does not push the orbit centre outward.
-        out_lat, out_lon = project_target_global(
+        return project_target_global(
             lat_deg=lat,
             lon_deg=lon,
             yaw_rad=yaw,
@@ -795,6 +833,22 @@ class MissionExecutorNode(Node):
             bearing_y_rad=bearing_y,
             slant_distance_m=distance_m,
         )
+
+    def estimate_target_global_center(self) -> Optional[tuple[float, float, float]]:
+        if self.last_telemetry is None:
+            return None
+        lat = float(self.last_telemetry.latitude)
+        lon = float(self.last_telemetry.longitude)
+        alt = float(self.last_telemetry.absolute_altitude)
+        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+            return None
+
+        center = self._center_from_state_estimate(lat, lon)
+        if center is None:
+            center = self._center_from_raw_projection(lat, lon)
+        if center is None:
+            return None
+        out_lat, out_lon = center
         # Orbit-ahead: shift the centre to where the ball will be. Read at
         # call time so `ros2 param set` works without a reconfigure callback.
         lead_s = float(self.get_parameter("orbit_lead_s").value)
@@ -1311,7 +1365,10 @@ class MissionExecutorNode(Node):
                 self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
                 self.publish_state("orbit hold: target not centered")
                 return False
-            self.publish_mission_command("ORBIT_TARGET", True, "visual-servo orbit fallback")
+            self.publish_mission_command(
+                "ORBIT_TARGET", True, "visual-servo orbit fallback",
+                desired_distance_m=radius_m,
+            )
             age = self.step_age()
             self.publish_state(f"orbiting/requested, age={age:.1f}/{timeout:.1f}s")
             return age > timeout

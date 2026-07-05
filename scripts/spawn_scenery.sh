@@ -19,8 +19,11 @@ POST_R="${POST_R:-0.3}"
 source /opt/ros/jazzy/setup.bash 2>/dev/null || true
 source "$HOME/dronetrack_groundstation_ros/ros_ws/install/setup.bash" 2>/dev/null || true
 
-# 8 bright, well-separated colors (red is the ball, so skip it).
-COLORS=("1 0.5 0" "1 1 0" "0 1 0" "0 1 1" "0 0.4 1" "0.6 0 1" "1 1 1" "1 0 1")
+# 8 bright, well-separated colors. NO red-adjacent hues: the red_ball YOLO
+# model fires on orange (observed: orange post detected as red_ball at 0.87
+# conf => tracker locked a POLE) and likely magenta. Keep every post's red
+# channel <= its strongest other channel.
+COLORS=("1 1 0" "0 1 0" "0 1 1" "0 0.4 1" "0 0 1" "0.4 0 1" "1 1 1" "0.5 0.5 0.5")
 
 post_sdf() {  # $1=name  $2="r g b"
   cat <<EOF

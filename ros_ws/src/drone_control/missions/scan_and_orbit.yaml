@@ -22,7 +22,9 @@
 mission:
   name: scan_and_orbit
   steps:
-    - {type: takeoff, altitude_m: 3.0}
+    # 3.2 m: PX4's acceptance radius + rel-alt reference offset settle the
+    # hover ~0.3-0.4 below the command; 3.2 keeps the vehicle above 3 m.
+    - {type: takeoff, altitude_m: 3.2}
     - {type: prime_offboard, hold_s: 1.5}
     # Sweep CCW; bail out early the moment the target locks. 40 deg/s (was 20)
     # out-runs a moving target's LOS rate (~19 deg/s worst case) instead of

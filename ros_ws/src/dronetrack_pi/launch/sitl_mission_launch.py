@@ -63,7 +63,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     allow_scan_without_lock_arg = DeclareLaunchArgument(
         "allow_scan_without_lock",
-        default_value="false",
+        default_value="true",
         description="SITL/dev: allow yaw-only SCAN while the target is not locked.",
     )
     auto_start_arg = DeclareLaunchArgument(

@@ -36,6 +36,11 @@ cd "$HOME/PX4-Autopilot"
     echo "param set COM_RCL_EXCEPT 4"
     echo "param set COM_DISARM_LAND 2.0"
     echo "param set NAV_MC_ALT_RAD 0.2"
+    # RTL must stay low in the tiny sim arena: the 60 m default return
+    # altitude hauled the drone to 42 m, where the 0.22 m ball is ~3 px and
+    # can never re-lock (observed 2026-07-05).
+    echo "param set RTL_RETURN_ALT 5"
+    echo "param set RTL_DESCEND_ALT 5"
   } > /tmp/px4in
 ) &
 

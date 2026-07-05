@@ -196,7 +196,7 @@ def generate_launch_description() -> LaunchDescription:
                               description="SITL: allow velocity/translation commands."),
         DeclareLaunchArgument("enable_approach_translation", default_value="true",
                               description="Let control_node generate forward approach velocity."),
-        DeclareLaunchArgument("allow_scan_without_lock", default_value="false",
+        DeclareLaunchArgument("allow_scan_without_lock", default_value="true",
                               description="Allow yaw-only SCAN while target is not locked."),
         DeclareLaunchArgument("auto_start", default_value="false",
                               description="Start mission immediately."),

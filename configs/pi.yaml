@@ -97,21 +97,22 @@ tracker_node:
     coast_timeout: 3.5
     lock_confirm_frames: 1
     estimate_distance: true
-    # Empirical: distance_m = k / diameter_px. Calibrated against gz truth in
-    # SITL (k = true_dist * bbox_diam_px: 3.2m*30.5px=98, 6.3m*16.6px=105).
-    # Empirically fit to 19 SITL ground-truth samples (drone-vs-ball gz pose)
-    # spanning 3.3-9m: k = diam_px * true_slant = 147 (mean). Pinhole predicts
-    # fx*D=539*0.2=108; YOLO boxes run ~1.36x fat, hence 147. (was 100, tuned
-    # for the old 960-wide fx=405 assumption -> read 32% low on the 1280 cam.)
+    # Empirical: distance_m = k / diameter_px.
+    # 2026-07-05: recalibrated for the 8.5 in (0.2159 m) sim ball against gz
+    # truth at 3 m (k=121.5, fat 1.04x) and 7 m (k=119.0, fat 1.02x) with the
+    # drone's own-airframe false positive EXCLUDED -> k = 120.3. The previous
+    # k=147 ("1.36x fat") was contaminated by that false positive (a red
+    # airframe piece in the frame corner detected as red_ball at 0.87 conf,
+    # constant 45 px) and over-read every distance ~22%.
     # RE-CALIBRATE FOR REAL HARDWARE: put the ball at a tape-measured distance
     # and run  scripts/ros_wsl.sh env python3 scripts/calibrate_distance.py \
     #   --true-distance-m <m>   — it prints the k (and fat-factor) to set here.
     # k is camera+model specific; re-run after retraining or swapping YOLO.
-    distance_calibration_k: 147.0
-    # Sim ball is 0.20 m; the REAL DroneTrack ball is 8.5 in = 0.2159 m — set
-    # that on hardware (used by the pinhole fallback when k <= 0, and by the
-    # calibration tool's fat-factor report).
-    ball_diameter_m: 0.20
+    distance_calibration_k: 120.3
+    # Ball diameter: sim and the REAL DroneTrack ball are both 8.5 in =
+    # 0.2159 m now (models/red_ball.sdf radius 0.10795). Used by the pinhole
+    # fallback when k <= 0, and by the calibration tool's fat-factor report.
+    ball_diameter_m: 0.2159
     focal_length_px: 0.0
     # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad) at 1280x960,
     # fx=fy=539 px. MUST equal the resolution YOLO runs on: Wrong FOV skews bearing_x/bearing_y
@@ -168,8 +169,13 @@ autonomy_manager_node:
     enable_offboard_when_ready: true
     # Opt-in (default OFF): allow pre-lock, yaw-only autonomy during a SCAN step so
     # the drone can yaw-sweep to search. Movement stays yaw-only (control_node holds
-    # position in SCAN mode). Leave false on hardware unless you want search sweeps.
-    allow_scan_without_lock: false
+    # position in SCAN mode). Default true so a from-scratch scan can search;
+    # set false on hardware if you want to require a prior lock before any autonomy.
+    allow_scan_without_lock: true
+    # SITL/dev: grant autonomy on request+safety alone — no target lock needed
+    # (mission can prime offboard / goto / hand off the orbit pre-lock).
+    # Set true on hardware to require a lock before any autonomous motion.
+    require_target_lock: false
     mission_command_topic: "/drone/mission/command"
     mission_command_timeout: 1.0
     require_connected: true
@@ -181,6 +187,12 @@ autonomy_manager_node:
 
 mission_executor_node:
   ros__parameters:
+    # In-house visual-servo orbit (control_node ORBIT_TARGET): PX4's
+    # MAV_CMD_DO_ORBIT is ACK'd ACCEPTED but never engages ORBIT mode on this
+    # SITL build (verified directly via MAVSDK 2026-07-05), so the mode
+    # hand-off path can never work. The visual-servo orbit also stays in
+    # OFFBOARD (no release/recapture dance) and centers on the tracked ball.
+    use_mavsdk_do_orbit: false
     # Orbit-ahead: lead the DO_ORBIT centre along the estimated target
     # velocity by this many seconds (0 = centre on where the ball IS; only
     # applies when the state estimate is valid, fresh, and moving).

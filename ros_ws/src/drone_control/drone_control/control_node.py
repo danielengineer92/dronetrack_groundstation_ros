@@ -204,6 +204,10 @@ class ControlNode(Node):
         self.declare_parameter("approach_delay_s", 0.35)
         self.declare_parameter("approach_decel", 0.5)
         self.declare_parameter("approach_align_error_limit", 0.5)
+        # Visual-servo orbit: constant body-right strafe speed while the yaw
+        # law keeps the nose on the target. Sign sets direction (+ = CCW seen
+        # from above). Clamped by max_velocity_right in limit_motion.
+        self.declare_parameter("orbit_tangential_speed_m_s", 0.4)
 
         autonomy_param = bool(self.get_parameter("autonomy_enabled").value)
         legacy_autonomous_param = bool(self.get_parameter("autonomous_enabled").value)
@@ -282,6 +286,7 @@ class ControlNode(Node):
         self.approach_delay_s = float(self.get_parameter("approach_delay_s").value)
         self.approach_decel = float(self.get_parameter("approach_decel").value)
         self.approach_align_error_limit = float(self.get_parameter("approach_align_error_limit").value)
+        self.orbit_tangential_speed_m_s = float(self.get_parameter("orbit_tangential_speed_m_s").value)
 
         self.validate_parameters()
         self.control_period = 1.0 / self.control_rate
@@ -1317,8 +1322,43 @@ class ControlNode(Node):
             )
             return
 
-        # No forward/right/down in this stage. APPROACH/ORBIT stay in the same
-        # position-hold+yaw behavior until we add true NED waypoint math.
+        # Visual-servo ORBIT (in-house; PX4's MAV_CMD_DO_ORBIT is ACK'd
+        # ACCEPTED but never engages on this SITL build): keep the nose on the
+        # target with the yaw law above, strafe body-right at constant speed,
+        # and regulate range to the orbit radius with the same approach law.
+        # The circle is closed-loop around the BALL by construction.
+        if mission_mode == "ORBIT_TARGET" and self.enable_approach_translation:
+            desired_distance_m = (
+                float(mission.desired_distance_m) if mission is not None else self.desired_distance_m
+            )
+            forward_cmd = approach_forward_velocity(
+                distance_valid=bool(getattr(target, "distance_valid", False)),
+                distance_m=float(getattr(target, "distance_m", 0.0)),
+                desired_distance_m=desired_distance_m,
+                gain=self.distance_gain_forward,
+                max_speed=self.max_velocity_forward,
+                deadband_m=self.approach_distance_deadband_m,
+                target_locked=True,
+                delay_s=self.approach_delay_s,
+                decel_m_s2=self.approach_decel,
+                error_x=float(target.error_x),
+                align_error_limit=self.approach_align_error_limit,
+            )
+            forward, right, _, yaw = self.limit_motion(
+                forward_cmd, self.orbit_tangential_speed_m_s, 0.0, desired_yaw
+            )
+            self.publish_velocity(
+                f"{STATUS_SENT}: ORBIT r={desired_distance_m:.2f}m vt={right:.2f}m/s",
+                velocity_forward=forward,
+                velocity_right=right,
+                yaw_rate=yaw,
+                source_error_x=float(target.error_x),
+                source_error_y=float(target.error_y),
+            )
+            return
+
+        # No forward/right/down in this stage. APPROACH/TRACK stay in the same
+        # position-hold+yaw behavior.
         _, _, _, yaw = self.limit_motion(0.0, 0.0, 0.0, desired_yaw)
         self._log_yaw_terms(error_x, desired_yaw, yaw, current_time)
 
