@@ -98,7 +98,13 @@ tracker_node:
     lock_confirm_frames: 1
     estimate_distance: true
     # Empirical: distance_m = k / diameter_px.
-    # 2026-07-05: recalibrated for the 8.5 in (0.2159 m) sim ball against gz
+    # THIS FILE IS THE SIM VALUE (gz mono_cam 1280x960). The REAL Pi camera
+    # (640x480) was tape-measure calibrated 2026-07-05: k=66.0 @ 2.00 m,
+    # k=68.0 @ 4.00 m -> k = 67.0 (fat ~1.15x). The deployed Pi config
+    # (ros_ws/src/dronetrack_pi/config/pi.yaml) carries 67.0 — keep that in
+    # sync if you re-stage configs before a deploy (stage_configs overwrites
+    # the staged copy with this sim-flavored file!).
+    # 2026-07-05: sim recalibrated for the 8.5 in (0.2159 m) ball against gz
     # truth at 3 m (k=121.5, fat 1.04x) and 7 m (k=119.0, fat 1.02x) with the
     # drone's own-airframe false positive EXCLUDED -> k = 120.3. The previous
     # k=147 ("1.36x fat") was contaminated by that false positive (a red
