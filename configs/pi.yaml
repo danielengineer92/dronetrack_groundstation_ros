@@ -285,6 +285,13 @@ control_node:
     mission_command_topic: "/drone/mission/command"
     autonomy_enabled: false
     # ============================================================
+    # EXPERIMENTAL OVERRIDE (2026-07-04): bare PD+FF baseline — only P, D, FF
+    # and capture-stamp pairing are active. Tuning aids OFF: braking cap,
+    # FF alignment gate, FF-state LPF, I. Current: kp 1.6 / kd 0.15 / ff 1.0.
+    # The tuned SITL candidate (kp 2.0 / kd 0.3 / ff 0.8 + aids on) is saved in
+    # configs/yaw_config_backup_2026-07-04.md and in git @63d41c1. The §11/§12
+    # notes below describe that SITL candidate, not these override values.
+    # ------------------------------------------------------------
     # SITL CANDIDATE — NOT FLIGHT-VALIDATED. These yaw gains were tuned in
     # PX4/Gazebo SITL only (2026-07-04). Do NOT treat them as hardware-proven.
     # Before the first real flight, follow the bring-up in
@@ -308,9 +315,9 @@ control_node:
     #     damping stays alive inside the deadband. kd>=0.7 destabilises.
     #   ki stays 0 — near==far tracking error (no standing bias) and FF carries
     #     the rate, so I only adds phase lag. Enable only for a measured bias.
-    gain_yaw: 2.0
+    gain_yaw: 1.6         # EXPERIMENTAL override (SITL candidate was 2.0)
     yaw_ki: 0.0
-    yaw_kd: 0.3
+    yaw_kd: 0.15          # EXPERIMENTAL override (SITL candidate was 0.3)
     yaw_i_limit: 0.3       # max integral contribution, rad/s
     yaw_d_lpf_alpha: 0.35  # D low-pass blend (0,1]; 1 = raw derivative
     # LOS-rate feed-forward: commands the rate the ball is moving at (from the
@@ -324,7 +331,7 @@ control_node:
     # Drop toward 0.6 if operating at consistently high LOS rate; filtering the
     # FF (yaw_ff_state_lpf_alpha) made it WORSE (adds phase lag, mistimes the
     # spike) — reduce the gain instead. Structurally zero for a still target.
-    yaw_ff_gain: 0.8
+    yaw_ff_gain: 1.0      # EXPERIMENTAL override (SITL candidate was 0.8)
     # 0.45 (was 0.25): the FF starts from ZERO at first lock and the low-pass
     # sets how fast it learns the ball's motion. 0.25 took ~0.5 s to warm up,
     # during which the drone lagged a moving ball right after acquisition.
@@ -335,7 +342,7 @@ control_node:
     # re-lock position jump as a huge velocity and would spike the yaw as the
     # feedback crosses centre (measured: swing to +0.9 err). Gating it off when
     # off-centre lets the feedback+anti-swing own the reel-in. 0 disables.
-    yaw_ff_align_error_limit: 0.6
+    yaw_ff_align_error_limit: 0.0   # EXPERIMENTAL: FF align gate OFF (was 0.6)
     # Optional flat zone of the FF gate: full FF for |error_x| <= inner, ramp
     # only between inner and the limit (removes the gate's in-band modulation
     # during steady tracking). 0 = original pure ramp. Offline A/B: NOT needed
@@ -369,7 +376,7 @@ control_node:
     # min_rate keeps a little authority just outside the deadband. Tuned in SITL
     # 2026-07-04 (far-off-bearing acquisition A/B). Disable for the old raw slew:
     # ros2 param set /control_node yaw_approach_limit_enabled false
-    yaw_approach_limit_enabled: true
+    yaw_approach_limit_enabled: false   # EXPERIMENTAL: braking cap OFF (was true)
     yaw_approach_delay_s: 0.35
     yaw_approach_decel: 0.8
     # 0.35 (was 0.15): the cap floor is what the feedback may still command
