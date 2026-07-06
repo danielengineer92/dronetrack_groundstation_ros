@@ -1,0 +1,41 @@
+# Fixed-center ("dumb position") orbit mission.
+#
+# Built for the 2026-07-06 field failure: YOLO confidence peaked 0.86 but lock
+# FLICKERED (39 LOCKED vs 501 SEARCHING status samples), so the visual-servo
+# orbit could never hold. This plan needs the ball only long enough to collect
+# a handful of position fixes:
+#
+#   1. scan rotates in place until the tracker first locks (lock_confirm_frames
+#      is 1, so a single good frame is enough).
+#   2. orbit_fixed keeps collecting local-NED fixes across lock flickers
+#      (median of center_samples fixes, KF estimate preferred, raw
+#      bearing+distance projection as fallback), FREEZES the center, then
+#      orbits it on pure geometry — losing the ball mid-orbit changes nothing.
+#      Yaw still faces the center, so the camera keeps filming the ball.
+#
+# orbit_fixed params: radius_m, speed_m_s, revolutions (timeout derived),
+# center_samples, sample_timeout_s. If too few fixes arrive in
+# sample_timeout_s the step advances WITHOUT orbiting (straight to land).
+mission:
+  name: position_orbit
+  steps:
+    - {type: takeoff, altitude_m: 3.2}
+    - {type: prime_offboard, hold_s: 1.5}
+    # Find the ball: sweep until the first lock. Generous timeout — outdoors
+    # the model may need several sweeps before one frame clears threshold.
+    - {type: scan, until: locked, timeout_s: 60}
+    # Tight orbit (operator request 2026-07-06): r=1.5 m. Speed cut to 0.6 m/s
+    # so the yaw needed to keep facing center (v/r = 0.4 rad/s ~ 23 deg/s)
+    # stays under the detuned max_yaw_rate of 0.6 rad/s; ~16 s per lap.
+    # 15 fixes (~2-4 s dwell): flight 1 froze off-center from 5 fixes taken in
+    # 0.4 s at scan-exit — one viewpoint, yaw still swinging, KF not yet valid
+    # (needs ~2 s), so every fix was a raw latest-yaw projection. The longer
+    # dwell lets TRACK_CENTER settle the yaw and the KF take over the fixes.
+    # descend_m 1.2: flights 3-4 orbited at ~3.5 m altitude, so the SLANT
+    # distance to the grounded ball read a steady ~3.05 m even though the
+    # horizontal ring was dead-on (operator: "kinda far"). Dropping to ~2.3 m
+    # brings the vehicle ~1 m closer to the ball without touching the
+    # (verified good) k=67 range calibration.
+    - {type: orbit_fixed, radius_m: 1.5, speed_m_s: 0.6, revolutions: 3,
+       center_samples: 15, sample_timeout_s: 25, descend_m: 1.2}
+    - {type: land}
