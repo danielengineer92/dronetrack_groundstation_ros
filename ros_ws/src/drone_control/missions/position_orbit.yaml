@@ -24,9 +24,11 @@ mission:
     # Find the ball: sweep until the first lock. Generous timeout — outdoors
     # the model may need several sweeps before one frame clears threshold.
     - {type: scan, until: locked, timeout_s: 60}
-    # r=4.0 @ 1.0 m/s matches the hand-verified visual orbit (~25 s/lap).
+    # Tight orbit (operator request 2026-07-06): r=1.5 m. Speed cut to 0.6 m/s
+    # so the yaw needed to keep facing center (v/r = 0.4 rad/s ~ 23 deg/s)
+    # stays under the detuned max_yaw_rate of 0.6 rad/s; ~16 s per lap.
     # 5 fixes is ~0.5 s of cumulative visibility — the flickering lock from
     # the field run delivers that easily within the 20 s sampling window.
-    - {type: orbit_fixed, radius_m: 4.0, speed_m_s: 1.0, revolutions: 3,
+    - {type: orbit_fixed, radius_m: 1.5, speed_m_s: 0.6, revolutions: 3,
        center_samples: 5, sample_timeout_s: 20}
     - {type: land}
