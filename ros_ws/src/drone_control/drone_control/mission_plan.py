@@ -42,6 +42,7 @@ STEP_TYPE_TO_STATE: dict[str, str] = {
     "approach": "APPROACH_TARGET",
     "goto": "GOTO",
     "orbit": "DO_ORBIT",
+    "orbit_fixed": "ORBIT_FIXED",
     "rtl": "RETURN_TO_LAUNCH",
     "land": "LAND",
     "hold": "HOLD",
@@ -61,7 +62,7 @@ VALID_UNTIL: frozenset[str] = frozenset(
 # these should normally come after a prime_offboard step. `scan` yaw-sweeps in
 # Offboard (position-held), so it belongs here too.
 MOTION_STEP_TYPES: frozenset[str] = frozenset(
-    {"scan", "track_center", "approach", "orbit"}
+    {"scan", "track_center", "approach", "orbit", "orbit_fixed"}
 )
 
 # Verbs that run open-loop or search for a bounded time. A plan author should give
@@ -71,6 +72,9 @@ MOTION_STEP_TYPES: frozenset[str] = frozenset(
 TIMEOUT_RECOMMENDED_STEP_TYPES: frozenset[str] = frozenset(
     {"scan", "approach", "orbit", "goto"}
 )
+# orbit_fixed is excluded: like orbit-with-revolutions, its timeout is derived
+# from radius/speed/revolutions, and its sampling phase has its own
+# sample_timeout_s backstop.
 
 # Allowed sweep directions for a `scan` step (counter-clockwise / clockwise yaw).
 VALID_SCAN_DIRECTIONS: frozenset[str] = frozenset({"ccw", "cw"})
@@ -93,6 +97,10 @@ NUMERIC_STEP_PARAM_RANGES: dict[str, tuple[Optional[float], Optional[float]]] = 
     "north_m": (-500.0, 500.0),
     "east_m": (-500.0, 500.0),
     "tolerance_m": (0.0, 50.0),
+    # orbit_fixed: vision fixes to median before freezing the center, and how
+    # long to keep trying before giving up and advancing to the next step.
+    "center_samples": (0.0, 100.0),
+    "sample_timeout_s": (0.0, 120.0),
 }
 
 

@@ -1,0 +1,32 @@
+# Fixed-center ("dumb position") orbit mission.
+#
+# Built for the 2026-07-06 field failure: YOLO confidence peaked 0.86 but lock
+# FLICKERED (39 LOCKED vs 501 SEARCHING status samples), so the visual-servo
+# orbit could never hold. This plan needs the ball only long enough to collect
+# a handful of position fixes:
+#
+#   1. scan rotates in place until the tracker first locks (lock_confirm_frames
+#      is 1, so a single good frame is enough).
+#   2. orbit_fixed keeps collecting local-NED fixes across lock flickers
+#      (median of center_samples fixes, KF estimate preferred, raw
+#      bearing+distance projection as fallback), FREEZES the center, then
+#      orbits it on pure geometry — losing the ball mid-orbit changes nothing.
+#      Yaw still faces the center, so the camera keeps filming the ball.
+#
+# orbit_fixed params: radius_m, speed_m_s, revolutions (timeout derived),
+# center_samples, sample_timeout_s. If too few fixes arrive in
+# sample_timeout_s the step advances WITHOUT orbiting (straight to land).
+mission:
+  name: position_orbit
+  steps:
+    - {type: takeoff, altitude_m: 3.2}
+    - {type: prime_offboard, hold_s: 1.5}
+    # Find the ball: sweep until the first lock. Generous timeout — outdoors
+    # the model may need several sweeps before one frame clears threshold.
+    - {type: scan, until: locked, timeout_s: 60}
+    # r=4.0 @ 1.0 m/s matches the hand-verified visual orbit (~25 s/lap).
+    # 5 fixes is ~0.5 s of cumulative visibility — the flickering lock from
+    # the field run delivers that easily within the 20 s sampling window.
+    - {type: orbit_fixed, radius_m: 4.0, speed_m_s: 1.0, revolutions: 3,
+       center_samples: 5, sample_timeout_s: 20}
+    - {type: land}

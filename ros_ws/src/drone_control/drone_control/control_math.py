@@ -50,12 +50,79 @@ def project_target_global(
 
     Returns ``(out_lat_deg, out_lon_deg)`` via an equirectangular offset.
     """
+    north_m, east_m = project_target_local_offset(
+        yaw_rad=yaw_rad,
+        bearing_x_rad=bearing_x_rad,
+        bearing_y_rad=bearing_y_rad,
+        slant_distance_m=slant_distance_m,
+    )
+    return offset_global(lat_deg, lon_deg, north_m, east_m)
+
+
+def project_target_local_offset(
+    *,
+    yaw_rad: float,
+    bearing_x_rad: float,
+    bearing_y_rad: float,
+    slant_distance_m: float,
+) -> tuple[float, float]:
+    """Project a monocular detection to a (north_m, east_m) offset from the drone.
+
+    Same slant-range foreshortening and yaw+bearing heading as
+    ``project_target_global`` (see its docstring), but stops at the local-NED
+    offset so callers working in PX4 local coordinates (ORBIT_FIXED) don't have
+    to round-trip through lat/lon.
+    """
     horizontal_m = float(slant_distance_m) * math.cos(float(bearing_y_rad))
     global_bearing = float(yaw_rad) + float(bearing_x_rad)
-    north_m = horizontal_m * math.cos(global_bearing)
-    east_m = horizontal_m * math.sin(global_bearing)
+    return (
+        horizontal_m * math.cos(global_bearing),
+        horizontal_m * math.sin(global_bearing),
+    )
 
-    return offset_global(lat_deg, lon_deg, north_m, east_m)
+
+def orbit_fixed_setpoint(
+    *,
+    drone_north: float,
+    drone_east: float,
+    center_north: float,
+    center_east: float,
+    radius_m: float,
+    speed_m_s: float,
+    lead_s: float,
+    clockwise: bool = True,
+) -> tuple[float, float, float]:
+    """Carrot position setpoint for a fixed-center orbit (no vision input).
+
+    The setpoint sits ON the circle, leading the drone's current angular
+    position by ``(speed / radius) * lead_s`` radians. Because the lead is
+    measured from where the drone actually is, the carrot self-regulates: if
+    the drone lags (wind, PX4 speed limits) the carrot waits instead of running
+    away, and if the drone starts off-circle the nearest-point projection pulls
+    it radially onto the ring. Angle convention matches atan2(east, north)
+    (NED: 0 = north, positive toward east => positive lead = clockwise from
+    above).
+
+    Returns ``(north_sp, east_sp, yaw_rad)`` with yaw facing the center so the
+    camera keeps filming the target even though vision is not consumed.
+    """
+    radius_m = max(float(radius_m), 0.1)
+    dn = float(drone_north) - float(center_north)
+    de = float(drone_east) - float(center_east)
+    if math.hypot(dn, de) < 1e-6:
+        # Degenerate: drone exactly at the center. Pick due north arbitrarily;
+        # the next tick has geometry again.
+        theta = 0.0
+    else:
+        theta = math.atan2(de, dn)
+
+    lead = (float(speed_m_s) / radius_m) * max(float(lead_s), 0.0)
+    theta_sp = theta + lead if clockwise else theta - lead
+
+    north_sp = float(center_north) + radius_m * math.cos(theta_sp)
+    east_sp = float(center_east) + radius_m * math.sin(theta_sp)
+    yaw_rad = math.atan2(float(center_east) - east_sp, float(center_north) - north_sp)
+    return north_sp, east_sp, yaw_rad
 
 
 def offset_global(

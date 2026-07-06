@@ -36,6 +36,7 @@ from drone_control.control_math import (
     approach_forward_velocity,
     braking_speed_limit,
     los_rate_from_state,
+    orbit_fixed_setpoint,
     yaw_feedforward_step,
     yaw_pid_step,
 )
@@ -208,6 +209,11 @@ class ControlNode(Node):
         # law keeps the nose on the target. Sign sets direction (+ = CCW seen
         # from above). Clamped by max_velocity_right in limit_motion.
         self.declare_parameter("orbit_tangential_speed_m_s", 0.4)
+        # Fixed-center orbit (ORBIT_FIXED): how far ahead (seconds of arc) the
+        # carrot position setpoint leads the drone's current angle on the
+        # circle. Larger = smoother/faster convergence to commanded speed;
+        # smaller = tighter tracking of the ring.
+        self.declare_parameter("orbit_fixed_lead_s", 1.5)
 
         autonomy_param = bool(self.get_parameter("autonomy_enabled").value)
         legacy_autonomous_param = bool(self.get_parameter("autonomous_enabled").value)
@@ -287,6 +293,7 @@ class ControlNode(Node):
         self.approach_decel = float(self.get_parameter("approach_decel").value)
         self.approach_align_error_limit = float(self.get_parameter("approach_align_error_limit").value)
         self.orbit_tangential_speed_m_s = float(self.get_parameter("orbit_tangential_speed_m_s").value)
+        self.orbit_fixed_lead_s = float(self.get_parameter("orbit_fixed_lead_s").value)
 
         self.validate_parameters()
         self.control_period = 1.0 / self.control_rate
@@ -1100,6 +1107,61 @@ class ControlNode(Node):
             ),
         )
 
+    def publish_position_setpoint(
+        self,
+        status: str,
+        *,
+        position_north: float,
+        position_east: float,
+        position_down: float,
+        yaw_rad: float,
+    ) -> None:
+        # Explicit (moving) POSITION setpoint for ORBIT_FIXED. Same fail-safe
+        # as publish_position_hold: if the EKF/GPS drops out, emit IDLE so PX4
+        # holds on its own failsafe instead of chasing a stale NED coordinate.
+        if not self.local_position_ready():
+            self.reset_position_hold_anchor()
+            self.publish_idle(STATUS_BLOCKED_NO_LOCAL_POSITION)
+            return
+        if not self.finite(position_north, position_east, position_down, yaw_rad):
+            self.publish_idle("BLOCKED_NONFINITE_POSITION_SETPOINT")
+            return
+
+        yaw_deg = self.yaw_rad_to_deg_0_360(yaw_rad)
+        command = self.make_command(
+            CMD_POSITION,
+            status,
+            executed=True,
+            velocity_forward=0.0,
+            velocity_right=0.0,
+            velocity_down=0.0,
+            yaw_rate=0.0,
+            position_valid=True,
+            position_north=float(position_north),
+            position_east=float(position_east),
+            position_down=float(position_down),
+            yaw_deg=yaw_deg,
+        )
+
+        self.last_command_forward = 0.0
+        self.last_command_right = 0.0
+        self.last_command_down = 0.0
+        self.last_command_yaw = 0.0
+
+        self.command_pub.publish(command)
+        self.command_count += 1
+        self.executed_command_count += 1
+
+        self.diagnostics.mark_published(
+            self.control_command_topic,
+            summary=(
+                f"commands={self.command_count}, executed={self.executed_command_count}, "
+                f"type={CMD_POSITION}, N={float(position_north):.2f}, "
+                f"E={float(position_east):.2f}, D={float(position_down):.2f}, "
+                f"yaw_deg={yaw_deg:.1f}, status={status}"
+            ),
+        )
+
     def publish_velocity(
         self,
         status: str,
@@ -1254,6 +1316,48 @@ class ControlNode(Node):
             commanded_yaw = float(mission.yaw_rate) if mission is not None else 0.0
             _, _, _, yaw = self.limit_motion(0.0, 0.0, 0.0, commanded_yaw)
             self.publish_position_hold("MISSION_SCAN", yaw_rate=yaw, update_yaw=True)
+            return
+
+        # Fixed-center orbit: pure geometry around the executor-frozen local-NED
+        # center. Deliberately BEFORE every vision gate below — the entire point
+        # of this mode is surviving lock loss (2026-07-06 field run: conf peaked
+        # 0.86 but lock flickered, so the visual-servo orbit never engaged).
+        # Translation double-gate matches APPROACH/ORBIT_TARGET.
+        if mission_mode == "ORBIT_FIXED":
+            if not self.enable_approach_translation:
+                self.publish_position_hold(
+                    "ORBIT_FIXED_TRANSLATION_DISABLED", yaw_rate=0.0, update_yaw=False)
+                return
+            if mission is None or not bool(getattr(mission, "orbit_center_valid", False)):
+                self.publish_position_hold(
+                    "ORBIT_FIXED_NO_CENTER", yaw_rate=0.0, update_yaw=False)
+                return
+            if not self.local_position_ready():
+                self.publish_idle(STATUS_BLOCKED_NO_LOCAL_POSITION)
+                return
+            tel = self.last_telemetry
+            north_sp, east_sp, yaw_sp_rad = orbit_fixed_setpoint(
+                drone_north=float(tel.local_position_north),
+                drone_east=float(tel.local_position_east),
+                center_north=float(mission.orbit_center_north),
+                center_east=float(mission.orbit_center_east),
+                radius_m=float(mission.orbit_radius_m),
+                speed_m_s=float(mission.orbit_speed_m_s),
+                lead_s=self.orbit_fixed_lead_s,
+            )
+            # Like the VELOCITY modes: drop the hold anchor every tick so any
+            # fallback hold (mode change, link loss) recaptures at the drone's
+            # CURRENT position instead of flying back to a pre-orbit anchor.
+            self.reset_position_hold_anchor()
+            self.publish_position_setpoint(
+                f"{STATUS_SENT}: ORBIT_FIXED r={float(mission.orbit_radius_m):.2f}m "
+                f"v={float(mission.orbit_speed_m_s):.2f}m/s "
+                f"c=({float(mission.orbit_center_north):.1f},{float(mission.orbit_center_east):.1f})",
+                position_north=north_sp,
+                position_east=east_sp,
+                position_down=float(mission.orbit_center_down),
+                yaw_rad=yaw_sp_rad,
+            )
             return
 
         if self.last_target_error is None:
