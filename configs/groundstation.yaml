@@ -49,7 +49,12 @@ web_dashboard_node:
     port: 8080
     link_status_topic: "/drone/groundstation/link_status"
     heartbeat_topic: "/groundstation/heartbeat"
-    detections_topic: "/groundstation/vision/detections"
+    # The TRUSTED, post-gate detection stream the tracker actually acts on —
+    # correct in every setup: on hardware the Pi's local YOLO publishes here;
+    # in the split/SITL setup the detection gate republishes here. The old
+    # /groundstation/vision/detections was the raw GS-YOLO output, which is
+    # empty when perception runs on the Pi.
+    detections_topic: "/drone/vision/detections"
     telemetry_topic: "/drone/telemetry"
     mission_request_topic: "/drone/mission/request"
     autonomy_request_topic: "/drone/autonomy/request"
