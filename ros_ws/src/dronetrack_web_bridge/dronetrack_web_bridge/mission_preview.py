@@ -320,6 +320,19 @@ def _fallback_lint(steps: list[dict[str, Any]]) -> list[str]:
             warnings.append(
                 f"step {index} 'scan' has neither 'until' nor 'timeout_s'; it should have a bounded exit"
             )
+        if step_type == "scan" and params.get("until") in (None, "none"):
+            warnings.append(
+                f"step {index} 'scan' has no until:locked; it will sweep its full duration "
+                "even after the target locks"
+            )
+        if step_type == "orbit" and not any(
+            str(s["type"]) == "approach" and int(s["index"]) < index for s in steps
+        ):
+            warnings.append(
+                f"step {index} 'orbit' has no preceding 'approach'; the orbit step will still "
+                "close in via its entry envelope, but an explicit approach gives the profiled "
+                "deceleration onto the ring"
+            )
     if has_motion and not has_prime:
         warnings.append("plan contains motion steps but no 'prime_offboard' step; Offboard is never primed")
     return warnings

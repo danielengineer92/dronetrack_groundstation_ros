@@ -22,6 +22,12 @@ export INSTALL_DIR
 GS_DEFAULTS=(model_path:="${REPO_ROOT}/models/red_ball_yolo11s.pt" target_class:=red_ball device:=cuda:0 half_precision:=True max_fps:=60.0)
 GS_ARGS=("$@"); [ "${#GS_ARGS[@]}" -gt 0 ] || GS_ARGS=("${GS_DEFAULTS[@]}")
 
+# The Pi runs its own local ncnn YOLO by default (pi_launch local_yolo), so the
+# ground station defaults to dashboard+heartbeat only. Two YOLOs must never
+# feed the tracker at once. Override with GS_YOLO=true for the old split mode
+# (also set local_yolo:=false on the Pi side then).
+GS_ARGS+=("gs_yolo:=${GS_YOLO:-false}")
+
 echo "==> [1/5] Discovering laptop + Pi IPs (subnet-agnostic) ..."
 bash "${HERE}/discover_ips.sh"
 

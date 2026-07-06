@@ -475,9 +475,17 @@ class TelemetryNode(Node):
         async for battery in drone.telemetry.battery():
             if not self._running:
                 return
+            # MAVSDK v3 Battery.remaining_percent is ALREADY 0..100 (v1/v2 was
+            # 0..1). The old "* 100.0" made a real 7% pack read 700%, which the
+            # ">0 and <min" low-battery gates can never catch — observed in the
+            # 2026-07-05 field logs (700-1600% while genuinely at 7-16%).
+            # Unknown battery (PX4 reports -1 / MAVSDK ~-100) maps to -1.0 so
+            # gates can distinguish "unknown" from "low" explicitly.
+            remaining = float(battery.remaining_percent)
+            remaining = -1.0 if remaining < 0.0 else min(remaining, 100.0)
             with self._data_lock:
                 self._telemetry_data['battery_voltage'] = battery.voltage_v
-                self._telemetry_data['battery_remaining'] = battery.remaining_percent * 100.0
+                self._telemetry_data['battery_remaining'] = remaining
 
     async def _stream_position(self, drone) -> None:
         async for position in drone.telemetry.position():

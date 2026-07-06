@@ -96,9 +96,16 @@ class YoloNode(Node):
 
         image_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                history=HistoryPolicy.KEEP_LAST, depth=1)
-        # BEST_EFFORT outbound: laptop->Pi over Wi-Fi, freshest-wins, never blocks.
-        detection_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                                   history=HistoryPolicy.KEEP_LAST, depth=1)
+        # BEST_EFFORT outbound suits the lossy laptop->Pi WiFi path (freshest
+        # wins, never blocks). When this node runs ON the Pi publishing straight
+        # to the tracker (local_yolo), the tracker subscribes RELIABLE — a
+        # BEST_EFFORT publisher is QoS-INCOMPATIBLE there and delivers nothing.
+        # Local launches set reliable_detections:=true.
+        self.declare_parameter("reliable_detections", False)
+        reliable = bool(self.get_parameter("reliable_detections").value)
+        detection_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
 
         if self.transport == "raw":
             self.sub = self.create_subscription(Image, self.image_topic, self._on_raw, image_qos)
@@ -162,6 +169,12 @@ class YoloNode(Node):
 
     # ---- image callbacks -------------------------------------------------
     def _on_compressed(self, msg: CompressedImage) -> None:
+        # Throttle BEFORE the JPEG decode: at a 30-50 fps camera the decode
+        # alone burns ~0.3-0.5 s of CPU per second inside this process, which
+        # starves ncnn on a Pi (measured: 510 ms/inference in-stack vs 117 ms
+        # standalone before this reorder). Skipped frames now cost ~nothing.
+        if not self._should_process():
+            return
         try:
             frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as exc:  # noqa: BLE001
@@ -170,6 +183,8 @@ class YoloNode(Node):
         self._process(frame, msg.header.stamp)
 
     def _on_raw(self, msg: Image) -> None:
+        if not self._should_process():
+            return
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as exc:  # noqa: BLE001
@@ -177,13 +192,13 @@ class YoloNode(Node):
             return
         self._process(frame, msg.header.stamp)
 
-    # ---- inference -------------------------------------------------------
-    def _process(self, frame, stamp) -> None:
+    def _should_process(self) -> bool:
+        """Cheap frame gating, run before any decode work."""
         self._received_frames += 1
         if not self.model_loaded:
-            return
+            return False
         if self._received_frames % self.process_every_n_frames != 0:
-            return
+            return False
         # Anchored-schedule throttle. A naive "now - last >= interval" check drops
         # every other frame when max_fps equals the camera rate: frame periods
         # jitter around the interval, so half of them land a hair early. Anchoring
@@ -192,12 +207,15 @@ class YoloNode(Node):
         now = time.monotonic()
         if self.min_process_interval_s > 0.0:
             if now < self._next_process_time:
-                return
+                return False
             slot = self._next_process_time + self.min_process_interval_s
             # If we fell far behind (slow inference, stalled stream), re-anchor to
             # now instead of racing to catch up on a backlog of virtual slots.
             self._next_process_time = slot if slot > now - self.min_process_interval_s else now + self.min_process_interval_s
+        return True
 
+    # ---- inference -------------------------------------------------------
+    def _process(self, frame, stamp) -> None:
         try:
             img_h, img_w = frame.shape[:2]
             t0 = time.time()

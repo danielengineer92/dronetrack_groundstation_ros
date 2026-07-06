@@ -10,7 +10,9 @@ Runs everything that MUST stay on the drone:
   - detection gate (laptop perception in) (new: dronetrack_pi)
   - ground-station watchdog               (new: dronetrack_pi)
 
-YOLO and the dashboard do NOT run here — they run on the laptop ground station.
+YOLO runs HERE by default since 2026-07-05 (local_yolo, ncnn on CPU) so
+perception does not depend on the WiFi link; the dashboard (and optionally a
+GS-side YOLO for bench work, see up.sh GS_YOLO) runs on the laptop.
 
 The "reused" nodes come from dronetrack_pi_ros. Copy those packages into this
 workspace's src/ (see scripts/setup_pi.sh and docs/migration_from_dronetrack_pi_ros.md).
@@ -60,6 +62,20 @@ def generate_launch_description() -> LaunchDescription:
     native_mjpeg_arg = DeclareLaunchArgument(
         'native_mjpeg', default_value='true',
         description='Publish native V4L2 MJPEG directly as CompressedImage; disables raw camera + compressor path.')
+    local_yolo_arg = DeclareLaunchArgument(
+        'local_yolo', default_value='true',
+        description='Run YOLO (ncnn, CPU) on the Pi itself so perception does not '
+                    'ride the WiFi link. Publishes straight to the tracker input '
+                    '(/drone/vision/detections); the GS yolo_node must NOT run '
+                    'concurrently (see up.sh GS_YOLO).')
+    local_yolo_model_arg = DeclareLaunchArgument(
+        'local_yolo_model',
+        default_value=os.path.expanduser('~/models/red_ball_ncnn_model'),
+        description='Path to the ncnn model directory (deployed by deploy_pi.sh).')
+    local_yolo_imgsz_arg = DeclareLaunchArgument(
+        'local_yolo_imgsz', default_value='320',
+        description='Inference size; MUST match the ncnn export imgsz '
+                    '(320 for red_ball_ncnn_model, 480 for red_ball_480_ncnn_model).')
 
     params = LaunchConfiguration('params_file')
     truthy = ('1', 'true', 'yes', 'on')
@@ -109,6 +125,35 @@ def generate_launch_description() -> LaunchDescription:
         output='screen',
         condition=compress_condition)
 
+    # ---- Pi-local YOLO (ncnn, CPU) ----------------------------------------
+    # Perception on the drone: consumes the camera's NATIVE hardware MJPEG
+    # (no Pi-side encode exists; one unavoidable ~3 ms decode here) and
+    # publishes DIRECTLY to the tracker input. This intentionally bypasses
+    # detection_gate_node — the gate exists to validate the UNTRUSTED WiFi
+    # path from the laptop, and its require_heartbeat would kill local
+    # detections whenever the GS link blips (the 2026-07-05 field failure).
+    local_yolo = Node(
+        package='dronetrack_perception', executable='yolo_node',
+        name='local_yolo_node',
+        # Two dedicated cores: the launcher pins the rest of the stack to 0-1
+        # (pi_split_launcher.sh); ncnn gets 2-3 uncontended. sched_setaffinity
+        # may widen beyond the inherited mask, so this override works.
+        prefix='taskset -c 2,3',
+        parameters=[{
+            'model_path': LaunchConfiguration('local_yolo_model'),
+            'input_size': ParameterValue(LaunchConfiguration('local_yolo_imgsz'), value_type=int),
+            'device': 'cpu',
+            'target_class': 'red_ball',
+            'image_transport': 'compressed',
+            'compressed_image_topic': LaunchConfiguration('compressed_image_topic'),
+            'detections_topic': '/drone/vision/detections',
+            'reliable_detections': True,     # tracker subscribes RELIABLE
+            'confidence_threshold': 0.05,
+            'max_fps': 10.0,
+        }],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('local_yolo')))
+
     # ---- Reused safety-critical Pi nodes (from dronetrack_pi_ros) ---------
     reused = IfCondition(LaunchConfiguration('reused_pi_nodes'))
     camera = Node(package='drone_camera', executable='camera_node', name='camera_node',
@@ -138,11 +183,14 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         params_file_arg, raw_image_topic_arg, compressed_image_topic_arg,
         connection_url_arg, allow_mavsdk_actions_arg, reused_pi_nodes_arg, compress_arg, native_mjpeg_arg,
+        local_yolo_arg, local_yolo_model_arg,
         LogInfo(msg='=== DRONETRACK PI (on-drone) — safety-critical stack ==='),
-        LogInfo(msg='YOLO + dashboard run on the LAPTOP ground station.'),
+        LogInfo(msg=['local_yolo=', LaunchConfiguration('local_yolo'),
+                     ' (true: perception onboard; GS yolo_node must be off)']),
         LogInfo(msg=['Streaming compressed camera on ', LaunchConfiguration('compressed_image_topic')]),
         detection_gate,
         watchdog,
+        local_yolo,
         native_camera,
         compress,
         camera,

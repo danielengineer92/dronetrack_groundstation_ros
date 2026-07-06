@@ -652,6 +652,12 @@ class MissionExecutorNode(Node):
     def is_airborne(self) -> bool:
         if self.last_telemetry is None:
             return False
+        # A disarmed vehicle is never airborne, whatever the land detector
+        # says. PX4 can report IN_AIR/UNKNOWN while disarmed on the ground,
+        # which (with the unconditional IN_AIR trust below) let the takeoff
+        # step "complete" without ever sending a TAKEOFF action.
+        if not bool(self.last_telemetry.armed):
+            return False
         altitude = float(self.last_telemetry.relative_altitude)
         landed_state = str(self.last_telemetry.landed_state).upper()
         if "ON_GROUND" in landed_state or "LANDED" in landed_state:
@@ -1365,13 +1371,49 @@ class MissionExecutorNode(Node):
                 self.publish_mission_command("TRACK_CENTER", True, "centering target before orbit")
                 self.publish_state("orbit hold: target not centered")
                 return False
+            # Entry envelope (same rule as the DO_ORBIT path): APPROACH to the
+            # ring before strafing. Without this the orbit starts from wherever
+            # the scan locked — observed in the field: orbit engaged directly
+            # from track_center at long range and spiralled in instead of
+            # approaching first. Timeout counts orbit time only (from the
+            # first ORBIT_TARGET), not the approach.
+            entry_factor = float(self.get_parameter("orbit_entry_distance_factor").value)
+            if entry_factor > 0.0:
+                entry_max_m = radius_m * entry_factor + float(
+                    self.get_parameter("orbit_entry_slack_m").value
+                )
+                distance_ok = (
+                    self.last_target is not None
+                    and bool(getattr(self.last_target, "distance_valid", False))
+                    and math.isfinite(float(self.last_target.distance_m))
+                    and float(self.last_target.distance_m) > 0.0
+                )
+                if not distance_ok or float(self.last_target.distance_m) > entry_max_m:
+                    dist_text = (
+                        f"{float(self.last_target.distance_m):.2f}m" if distance_ok else "invalid"
+                    )
+                    self.publish_mission_command(
+                        "APPROACH_TARGET", True,
+                        f"closing to orbit entry envelope (<= {entry_max_m:.2f}m) before visual orbit",
+                        desired_distance_m=radius_m,
+                    )
+                    self.publish_state(
+                        f"orbit hold: outside entry envelope (distance={dist_text}, "
+                        f"max={entry_max_m:.2f}m)"
+                    )
+                    return False
+            orbit_key = self._step_action_key("visual_orbit")
+            mark = self._orbit_marks.get(orbit_key)
+            if mark is None:
+                mark = self.step_age()
+                self._orbit_marks[orbit_key] = mark
             self.publish_mission_command(
                 "ORBIT_TARGET", True, "visual-servo orbit fallback",
                 desired_distance_m=radius_m,
             )
-            age = self.step_age()
-            self.publish_state(f"orbiting/requested, age={age:.1f}/{timeout:.1f}s")
-            return age > timeout
+            orbit_age = self.step_age() - mark
+            self.publish_state(f"orbiting/requested, age={orbit_age:.1f}/{timeout:.1f}s")
+            return orbit_age > timeout
 
         # DO_ORBIT path: PX4 flies the orbit in ORBIT mode, which the offboard
         # stream would immediately override (telemetry restarts Offboard the

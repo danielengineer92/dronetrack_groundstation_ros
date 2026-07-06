@@ -932,7 +932,13 @@ class ControlNode(Node):
         if not telemetry.connected:
             return False, STATUS_BLOCKED_DISCONNECTED
 
-        if telemetry.battery_remaining_percent < self.min_battery_percent:
+        # Unknown battery is reported as a negative sentinel (-1; historically
+        # -100). Only a KNOWN-low battery blocks — matching the telemetry and
+        # autonomy-manager gates. The unguarded "< min" comparison blocked every
+        # command on USB bench power (battery=-100 -> 7343 BLOCKED_LOW_BATTERY
+        # hits in the 2026-07-05 logs).
+        battery_percent = float(telemetry.battery_remaining_percent)
+        if 0.0 < battery_percent < self.min_battery_percent:
             return False, STATUS_BLOCKED_LOW_BATTERY
 
         if self.require_gps and not telemetry.health_gps_ok:

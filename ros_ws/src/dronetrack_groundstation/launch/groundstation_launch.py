@@ -46,6 +46,11 @@ def generate_launch_description() -> LaunchDescription:
     dashboard_arg = DeclareLaunchArgument(
         'dashboard', default_value='true',
         description='Run the web dashboard.')
+    gs_yolo_arg = DeclareLaunchArgument(
+        'gs_yolo', default_value='true',
+        description='Run YOLO on the ground station. Set false when the Pi runs '
+                    'its own local_yolo (default since 2026-07-05) — two YOLOs '
+                    'must never feed the tracker at once.')
     dashboard_port_arg = DeclareLaunchArgument(
         'dashboard_port', default_value='8080',
         description='HTTP port for the dashboard.')
@@ -61,7 +66,8 @@ def generate_launch_description() -> LaunchDescription:
             'half_precision': ParameterValue(LaunchConfiguration('half_precision'), value_type=bool),
             'max_fps': ParameterValue(LaunchConfiguration('max_fps'), value_type=float),
         }],
-        output='screen')
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('gs_yolo')))
 
     heartbeat = Node(
         package='dronetrack_groundstation', executable='heartbeat_node',
@@ -77,6 +83,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         params_file_arg, model_path_arg, target_class_arg, device_arg,
         half_precision_arg, max_fps_arg, dashboard_arg, dashboard_port_arg,
+        gs_yolo_arg,
         LogInfo(msg='=== DRONETRACK GROUND STATION (laptop) ==='),
         LogInfo(msg=['Dashboard: http://127.0.0.1:', LaunchConfiguration('dashboard_port'), '/  (use 127.0.0.1 from Windows/WSL2)']),
         LogInfo(msg='Publishes detections + heartbeat to the Pi; the Pi validates everything.'),

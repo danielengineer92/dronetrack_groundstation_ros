@@ -1,0 +1,465 @@
+# =============================================================================
+# HARDWARE Pi configuration — the file deploy_pi.sh ships to the real drone.
+# configs/pi.yaml stays SIM-flavored (gz camera, sim calibration); this file
+# carries the tape-measured / field-tuned values. deploy_pi.sh stages THIS
+# file into dronetrack_pi/config/pi.yaml before rsync, so a sim build's
+# stage_configs can never poison a hardware deploy again.
+# Provenance highlights (2026-07-05 field session):
+#   distance_calibration_k 67.0   tape-calibrated 2 m + 4 m, 8.5 in ball
+#   camera 640x480, FOV 120x105   Pi Global Shutter (IMX296) + 120 deg lens
+#   watchdog heartbeat 10 s       ride through WiFi blips (perception onboard)
+#   yaw detune                    first-flight-safe after the wrong-FOV hunting
+# =============================================================================
+# =============================================================================
+# Pi-side parameters (split DroneTrack architecture)
+#
+# This is the single authoritative config for everything that runs ON THE DRONE.
+# The reused sections (camera/tracker/telemetry/autonomy/mission/control/health)
+# are carried over verbatim from dronetrack_pi_ros full_system_params.yaml so the
+# Pi behaves identically. YOLO, visualizer, and dashboard sections were removed
+# because those now run on the laptop (see configs/groundstation.yaml).
+#
+# Topic names are kept compatible with dronetrack_pi_ros. See configs/topics.yaml
+# for the boundary topic map and configs/network.example.yaml for IP/DDS setup.
+# =============================================================================
+
+# ---- NEW: laptop perception trust boundary ----------------------------------
+detection_gate_node:
+  ros__parameters:
+    inbound_detections_topic: "/groundstation/vision/detections"   # untrusted, from laptop
+    outbound_detections_topic: "/drone/vision/detections"          # trusted, to Pi tracker
+    heartbeat_topic: "/groundstation/heartbeat"
+    max_detection_age_s: 1.5        # drop frames older than this (Pi->laptop->Pi round-trip;
+                                    # raised from 0.5 to tolerate weak-Wi-Fi latency + inference)
+    max_heartbeat_age_s: 1.0        # link considered down past this
+    require_heartbeat: true         # no heartbeat yet => drop all detections
+    max_message_rate_hz: 60.0       # inbound flood / DoS cap
+    max_detections: 20              # absurd-payload cap
+    min_confidence: 0.05            # noise floor (tracker still has its own min_confidence)
+    clock_skew_tolerance_s: 0.25    # tolerate small future stamps from clock jitter
+    report_period_s: 5.0
+
+# ---- NEW: ground-station watchdog -------------------------------------------
+ground_station_watchdog_node:
+  ros__parameters:
+    heartbeat_topic: "/groundstation/heartbeat"
+    inbound_detections_topic: "/groundstation/vision/detections"
+    link_status_topic: "/drone/groundstation/link_status"
+    link_ok_topic: "/drone/groundstation/ok"
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    # Perception is onboard (local_yolo) — the GS link is dashboard-only, so
+    # tolerate WiFi blips instead of de-asserting autonomy every dropout
+    # (2026-07-05: HEARTBEAT_STALE every 15-30 s froze control mid-approach).
+    # De-assert still fires after 10 s as the backstop.
+    max_heartbeat_age_s: 10.0
+    max_detection_age_s: 10.0
+    check_rate_hz: 10.0
+    deassert_on_link_loss: true     # publish autonomy/offboard request=false on link loss
+    request_hold_on_link_loss: false  # also request MAVSDK HOLD (needs allow_mavsdk_actions on Pi)
+
+native_mjpeg_camera_node:
+  ros__parameters:
+    compressed_image_topic: "/drone/camera/image_raw/compressed"
+    frame_id: "camera_optical_frame"
+    camera_device: "/dev/video0"
+    camera_index: 0
+    frame_width: 640
+    frame_height: 480
+    fps: 60.0
+    fourcc: "MJPG"
+    buffer_count: 4
+    report_period_s: 5.0
+
+camera_compressor_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw"
+    compressed_image_topic: "/drone/camera/image_raw/compressed"
+    jpeg_quality: 80
+    report_period_s: 5.0
+
+# ---- REUSED from dronetrack_pi_ros (must stay on the Pi) ---------------------
+camera_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw"
+    frame_id: "camera_optical_frame"
+    buffer_size: 1
+    camera_index: 0
+    frame_width: 640
+    frame_height: 480
+    fps: 60.0
+    camera_backend: "v4l2"
+    fourcc: "MJPG"
+
+tracker_node:
+  ros__parameters:
+    detections_topic: "/drone/vision/detections"   # gate republishes here
+    target_error_topic: "/drone/tracking/target_error"
+    target_class: "red_ball"
+    min_confidence: 0.08
+    detection_timeout: 2.5
+    reacquisition_timeout: 6.0
+    # 0.5 (was 0.35): EMA weight on the newest error sample. At ~12 fps YOLO,
+    # 0.35 added ~150 ms of extra lag on top of the pipeline delay — visible as
+    # trailing a moving ball, worst right after first lock. 0.5 halves that.
+    smoothing_alpha: 0.5
+    target_area_min: 0.0001   # 0.2m ball stays trackable to ~16m (was 0.0004 = ~8m cutoff; far orbit hit 9m)
+    target_area_max: 0.7
+    publish_rate: 30.0
+    proximity_threshold: 0.12
+    stale_detection_timeout: 3.5
+    missed_detection_threshold: 30   # FIELD: ride through 2-3s outdoor detection dropouts
+    coast_timeout: 5.0               # FIELD: hold lock through link/blur blips
+    lock_confirm_frames: 1
+    estimate_distance: true
+    # Empirical: distance_m = k / diameter_px.
+    # 2026-07-05: recalibrated for the 8.5 in (0.2159 m) sim ball against gz
+    # truth at 3 m (k=121.5, fat 1.04x) and 7 m (k=119.0, fat 1.02x) with the
+    # drone's own-airframe false positive EXCLUDED -> k = 120.3. The previous
+    # k=147 ("1.36x fat") was contaminated by that false positive (a red
+    # airframe piece in the frame corner detected as red_ball at 0.87 conf,
+    # constant 45 px) and over-read every distance ~22%.
+    # RE-CALIBRATE FOR REAL HARDWARE: put the ball at a tape-measured distance
+    # and run  scripts/ros_wsl.sh env python3 scripts/calibrate_distance.py \
+    #   --true-distance-m <m>   — it prints the k (and fat-factor) to set here.
+    # k is camera+model specific; re-run after retraining or swapping YOLO.
+    distance_calibration_k: 67.0   # HARDWARE Pi camera 640x480, tape-calibrated 2m+4m 2026-07-05
+    # Ball diameter: sim and the REAL DroneTrack ball are both 8.5 in =
+    # 0.2159 m now (models/red_ball.sdf radius 0.10795). Used by the pinhole
+    # fallback when k <= 0, and by the calibration tool's fat-factor report.
+    ball_diameter_m: 0.2159
+    focal_length_px: 0.0
+    # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad) at 1280x960,
+    # fx=fy=539 px. MUST equal the resolution YOLO runs on: Wrong FOV skews bearing_x/bearing_y
+    # (and the pinhole distance fallback) by fx_err.
+    horizontal_fov_deg: 120.0  # HARDWARE: 120 deg wide-angle lens on the IMX296 (operator-confirmed)
+    vertical_fov_deg: 105.0    # HARDWARE: 4:3 at the same fx as the 120 deg horizontal
+    image_width_px: 640        # HARDWARE 640x480 stream
+    image_height_px: 480       # HARDWARE
+    min_distance_m: 0.25
+    max_distance_m: 12.0
+    distance_filter_alpha: 0.25
+
+telemetry_node:
+  ros__parameters:
+    telemetry_topic: "/drone/telemetry"
+    connection_url: "serial:///dev/ttyACM0:57600"
+    publish_rate: 10.0
+    reconnect_interval: 5.0
+    connection_timeout: 10.0
+    control_command_topic: "/drone/control/command"
+    offboard_enable_topic: "/drone/mavsdk/offboard_enable"
+    command_status_topic: "/drone/mavsdk/command_status"
+    action_command_topic: "/drone/mavsdk/action_command"
+    mavsdk_offboard_enabled: false
+    command_rate: 20.0
+    command_timeout: 0.5
+    require_armed_for_offboard: true
+    min_battery_percent: 20.0
+    max_yaw_rate_rad_s: 1.0
+    allow_translation_commands: true    # HARDWARE: telemetry gate for VELOCITY commands
+    stop_offboard_on_disable: true
+    allow_mavsdk_actions: false      # keep false for normal hardware bench work
+    allow_arm_via_mavsdk: false      # extra opt-in for the dashboard Arm button; hardware stays false
+    action_command_timeout: 3.0
+    action_telemetry_timeout: 2.0
+    action_airborne_altitude_m: 0.5
+
+autonomy_manager_node:
+  ros__parameters:
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    autonomy_enable_topic: "/drone/autonomy/enabled"
+    offboard_enable_topic: "/drone/mavsdk/offboard_enable"
+    autonomy_state_topic: "/drone/autonomy/state"
+    manager_enabled: true
+    initial_autonomy_request: false
+    initial_offboard_request: false
+    publish_rate: 10.0
+    target_timeout: 3.0
+    telemetry_timeout: 2.0
+    request_timeout: 0.0
+    enable_offboard_when_ready: true
+    # Opt-in (default OFF): allow pre-lock, yaw-only autonomy during a SCAN step so
+    # the drone can yaw-sweep to search. Movement stays yaw-only (control_node holds
+    # position in SCAN mode). Default true so a from-scratch scan can search;
+    # set false on hardware if you want to require a prior lock before any autonomy.
+    allow_scan_without_lock: true
+    # SITL/dev: grant autonomy on request+safety alone — no target lock needed
+    # (mission can prime offboard / goto / hand off the orbit pre-lock).
+    # Set true on hardware to require a lock before any autonomous motion.
+    require_target_lock: false
+    mission_command_topic: "/drone/mission/command"
+    mission_command_timeout: 1.0
+    require_connected: true
+    require_armed: true
+    require_health_all_ok: false
+    require_gps: false
+    required_flight_mode: ""
+    min_battery_percent: 20.0
+
+mission_executor_node:
+  ros__parameters:
+    # In-house visual-servo orbit (control_node ORBIT_TARGET): PX4's
+    # MAV_CMD_DO_ORBIT is ACK'd ACCEPTED but never engages ORBIT mode on this
+    # SITL build (verified directly via MAVSDK 2026-07-05), so the mode
+    # hand-off path can never work. The visual-servo orbit also stays in
+    # OFFBOARD (no release/recapture dance) and centers on the tracked ball.
+    use_mavsdk_do_orbit: false
+    # Orbit-ahead: lead the DO_ORBIT centre along the estimated target
+    # velocity by this many seconds (0 = centre on where the ball IS; only
+    # applies when the state estimate is valid, fresh, and moving).
+    orbit_lead_s: 0.0
+    orbit_lead_min_speed_m_s: 0.3
+    orbit_lead_max_state_age_s: 1.0
+    # Curved lead: extrapolate on a constant-turn-rate arc, not a straight
+    # v*lead tangent. SITL sweep (2026-07-04): cuts lead-vector direction
+    # error ~23 deg -> ~9 deg on the orbiting ball, robust across q.
+    orbit_lead_curved: true
+    # Orbit entry envelope (anti launch-at-target). PX4's ORBIT mode captures
+    # the ring by flying STRAIGHT AT the centre from wherever the vehicle is,
+    # so DO_ORBIT sent from far away darts the drone at the ball. Only send it
+    # once distance <= radius * factor + slack; outside, the orbit step keeps
+    # commanding APPROACH_TARGET (profiled closing when translation is enabled,
+    # hold+centre when not — the step timeout is the backstop). 0 disables.
+    orbit_entry_distance_factor: 1.75
+    orbit_entry_slack_m: 0.5
+    target_state_topic: "/drone/tracking/target_state"
+    mission_enabled: true
+    auto_start: false
+    mission_request_topic: "/drone/mission/request"
+    mission_command_topic: "/drone/mission/command"
+    mission_state_topic: "/drone/mission/state"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    autonomy_request_topic: "/drone/autonomy/request"
+    offboard_request_topic: "/drone/mavsdk/offboard_request"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    publish_rate: 10.0
+    require_connected_for_mission: true
+    require_armed_for_mission: true
+    telemetry_timeout_s: 2.0
+    takeoff_altitude_m: 3.0
+    # A commanded 3.0 m takeoff settles at ~2.75 m measured; 2.7 left 5 cm of
+    # margin and flapped NOT_AIRBORNE mid-orbit. Keep this well under hover.
+    airborne_altitude_m: 2.3
+    takeoff_timeout_s: 20.0
+    offboard_prime_time_s: 1.5
+    track_center_timeout_s: 0.0
+    run_full_orbit_after_track_center: false
+    # Scan-for-target defaults (overridable per scan step in the mission YAML).
+    scan_yaw_deg: 180.0
+    # 40 (was 20): a target moving on its own subtends up to ~19 deg/s of LOS
+    # from a close hover — a 20 deg/s sweep chasing it from behind closes at
+    # ~1 deg/s and takes forever to find it. 40 out-runs it decisively; the
+    # sweep stops the instant the tracker locks, so the higher rate does not
+    # cost lock stability. YOLO at ~12 fps still gets ~20 looks per FOV pass.
+    scan_yaw_rate_deg_s: 40.0
+    scan_timeout_s: 12.0
+    # goto step defaults (world-frame offset reposition via MAVSDK goto_location;
+    # gated by telemetry_node.allow_mavsdk_actions like TAKEOFF/DO_ORBIT).
+    goto_timeout_s: 30.0
+    goto_tolerance_m: 1.0
+    mission_plan_file: ""
+    # Runtime plan upload (dashboard mission builder). Plans arriving here are
+    # fully re-validated and refused while a mission is active. Set the request
+    # topic to "" to disable uploads entirely (e.g. locked-down hardware).
+    mission_plan_topic: "/drone/mission/plan_request"
+    mission_plan_ack_topic: "/drone/mission/plan_ack"
+    event_log_enabled: true
+    event_log_directory: "~/drone_mission_logs"
+
+target_state_estimator_node:
+  ros__parameters:
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    target_state_topic: "/drone/tracking/target_state"
+    publish_rate_hz: 10.0
+    # CV-Kalman process noise: how hard the target may maneuver (m^2/s^3).
+    # Swept 0.1/0.3/1.0/3.0 against gz truth (2026-07-04, see
+    # docs/target_state_estimator.md): 0.3 gives prediction error within 4%
+    # of best AND the only healthy NIS (1.71 ~ 2.0) -> trustworthy std-devs.
+    # Runtime-tunable; watch avg_nis in the node log when changing.
+    accel_noise_density: 0.3
+    # Measurement noise model: cross-range from bearing (~0.23 deg), radial
+    # from monocular k/diam (a fixed pixel jitter is a fixed FRACTION of
+    # range -> sigma_r = fraction * range, floored).
+    sigma_bearing_rad: 0.004
+    sigma_range_fraction: 0.08
+    sigma_range_floor_m: 0.15
+    prediction_horizon_s: 0.5
+    coast_timeout_s: 2.0
+    reset_timeout_s: 4.0
+    min_updates_for_valid: 8
+    max_telemetry_age_s: 0.5
+    # Pair each detection with the drone pose AT ITS CAPTURE STAMP
+    # (interpolated from a short telemetry history) instead of the latest
+    # telemetry. The bearing is ~0.35 s old on arrival; projecting it with the
+    # CURRENT yaw leaks our own rotation into the target estimate and feeds
+    # back through the yaw FF — closed-loop model showed this was THE dominant
+    # cause of the side-to-side wobble at high LOS rate (peak-window error
+    # 0.41 -> 0.06 when fixed). Runtime-tunable for live A/B:
+    # ros2 param set /target_state_estimator_node pair_at_capture_stamp false
+    pair_at_capture_stamp: true
+
+control_node:
+  ros__parameters:
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    control_command_topic: "/drone/control/command"
+    mission_command_topic: "/drone/mission/command"
+    autonomy_enabled: false
+    # ============================================================
+    # EXPERIMENTAL OVERRIDE (2026-07-04): bare PD+FF baseline — only P, D, FF
+    # and capture-stamp pairing are active. Tuning aids OFF: braking cap,
+    # FF alignment gate, FF-state LPF, I. Current: kp 1.6 / kd 0.15 / ff 1.0.
+    # The tuned SITL candidate (kp 2.0 / kd 0.3 / ff 0.8 + aids on) is saved in
+    # configs/yaw_config_backup_2026-07-04.md and in git @63d41c1. The §11/§12
+    # notes below describe that SITL candidate, not these override values.
+    # ------------------------------------------------------------
+    # SITL CANDIDATE — NOT FLIGHT-VALIDATED. These yaw gains were tuned in
+    # PX4/Gazebo SITL only (2026-07-04). Do NOT treat them as hardware-proven.
+    # Before the first real flight, follow the bring-up in
+    # docs/controller_math_review.md §12: set log_yaw_terms:=true and start
+    # LOWER, roughly  gain_yaw 1.0 / yaw_kd 0.1 / yaw_ff_gain 0.4 , confirm the
+    # FF term shares the P term's sign on a moving off-centre target, then raise
+    # each toward the SITL candidate while watching the logged term breakdown
+    # (raw vs clamped command, achieved yaw rate, and whether D is signal or
+    # noise). Keep yaw_ki = 0. Real vision latency and yaw dynamics differ from
+    # SITL — expect to re-trim, especially yaw_ff_gain.
+    # ============================================================
+    # Yaw tracking law: PD(image error) + FF(KF LOS rate). Gains LIVE-TUNED in
+    # SITL 2026-07-04 (P->D->FF, staged; see docs/controller_math_review.md §11
+    # and the tuning artifact). All three gains are runtime-tunable
+    # (ros2 param set /control_node gain_yaw 2.0).
+    #   gain_yaw (P): 1.5->2.0. Pure-P sweep knee — lag falls to kp~2.0 then
+    #     flattens; kp=3.0 goes unstable (saturation, lock loss). 2.0 cut
+    #     steady mean|error_x| 0.13->0.094 with good margin.
+    #   yaw_kd (D): 0->0.3. Phase-lead margin through the ~0.5 s vision delay;
+    #     differentiates the RAW pre-deadband error (control_node passes it) so
+    #     damping stays alive inside the deadband. kd>=0.7 destabilises.
+    #   ki stays 0 — near==far tracking error (no standing bias) and FF carries
+    #     the rate, so I only adds phase lag. Enable only for a measured bias.
+    gain_yaw: 1.0         # HARDWARE first-flight detune (SITL ran 1.6-2.0)
+    yaw_ki: 0.0
+    yaw_kd: 0.1           # HARDWARE first-flight detune
+    yaw_i_limit: 0.3       # max integral contribution, rad/s
+    yaw_d_lpf_alpha: 0.35  # D low-pass blend (0,1]; 1 = raw derivative
+    # LOS-rate feed-forward: commands the rate the ball is moving at (from the
+    # capture-stamp-paired KF state — never the command itself), so the drone
+    # aims at the ball's motion instead of trailing it. Live SITL A/B:
+    # FF 0 -> 0.8 halves the steady error (0.088 -> 0.046). Gain 0.8 (not 1.0):
+    # at high LOS rate (near pass of a fast target) full FF OVER-DRIVES — its
+    # 1/r^2 LOS-rate spike stacks on P+D and pushes yaw into saturation
+    # (peak_err 0.55 @ff1.0 vs 0.30 @ff0.7 on a 10 s ball). 0.8 keeps nominal
+    # tracking optimal (mean 0.046, ties ff1.0) while trimming the over-drive.
+    # Drop toward 0.6 if operating at consistently high LOS rate; filtering the
+    # FF (yaw_ff_state_lpf_alpha) made it WORSE (adds phase lag, mistimes the
+    # spike) — reduce the gain instead. Structurally zero for a still target.
+    yaw_ff_gain: 0.4      # HARDWARE first-flight detune (FF was fed garbage bearings pre-FOV-fix)
+    # 0.45 (was 0.25): the FF starts from ZERO at first lock and the low-pass
+    # sets how fast it learns the ball's motion. 0.25 took ~0.5 s to warm up,
+    # during which the drone lagged a moving ball right after acquisition.
+    yaw_ff_lpf_alpha: 0.45
+    yaw_ff_limit: 1.5       # rad/s cap on the feed-forward term
+    # FF alignment gate: scale FF from 1 (centred) to 0 at this |error_x|. FF
+    # carries a centred moving target; during acquisition the state KF reads the
+    # re-lock position jump as a huge velocity and would spike the yaw as the
+    # feedback crosses centre (measured: swing to +0.9 err). Gating it off when
+    # off-centre lets the feedback+anti-swing own the reel-in. 0 disables.
+    yaw_ff_align_error_limit: 0.0   # EXPERIMENTAL: FF align gate OFF (was 0.6)
+    # Optional flat zone of the FF gate: full FF for |error_x| <= inner, ramp
+    # only between inner and the limit (removes the gate's in-band modulation
+    # during steady tracking). 0 = original pure ramp. Offline A/B: NOT needed
+    # once pair_at_capture_stamp is on (the FF is clean); keep 0 in sim, it is
+    # a live knob for hardware where delays are larger.
+    yaw_ff_align_inner: 0.0
+    # Optional low-pass on the "state"-source FF (1.0 = off). The state LOS
+    # rate divides by range^2 — noisiest at a passing target's nearest point.
+    # Offline A/B: unnecessary with capture-stamp pairing (adds ~90 ms lag for
+    # no p2p gain); live knob if hardware FF looks jittery: try 0.35.
+    yaw_ff_state_lpf_alpha: 1.0
+    # Bring-up instrumentation (default OFF). true -> log the yaw-law term
+    # breakdown at ~2 Hz while tracking: P / D / FF / I terms, the braking cap,
+    # the raw (pre-limit) command, the clamped command actually sent, and the
+    # achieved yaw rate (differentiated telemetry). The §12 hardware checklist.
+    # Enable live: ros2 param set /control_node log_yaw_terms true
+    log_yaw_terms: false
+    # "los_diff" = differentiate the measured LOS angle (carries ~0.5 s vision
+    # latency); "state" = LOS rate from the target state estimator's predicted
+    # state (latency-cancelled; falls back to los_diff when estimate invalid).
+    # "state" also converges faster after first lock (KF vs filtered slope).
+    yaw_ff_source: "state"
+    target_state_topic: "/drone/tracking/target_state"
+    target_state_max_age_s: 1.0
+    # Delay-aware approach limiter (anti-swing). Caps the yaw CENTRING command
+    # (P+I+D, NOT the feed-forward) to a trapezoidal profile in bearing space so
+    # a target we start pointed far away from is closed on fast but decelerates
+    # into centre instead of sailing past and swinging back. Only bites at large
+    # bearing (acquisition); centred tracking is untouched. delay_s = the vision
+    # dead time the profile must stop within; decel = how hard we brake the yaw;
+    # min_rate keeps a little authority just outside the deadband. Tuned in SITL
+    # 2026-07-04 (far-off-bearing acquisition A/B). Disable for the old raw slew:
+    # ros2 param set /control_node yaw_approach_limit_enabled false
+    yaw_approach_limit_enabled: false   # EXPERIMENTAL: braking cap OFF (was true)
+    yaw_approach_delay_s: 0.35
+    yaw_approach_decel: 0.8
+    # 0.35 (was 0.15): the cap floor is what the feedback may still command
+    # right after first lock, while the feed-forward is still warming from
+    # zero. 0.15 starved it against a ball moving at ~0.3 rad/s LOS (lag grew
+    # until lock was lost). 0.35 tracks acquisition of a moving ball and only
+    # costs ~0.7 deg extra acquisition overshoot (closed-loop A/B).
+    yaw_approach_min_rate: 0.35
+    camera_half_fov_rad: 0.61  # 35 deg; fallback bearing when bearing_x_rad absent
+    gain_down: 0.3
+    gain_forward: 1.0
+    gain_right: 1.0
+    deadband_x: 0.05
+    deadband_y: 0.05
+    max_velocity_forward: 0.5        # FIELD: slow approach (less blur, keeps ball in frame)
+    max_velocity_right: 2.0
+    max_velocity_down: 0.5
+    max_yaw_rate: 0.6      # HARDWARE first-flight detune
+    max_accel_forward: 1.5
+    max_accel_right: 1.5
+    max_accel_down: 0.5
+    max_yaw_accel: 1.2
+    min_battery_percent: 25.0
+    require_gps: false
+    require_armed: true
+    min_altitude_m: 2.0
+    control_rate: 20.0
+    target_timeout: 3.0
+    mission_command_timeout: 1.0
+    telemetry_timeout: 2.0
+    # APPROACH translation stays OFF by default. Even if set true, the resulting
+    # VELOCITY command is still gated by telemetry_node.allow_translation_commands.
+    enable_approach_translation: true   # HARDWARE: required for APPROACH + visual-servo ORBIT
+    approach_distance_deadband_m: 0.15
+    # Professional approach profile (used when approach translation is enabled;
+    # the SIM launch enables both gates). Brake into the standoff distance
+    # instead of lunging past it: closing speed is capped by the same
+    # delay-aware trapezoidal law as yaw (approach_delay_s of stale vision,
+    # approach_decel m/s^2 of braking authority). approach_align_error_limit
+    # ramps the closing speed to zero as |error_x| reaches it, so the drone
+    # centres first and never charges off-axis at the ball (0 disables).
+    approach_delay_s: 0.35
+    approach_decel: 0.5
+    approach_align_error_limit: 0.5
+
+health_monitor_node:
+  ros__parameters:
+    image_topic: "/drone/camera/image_raw/compressed"
+    image_is_compressed: true
+    detections_topic: "/drone/vision/detections"
+    target_error_topic: "/drone/tracking/target_error"
+    telemetry_topic: "/drone/telemetry"
+    control_command_topic: "/drone/control/command"
+    mavsdk_command_status_topic: "/drone/mavsdk/command_status"
+    mavsdk_action_topic: "/drone/mavsdk/action_command"
+    monitor_mavsdk_command_status: true
+    heartbeat_period: 2.0
+    stale_seconds: 2.0

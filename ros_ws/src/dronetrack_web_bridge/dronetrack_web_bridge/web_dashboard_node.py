@@ -333,8 +333,9 @@ function builderInit(){
     const o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o);
   });
   builderSteps = [
-    {type:'takeoff', params:{altitude_m:'3.0'}},
+    {type:'takeoff', params:{altitude_m:'3.2'}},
     {type:'prime_offboard', params:{hold_s:'1.5'}},
+    {type:'scan', params:{until:'locked', timeout_s:'30'}},
     {type:'track_center', params:{}},
     {type:'land', params:{}},
   ];
