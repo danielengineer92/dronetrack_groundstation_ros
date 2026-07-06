@@ -27,8 +27,10 @@ mission:
     # Tight orbit (operator request 2026-07-06): r=1.5 m. Speed cut to 0.6 m/s
     # so the yaw needed to keep facing center (v/r = 0.4 rad/s ~ 23 deg/s)
     # stays under the detuned max_yaw_rate of 0.6 rad/s; ~16 s per lap.
-    # 5 fixes is ~0.5 s of cumulative visibility — the flickering lock from
-    # the field run delivers that easily within the 20 s sampling window.
+    # 15 fixes (~2-4 s dwell): flight 1 froze off-center from 5 fixes taken in
+    # 0.4 s at scan-exit — one viewpoint, yaw still swinging, KF not yet valid
+    # (needs ~2 s), so every fix was a raw latest-yaw projection. The longer
+    # dwell lets TRACK_CENTER settle the yaw and the KF take over the fixes.
     - {type: orbit_fixed, radius_m: 1.5, speed_m_s: 0.6, revolutions: 3,
-       center_samples: 5, sample_timeout_s: 20}
+       center_samples: 15, sample_timeout_s: 25}
     - {type: land}
