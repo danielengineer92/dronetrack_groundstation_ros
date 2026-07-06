@@ -107,7 +107,7 @@ mission:
     - {type: prime_offboard, hold_s: 1.0}
     - {type: scan, until: locked, timeout_s: 60}
     - {type: orbit_fixed, radius_m: 4.0, speed_m_s: 1.0, revolutions: 3,
-       center_samples: 5, sample_timeout_s: 20}
+       center_samples: 5, sample_timeout_s: 20, descend_m: 1.2}
     - {type: land}
 """
 

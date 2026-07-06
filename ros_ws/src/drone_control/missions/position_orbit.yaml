@@ -31,6 +31,11 @@ mission:
     # 0.4 s at scan-exit — one viewpoint, yaw still swinging, KF not yet valid
     # (needs ~2 s), so every fix was a raw latest-yaw projection. The longer
     # dwell lets TRACK_CENTER settle the yaw and the KF take over the fixes.
+    # descend_m 1.2: flights 3-4 orbited at ~3.5 m altitude, so the SLANT
+    # distance to the grounded ball read a steady ~3.05 m even though the
+    # horizontal ring was dead-on (operator: "kinda far"). Dropping to ~2.3 m
+    # brings the vehicle ~1 m closer to the ball without touching the
+    # (verified good) k=67 range calibration.
     - {type: orbit_fixed, radius_m: 1.5, speed_m_s: 0.6, revolutions: 3,
-       center_samples: 15, sample_timeout_s: 25}
+       center_samples: 15, sample_timeout_s: 25, descend_m: 1.2}
     - {type: land}

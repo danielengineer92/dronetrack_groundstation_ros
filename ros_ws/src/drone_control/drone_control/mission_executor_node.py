@@ -1645,9 +1645,22 @@ class MissionExecutorNode(Node):
 
             center_north = _median(s[0] for s in samples)
             center_east = _median(s[1] for s in samples)
-            # Orbit at the CURRENT altitude — the estimator is horizontal-only.
-            # _check_airborne_local_or_hold above guarantees valid local NED.
+            # Default: orbit at the CURRENT altitude — the estimator is
+            # horizontal-only. _check_airborne_local_or_hold above guarantees
+            # valid local NED. descend_m lowers the ring below the freeze
+            # altitude (tracker range is SLANT, so height dominates perceived
+            # distance to a grounded target); clamped to ~1.2 m estimated AGL.
             center_down = float(self.last_telemetry.local_position_down)
+            descend_m = step.get_float("descend_m", 0.0)
+            if descend_m > 0.0:
+                altitude_est = -center_down
+                descend_eff = max(0.0, min(descend_m, altitude_est - 1.2))
+                center_down += descend_eff
+                if descend_eff < descend_m:
+                    self.get_logger().warning(
+                        f"orbit_fixed: descend_m clamped {descend_m:.2f} -> "
+                        f"{descend_eff:.2f} m (altitude floor 1.2 m AGL)"
+                    )
             center = (center_north, center_east, center_down)
             self._fixed_orbit_centers[self.step_index] = center
             self._orbit_marks[key] = self.step_age()

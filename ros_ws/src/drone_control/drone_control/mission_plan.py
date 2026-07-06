@@ -101,6 +101,11 @@ NUMERIC_STEP_PARAM_RANGES: dict[str, tuple[Optional[float], Optional[float]]] = 
     # long to keep trying before giving up and advancing to the next step.
     "center_samples": (0.0, 100.0),
     "sample_timeout_s": (0.0, 120.0),
+    # orbit_fixed: descend this much below the freeze altitude before/while
+    # orbiting (the tracker range is SLANT, so height dominates how far the
+    # vehicle looks/is from a grounded target). Clamped in the executor so the
+    # commanded altitude never drops below ~1.2 m estimated AGL.
+    "descend_m": (0.0, 30.0),
 }
 
 
