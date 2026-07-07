@@ -133,10 +133,21 @@ tracker_node:
     # Must match the gz mono_cam sensor (horizontal_fov 1.74 rad) at 1280x960,
     # fx=fy=539 px. MUST equal the resolution YOLO runs on: Wrong FOV skews bearing_x/bearing_y
     # (and the pinhole distance fallback) by fx_err.
-    horizontal_fov_deg: 120.0  # HARDWARE: 120 deg wide-angle lens on the IMX296 (operator-confirmed)
-    vertical_fov_deg: 105.0    # HARDWARE: 4:3 at the same fx as the 120 deg horizontal
+    horizontal_fov_deg: 120.0  # legacy fallback only — superseded by camera_fx below
+    vertical_fov_deg: 105.0    # legacy fallback only
     image_width_px: 640        # HARDWARE 640x480 stream
     image_height_px: 480       # HARDWARE
+    # Measured intrinsics 2026-07-06: blue/white 16x10 checkerboard (15.55 mm),
+    # 52 views, scripts/calibrate_camera_intrinsics.py. RMS 0.87 px, edge-band
+    # residual 2.5 px. Measured hfov = 2*atan(320/245.11) = 105.2 deg — the
+    # "120 deg" lens spec was diagonal; the old FOV guess inflated bearings
+    # ~33%. Principal point sits 17 px above image center (cy=223.45).
+    camera_fx: 245.11
+    camera_fy: 234.85
+    camera_cx: 325.62
+    camera_cy: 223.45
+    distortion_model: "rational"
+    dist_coeffs: [-0.662458, 0.838831, -0.005170, -0.000531, 0.217038, -0.615926, 0.740391, 0.291509]
     min_distance_m: 0.25
     max_distance_m: 12.0
     distance_filter_alpha: 0.25

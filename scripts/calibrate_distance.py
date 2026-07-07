@@ -93,7 +93,12 @@ def main() -> int:
                         help="Only use detections of this class ('' = any).")
     parser.add_argument("--min-confidence", type=float, default=0.3)
     parser.add_argument("--hfov-deg", type=float, default=99.7,
-                        help="Camera horizontal FOV for the fat-factor report.")
+                        help="Camera horizontal FOV for the fat-factor report "
+                             "(ignored when --fx is given).")
+    parser.add_argument("--fx", type=float, default=0.0,
+                        help="Measured focal length in px (camera_fx from "
+                             "calibrate_camera_intrinsics.py); replaces the "
+                             "FOV-derived fx in the fat-factor cross-check.")
     args = parser.parse_args()
 
     if args.true_distance_m <= 0.0 or args.ball_diameter_m <= 0.0:
@@ -137,10 +142,16 @@ def main() -> int:
           f" = {args.true_distance_m:.3f} * {med:.1f} = {k:.1f}")
 
     if node.image_width > 0:
-        fx = node.image_width / (2.0 * math.tan(math.radians(args.hfov_deg) / 2.0))
+        if args.fx > 0.0:
+            fx = args.fx
+            fx_source = "measured camera_fx"
+        else:
+            fx = node.image_width / (2.0 * math.tan(math.radians(args.hfov_deg) / 2.0))
+            fx_source = f"fx from --hfov-deg {args.hfov_deg}"
         pinhole_k = args.ball_diameter_m * fx
         print(f"pinhole predicts k = ball_diameter * fx = {args.ball_diameter_m:.4f} * "
-              f"{fx:.0f} = {pinhole_k:.1f}  ->  bbox fat-factor = {k / pinhole_k:.2f}x")
+              f"{fx:.0f} ({fx_source}) = {pinhole_k:.1f}"
+              f"  ->  bbox fat-factor = {k / pinhole_k:.2f}x")
         print("(fat-factor is a property of the YOLO model; re-calibrate after "
               "retraining or swapping models)")
 
