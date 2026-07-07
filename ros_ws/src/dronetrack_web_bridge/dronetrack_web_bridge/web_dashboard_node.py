@@ -319,6 +319,7 @@ const STEP_PARAM_DEFS = {
   track_center:   [['until','','until'],['timeout_s','','num']],
   approach:       [['distance_m','2.0','num'],['until','','until'],['timeout_s','20','num']],
   goto:           [['north_m','+3.0','num'],['east_m','0.0','num'],['altitude_m','','num'],['tolerance_m','1.0','num'],['timeout_s','30','num']],
+  descend:        [['descend_m','1.0','num'],['altitude_m','','num'],['tolerance_m','0.3','num'],['timeout_s','20','num']],
   orbit:          [['radius_m','2.0','num'],['speed_m_s','0.4','num'],['revolutions','1','num'],['timeout_s','','num']],
   orbit_fixed:    [['radius_m','1.5','num'],['speed_m_s','0.6','num'],['revolutions','2','num'],['center_samples','15','num'],['sample_timeout_s','20','num'],['descend_m','','num']],
   smart_orbit:    [['radius_m','1.5','num'],['speed_m_s','0.6','num'],['revolutions','2','num'],['center_samples','30','num'],['settle_s','2.0','num'],['sample_timeout_s','30','num'],['descend_m','','num']],

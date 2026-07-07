@@ -46,6 +46,7 @@ matching `mission_executor_node` parameter (see [configs/pi.yaml](../configs/pi.
 | `approach` | Close to a desired distance (yaw-centers; translation opt-in, see below) | `distance_m`, `until`, `timeout_s` |
 | `orbit` | PX4 `DO_ORBIT` around the estimated target center | `radius_m`, `speed_m_s`, `revolutions`, `timeout_s` |
 | `goto` | Fly to a local-NED offset from the position at step entry | `north_m`, `east_m`, `tolerance_m`, `timeout_s` |
+| `descend` | Change altitude in place, in OFFBOARD (clamped ≥1.2 m AGL) | `descend_m` (relative) or `altitude_m` (absolute), `tolerance_m`, `timeout_s` |
 | `orbit_fixed` | Freeze a median vision-fixed center, then orbit it on pure geometry (vision-free) | `radius_m`, `speed_m_s`, `revolutions`, `center_samples`, `sample_timeout_s`, `descend_m` |
 | `smart_orbit` | `orbit_fixed` that only samples the center from a settled, target-centered hover (see below) | `orbit_fixed` keys + `settle_s` |
 | `rtl` | Return to launch | `timeout_s` |

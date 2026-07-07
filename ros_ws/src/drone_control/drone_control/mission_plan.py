@@ -41,6 +41,7 @@ STEP_TYPE_TO_STATE: dict[str, str] = {
     "track_center": "TRACK_CENTER",
     "approach": "APPROACH_TARGET",
     "goto": "GOTO",
+    "descend": "DESCEND",
     "orbit": "DO_ORBIT",
     "orbit_fixed": "ORBIT_FIXED",
     "smart_orbit": "SMART_ORBIT",
@@ -63,7 +64,7 @@ VALID_UNTIL: frozenset[str] = frozenset(
 # these should normally come after a prime_offboard step. `scan` yaw-sweeps in
 # Offboard (position-held), so it belongs here too.
 MOTION_STEP_TYPES: frozenset[str] = frozenset(
-    {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit"}
+    {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit", "descend"}
 )
 
 # Verbs that run open-loop or search for a bounded time. A plan author should give
@@ -276,6 +277,11 @@ def _parse_step(raw: object, index: int, mission_name: str) -> MissionStep:
     if step_type == "goto" and not any(k in params for k in ("north_m", "east_m", "altitude_m")):
         raise MissionPlanError(
             f"{where} (type 'goto') must set at least one of north_m, east_m, altitude_m"
+        )
+
+    if step_type == "descend" and not any(k in params for k in ("descend_m", "altitude_m")):
+        raise MissionPlanError(
+            f"{where} (type 'descend') must set descend_m (relative) or altitude_m (absolute)"
         )
 
     return MissionStep(step_type, params)

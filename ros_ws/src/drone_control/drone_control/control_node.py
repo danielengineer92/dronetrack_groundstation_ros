@@ -1360,6 +1360,34 @@ class ControlNode(Node):
             )
             return
 
+        # Vertical reposition in place: position setpoint at the executor-
+        # captured (N, E, target down), carried in the orbit_center fields.
+        # No target required (also before the vision gates); same translation
+        # double-gate and EKF fail-safe as ORBIT_FIXED. The executor clamps the
+        # target to the altitude floor at capture time.
+        if mission_mode == "DESCEND":
+            if not self.enable_approach_translation:
+                self.publish_position_hold(
+                    "DESCEND_TRANSLATION_DISABLED", yaw_rate=0.0, update_yaw=False)
+                return
+            if mission is None or not bool(getattr(mission, "orbit_center_valid", False)):
+                self.publish_position_hold(
+                    "DESCEND_NO_TARGET_POSITION", yaw_rate=0.0, update_yaw=False)
+                return
+            if not self.local_position_ready():
+                self.publish_idle(STATUS_BLOCKED_NO_LOCAL_POSITION)
+                return
+            # Hold the current heading; only the altitude moves.
+            self.reset_position_hold_anchor()
+            self.publish_position_setpoint(
+                f"{STATUS_SENT}: DESCEND to alt {-float(mission.orbit_center_down):.2f}m",
+                position_north=float(mission.orbit_center_north),
+                position_east=float(mission.orbit_center_east),
+                position_down=float(mission.orbit_center_down),
+                yaw_rad=float(self.last_telemetry.yaw),
+            )
+            return
+
         if self.last_target_error is None:
             self.publish_position_hold(STATUS_NO_TARGET, yaw_rate=0.0, update_yaw=False)
             return

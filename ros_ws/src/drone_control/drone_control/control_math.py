@@ -125,6 +125,32 @@ def orbit_fixed_setpoint(
     return north_sp, east_sp, yaw_rad
 
 
+def descend_target_down(
+    current_down: float,
+    *,
+    descend_m: "float | None" = None,
+    altitude_m: "float | None" = None,
+    floor_agl_m: float = 1.2,
+) -> float:
+    """Target NED down for a `descend` step, clamped to an altitude floor.
+
+    Exactly one of ``descend_m`` (metres below the current altitude) or
+    ``altitude_m`` (absolute altitude above the EKF origin, i.e. -down) drives
+    the target; ``altitude_m`` wins if both are given. The floor clamp never
+    commands a descent below ``floor_agl_m`` — but it also never converts a
+    descend into a climb: if the vehicle is already below the floor, the floor
+    becomes the current altitude (hold, don't dive further). An explicit
+    ``altitude_m`` above the current altitude is allowed through (ascent).
+    """
+    alt = -float(current_down)
+    if altitude_m is not None:
+        target_alt = float(altitude_m)
+    else:
+        target_alt = alt - float(descend_m or 0.0)
+    floor = min(float(floor_agl_m), alt)
+    return -max(target_alt, floor)
+
+
 def settle_gate(
     streak_start_age: "float | None",
     step_age: float,

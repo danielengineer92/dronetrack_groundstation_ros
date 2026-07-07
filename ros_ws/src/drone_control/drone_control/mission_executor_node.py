@@ -43,6 +43,7 @@ from drone_control.control_math import (
     estimate_turn_rate,
     offset_global,
     project_target_global,
+    descend_target_down,
     project_target_local_offset,
     settle_gate,
 )
@@ -67,6 +68,7 @@ class MissionState(Enum):
     TRACK_CENTER = "TRACK_CENTER"
     APPROACH_TARGET = "APPROACH_TARGET"
     GOTO = "GOTO"
+    DESCEND = "DESCEND"
     DO_ORBIT = "DO_ORBIT"
     ORBIT_FIXED = "ORBIT_FIXED"
     SMART_ORBIT = "SMART_ORBIT"
@@ -84,6 +86,7 @@ STEP_NAMES = {
     MissionState.TRACK_CENTER: "4_track_center_yaw",
     MissionState.APPROACH_TARGET: "5_approach_target",
     MissionState.GOTO: "5b_goto_position",
+    MissionState.DESCEND: "5c_descend",
     MissionState.DO_ORBIT: "6_orbit_target",
     MissionState.ORBIT_FIXED: "6b_orbit_fixed",
     MissionState.SMART_ORBIT: "6c_smart_orbit",
@@ -170,6 +173,11 @@ class MissionExecutorNode(Node):
         # count, and every fix must itself come from a centered tick.
         self.declare_parameter("smart_orbit_settle_s", 2.0)
         self.declare_parameter("smart_orbit_center_samples", 30)
+        # descend step: arrival tolerance on the vertical axis and the default
+        # step timeout. The altitude floor (1.2 m AGL, same as orbit_fixed's
+        # descend_m clamp) is enforced when the target is captured.
+        self.declare_parameter("descend_tolerance_m", 0.3)
+        self.declare_parameter("descend_timeout_s", 20.0)
         # Orbit entry envelope: DO_ORBIT is only sent once the vehicle is within
         # radius * factor + slack of the target. PX4's ORBIT mode captures the
         # ring by flying STRAIGHT AT the centre from wherever the vehicle is, so
@@ -256,6 +264,8 @@ class MissionExecutorNode(Node):
         self.orbit_fixed_max_center_m = float(self.get_parameter("orbit_fixed_max_center_m").value)
         self.smart_orbit_settle_s = max(0.0, float(self.get_parameter("smart_orbit_settle_s").value))
         self.smart_orbit_center_samples = max(1, int(self.get_parameter("smart_orbit_center_samples").value))
+        self.descend_tolerance_m = max(0.05, float(self.get_parameter("descend_tolerance_m").value))
+        self.descend_timeout_s = float(self.get_parameter("descend_timeout_s").value)
         self.rtl_wait_s = float(self.get_parameter("rtl_wait_s").value)
         self.land_wait_s = float(self.get_parameter("land_wait_s").value)
         self.goto_timeout_s = float(self.get_parameter("goto_timeout_s").value)
@@ -293,6 +303,9 @@ class MissionExecutorNode(Node):
         self._goto_targets: dict[int, tuple[float, float, float, float, float, float]] = {}
         # Per-step frozen orbit_fixed centers (step_index -> (north, east, down)).
         self._fixed_orbit_centers: dict[int, tuple[float, float, float]] = {}
+        # Per-step descend targets, captured once at step entry with the
+        # altitude floor already applied (step_index -> (north, east, down)).
+        self._descend_targets: dict[int, tuple[float, float, float]] = {}
         self._last_autonomy_request: Optional[bool] = None
         self._last_offboard_request: Optional[bool] = None
         self._last_autonomy_request_publish_time = 0.0
@@ -360,6 +373,7 @@ class MissionExecutorNode(Node):
             "orbit": self._step_orbit,
             "orbit_fixed": self._step_orbit_fixed,
             "smart_orbit": self._step_smart_orbit,
+            "descend": self._step_descend,
             "rtl": self._step_rtl,
             "land": self._step_land,
             "hold": self._step_hold,
@@ -532,6 +546,7 @@ class MissionExecutorNode(Node):
             self._orbit_marks.clear()
             self._orbit_center_samples.clear()
             self._fixed_orbit_centers.clear()
+            self._descend_targets.clear()
             self.publish_autonomy_request(True)
             self.publish_offboard_request(False)
             self._start_plan()
@@ -589,6 +604,7 @@ class MissionExecutorNode(Node):
         self._orbit_center_samples.clear()
         self._goto_targets.clear()
         self._fixed_orbit_centers.clear()
+        self._descend_targets.clear()
         detail = (
             f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
             f"{[s.type for s in plan.steps]}"
@@ -1035,6 +1051,7 @@ class MissionExecutorNode(Node):
             MissionState.TRACK_CENTER,
             MissionState.APPROACH_TARGET,
             MissionState.GOTO,
+            MissionState.DESCEND,
             MissionState.DO_ORBIT,
             MissionState.ORBIT_FIXED,
             MissionState.SMART_ORBIT,
@@ -1093,6 +1110,7 @@ class MissionExecutorNode(Node):
         self._last_arm_cmd_time = 0.0
         self._goto_targets.clear()
         self._fixed_orbit_centers.clear()
+        self._descend_targets.clear()
         if self.plan.steps:
             self.transition(MissionState[self.plan.steps[0].state_name])
         self.log_event("plan_started", plan=self.plan.name, steps=[s.type for s in self.plan.steps])
@@ -1430,6 +1448,67 @@ class MissionExecutorNode(Node):
         # Give PX4 a beat to accept the reposition before testing arrival, so a
         # goto that starts inside the tolerance ring doesn't complete instantly.
         if age > 1.0 and math.isfinite(distance_m) and distance_m <= tolerance_m:
+            return True
+        return age > timeout
+
+    def _step_descend(self, step) -> bool:
+        """Change altitude in place, in OFFBOARD (no MAVSDK action needed).
+
+        Captures the current N/E once at step entry and streams a DESCEND
+        position setpoint at the target down — the control node reuses the
+        ORBIT_FIXED position-setpoint path (same translation double-gate, same
+        EKF fail-safe). descend_m goes down relative to the entry altitude;
+        altitude_m targets an absolute altitude (and may ascend). The target is
+        clamped at capture so it never commands below 1.2 m AGL, and never
+        turns a descend into a climb (descend_target_down in control_math).
+        """
+        if not self._check_airborne_local_or_hold("descend"):
+            self.publish_offboard_request(False)
+            return False
+        self.publish_offboard_request(True)
+
+        target = self._descend_targets.get(self.step_index)
+        if target is None:
+            tel = self.last_telemetry
+            target_down = descend_target_down(
+                float(tel.local_position_down),
+                descend_m=step.get_float("descend_m", 0.0) if "descend_m" in step.params else None,
+                altitude_m=step.get_float("altitude_m", 0.0) if "altitude_m" in step.params else None,
+            )
+            target = (
+                float(tel.local_position_north),
+                float(tel.local_position_east),
+                target_down,
+            )
+            self._descend_targets[self.step_index] = target
+            self.log_event(
+                "descend_target_captured",
+                step_index=self.step_index,
+                from_down=round(float(tel.local_position_down), 2),
+                target_down=round(target_down, 2),
+            )
+            self.get_logger().info(
+                f"descend: from D={float(tel.local_position_down):.2f} to "
+                f"D={target_down:.2f} (alt {-target_down:.2f} m)"
+            )
+
+        self.publish_mission_command(
+            "DESCEND", True,
+            f"descend to alt {-target[2]:.2f} m",
+            orbit_center=target,
+        )
+
+        tolerance_m = step.get_float("tolerance_m", self.descend_tolerance_m)
+        timeout = step.timeout_s if step.timeout_s is not None else self.descend_timeout_s
+        age = self.step_age()
+        error_m = float("nan")
+        if self.local_position_ready() and self.last_telemetry is not None:
+            error_m = abs(float(self.last_telemetry.local_position_down) - target[2])
+        self.publish_state(
+            f"descend in progress, dz={error_m:.2f}/{tolerance_m:.2f}m, age={age:.1f}/{timeout:.1f}s"
+        )
+        # Same grace as goto: don't complete before PX4 has accepted the setpoint.
+        if age > 1.0 and math.isfinite(error_m) and error_m <= tolerance_m:
             return True
         return age > timeout
 

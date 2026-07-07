@@ -20,6 +20,7 @@ VALID_STEP_TYPES = {
     "track_center",
     "approach",
     "goto",
+    "descend",
     "orbit",
     "orbit_fixed",
     "smart_orbit",
@@ -29,7 +30,7 @@ VALID_STEP_TYPES = {
     "complete",
 }
 
-MOTION_STEP_TYPES = {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit"}
+MOTION_STEP_TYPES = {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit", "descend"}
 TIMEOUT_RECOMMENDED_STEP_TYPES = {"scan", "approach", "orbit", "goto"}
 
 
