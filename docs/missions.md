@@ -45,6 +45,9 @@ matching `mission_executor_node` parameter (see [configs/pi.yaml](../configs/pi.
 | `track_center` | Yaw-center the locked target (no translation) | `until`, `timeout_s` |
 | `approach` | Close to a desired distance (yaw-centers; translation opt-in, see below) | `distance_m`, `until`, `timeout_s` |
 | `orbit` | PX4 `DO_ORBIT` around the estimated target center | `radius_m`, `speed_m_s`, `revolutions`, `timeout_s` |
+| `goto` | Fly to a local-NED offset from the position at step entry | `north_m`, `east_m`, `tolerance_m`, `timeout_s` |
+| `orbit_fixed` | Freeze a median vision-fixed center, then orbit it on pure geometry (vision-free) | `radius_m`, `speed_m_s`, `revolutions`, `center_samples`, `sample_timeout_s`, `descend_m` |
+| `smart_orbit` | `orbit_fixed` that only samples the center from a settled, target-centered hover (see below) | `orbit_fixed` keys + `settle_s` |
 | `rtl` | Return to launch | `timeout_s` |
 | `land` | Land | `timeout_s` |
 | `hold` | Hold position | `status`, `timeout_s` |
@@ -91,6 +94,43 @@ both must be true to move:
    actually lets a VELOCITY setpoint reach PX4.
 
 Both default **false**. With defaults, `approach` is harmless.
+
+### The `smart_orbit` step
+
+`smart_orbit` is the math orbit (`orbit_fixed`) with a sampling discipline: the
+camera is only trusted for center fixes while the vehicle is genuinely holding
+with the nose on the ball — the state a preceding `track_center, until: centered`
+leaves it in. That is when the monocular projection is at its best (no stale-yaw
+pairing, KF converged on hover-quality data); fixes taken while still maneuvering
+are what froze flight 1's `orbit_fixed` center off the ball.
+
+Phases:
+
+1. **Settle** — command TRACK_CENTER (position-hold + yaw servo) until the target
+   has stayed centered for `settle_s` (default 2.0 s) of *continuous* hold. Any
+   un-centered tick restarts the clock.
+2. **Sample** — keep holding and accumulate `center_samples` (default 30, ~3 s at
+   10 Hz) local-NED fixes; each fix must itself come from a centered tick.
+   `sample_timeout_s` still backstops the whole phase — on timeout the step
+   advances WITHOUT orbiting, same as `orbit_fixed`.
+3. **Freeze & orbit** — median the fixes, freeze the center at the current
+   altitude (`descend_m` optionally lowers the ring, clamped to ~1.2 m AGL), and
+   stream `ORBIT_FIXED` — from here vision is not consumed; losing the ball
+   mid-orbit does not stop the circle.
+
+Recommended plan shape:
+
+```yaml
+mission:
+  name: smart_orbit
+  steps:
+    - {type: takeoff, altitude_m: 3}
+    - {type: prime_offboard, hold_s: 1.5}
+    - {type: track_center, until: centered, timeout_s: 30}
+    - {type: smart_orbit, radius_m: 1.5, speed_m_s: 0.6, revolutions: 2,
+       center_samples: 30, settle_s: 2.0, sample_timeout_s: 30}
+    - {type: land, timeout_s: 10}
+```
 
 ## Linting
 
