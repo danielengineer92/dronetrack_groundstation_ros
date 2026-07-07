@@ -21,13 +21,15 @@ VALID_STEP_TYPES = {
     "approach",
     "goto",
     "orbit",
+    "orbit_fixed",
+    "smart_orbit",
     "rtl",
     "land",
     "hold",
     "complete",
 }
 
-MOTION_STEP_TYPES = {"scan", "track_center", "approach", "orbit"}
+MOTION_STEP_TYPES = {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit"}
 TIMEOUT_RECOMMENDED_STEP_TYPES = {"scan", "approach", "orbit", "goto"}
 
 
