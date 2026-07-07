@@ -12,28 +12,37 @@ Distance is unaffected: the `distance_calibration_k` path is empirical and
 independent of fx. The sim is unaffected: the gz camera is a true pinhole and
 keeps the legacy FOV path (do NOT paste intrinsics into `configs/pi.yaml`).
 
-## 1. Get a target
+## 1. The target
 
-**Best: rigid ChArUco board** (checkerboard with ArUco markers). Partial
-views still contribute corners, which makes covering the frame edges — where
-the 120° lens distorts most and full checkerboards fall out of frame — far
-easier. Note the specs it ships with: squares CxR, square size mm, marker
-size mm, dictionary (e.g. DICT_4X4_50). Those become script args.
+**Daniel's board (2026-07): plain checkerboard, 16×10 squares, 15.55 mm,
+BLUE/white.** That means:
+- `--pattern 15x9` — OpenCV counts **inner corners** (squares − 1 per side).
+  Orientation (15x9 vs 9x15) just needs to match how the detector sees the
+  grid; the scripts accept either.
+- `--square-mm 15.55`
+- Blue/white is handled: detection uses `findChessboardCornersSB` and a
+  `--gray-channel` option (auto tries luminance, falls back to the RED
+  channel where blue squares read near-black). Verified working on
+  synthetic blue/white renders down to ~10 px squares.
+- **Hold it CLOSE**: on the 120° lens at 640×480, a 25 cm board at 30 cm is
+  only ~150 px wide (~10 px squares — borderline). Work at **15–30 cm** from
+  the lens so squares stay ≥10 px. Mount it dead-flat; flatness matters
+  more than anything else.
 
-**Fine: plain checkerboard**, 9×6 *inner corners* (a 10×7-square board),
-25 mm squares, A4, mounted dead-flat on foam board or a clipboard.
-Flatness matters more than size. `--pattern` counts INNER corners for
-checkerboards and SQUARES for ChArUco — mixing these up is the #1 mistake.
+(ChArUco boards are also supported — `--board charuco --pattern <squares>
+--marker-mm ... --aruco-dict ...` — and are the better choice if buying
+again: partial edge views still contribute corners.)
 
 ## 2. Capture (~40 frames)
 
 Pi camera stack running and streaming; on the laptop (ROS env sourced):
 
 ```bash
-# checkerboard:
-python3 scripts/capture_calib_frames.py --out-dir calib_frames --count 40
+# Daniel's blue/white 16x10 board:
+python3 scripts/capture_calib_frames.py --out-dir calib_frames --count 40 \
+    --pattern 15x9
 
-# ChArUco (use YOUR board's specs):
+# ChArUco alternative (use the board's own specs):
 python3 scripts/capture_calib_frames.py --out-dir calib_frames --count 40 \
     --board charuco --pattern 10x7 --square-mm 25 --marker-mm 19 \
     --aruco-dict DICT_4X4_50
@@ -54,8 +63,9 @@ Stop when the HUD shows every region covered. `--manual` for SPACE-to-save.
 ## 3. Calibrate (offline)
 
 ```bash
+# Daniel's board:
 python3 scripts/calibrate_camera_intrinsics.py --images calib_frames \
-    --pattern 9x6 --square-mm 25            # checkerboard
+    --pattern 15x9 --square-mm 15.55
 # or with --board charuco --pattern 10x7 --marker-mm 19 --aruco-dict ...
 ```
 

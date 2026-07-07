@@ -118,11 +118,47 @@ def fit_charuco(name, flags, board, all_corners, all_ids, size):
     }
 
 
-def detect_corners(paths, pattern):
+def to_gray(img, channel: str):
+    """Grayscale conversion with a channel override for colored boards.
+
+    A BLUE/white checkerboard has weak contrast in standard luminance; the
+    RED channel renders blue squares near-black and white squares bright,
+    restoring the contrast the corner detectors expect.
+    """
+    if channel == "red":
+        return img[:, :, 2].copy()
+    if channel == "green":
+        return img[:, :, 1].copy()
+    if channel == "blue":
+        return img[:, :, 0].copy()
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def find_board(gray, pattern):
+    """findChessboardCornersSB (robust, subpixel-accurate) with a classic
+    detector fallback. Returns (found, corners)."""
+    if hasattr(cv2, "findChessboardCornersSB"):
+        found, corners = cv2.findChessboardCornersSB(
+            gray, pattern, cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY)
+        if found:
+            return True, corners.astype(np.float32)
+    found, corners = cv2.findChessboardCorners(
+        gray, pattern,
+        cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+    if not found:
+        return False, None
+    corners = cv2.cornerSubPix(
+        gray, corners, (11, 11), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+    return True, corners
+
+
+def detect_corners(paths, pattern, gray_channel="auto"):
     objp = np.zeros((pattern[0] * pattern[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:pattern[0], 0:pattern[1]].T.reshape(-1, 2)
 
     objpoints, imgpoints, used, size = [], [], [], None
+    channel_hits = {"luma": 0, "red": 0}
     for path in paths:
         img = cv2.imread(path)
         if img is None:
@@ -135,19 +171,28 @@ def detect_corners(paths, pattern):
             raise SystemExit(
                 f"ERROR: mixed resolutions — {path} is {w}x{h}, first image was "
                 f"{size[0]}x{size[1]}. Calibrate one resolution at a time.")
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(
-            gray, pattern,
-            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+
+        if gray_channel == "auto":
+            # Luminance first; fall back to the red channel (blue/white boards).
+            found, corners = find_board(to_gray(img, "luma"), pattern)
+            if found:
+                channel_hits["luma"] += 1
+            else:
+                found, corners = find_board(to_gray(img, "red"), pattern)
+                if found:
+                    channel_hits["red"] += 1
+        else:
+            found, corners = find_board(to_gray(img, gray_channel), pattern)
+
         if not found:
             print(f"  skip (no board): {os.path.basename(path)}")
             continue
-        corners = cv2.cornerSubPix(
-            gray, corners, (11, 11), (-1, -1),
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
         objpoints.append(objp)
         imgpoints.append(corners)
         used.append(path)
+    if gray_channel == "auto" and channel_hits["red"]:
+        print(f"  (auto gray-channel: {channel_hits['luma']} via luminance, "
+              f"{channel_hits['red']} via red channel — colored board detected)")
     return objpoints, imgpoints, used, size
 
 
@@ -246,6 +291,11 @@ def main():
                     help="charuco only: ArUco marker side length")
     ap.add_argument("--aruco-dict", default="DICT_4X4_50",
                     help="charuco only: dictionary name printed on the board")
+    ap.add_argument("--gray-channel", choices=("auto", "luma", "red", "green", "blue"),
+                    default="auto",
+                    help="grayscale source for corner detection. Colored boards "
+                         "need a channel: BLUE/white board -> red. auto tries "
+                         "luminance then falls back to red per image.")
     ap.add_argument("--try-fisheye", action="store_true")
     ap.add_argument("--min-images", type=int, default=12)
     args = ap.parse_args()
@@ -266,7 +316,8 @@ def main():
         fisheye_obj = [board_pts[i.reshape(-1)].astype(np.float64) for i in all_ids]
         fisheye_img = all_corners
     else:
-        objpoints, imgpoints, used, size = detect_corners(paths, args.pattern)
+        objpoints, imgpoints, used, size = detect_corners(
+            paths, args.pattern, args.gray_channel)
         # Scale object points by square size (meters don't matter for
         # intrinsics, but keep it honest for the extrinsics/report).
         scale = args.square_mm / 1000.0

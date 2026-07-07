@@ -62,6 +62,7 @@ class _Capture(Node):
         self.charuco = None
         if args.board == "charuco":
             self.charuco = make_charuco(args)
+        self._auto_channel = None  # locked once a board is first detected
         self.saved = 0
         self.last_save_time = 0.0
         self.last_saved_centroid = None
@@ -86,6 +87,38 @@ class _Capture(Node):
         )
 
     # ---- helpers -----------------------------------------------------------
+    def _to_gray(self, frame):
+        # Colored boards (e.g. BLUE/white) have weak luminance contrast; the
+        # red channel renders blue squares near-black. 'auto' locks onto
+        # whichever source first detects a board and sticks with it.
+        ch = self.args.gray_channel
+        if ch == "auto":
+            ch = self._auto_channel or "luma"
+        if ch == "red":
+            return frame[:, :, 2].copy()
+        if ch == "green":
+            return frame[:, :, 1].copy()
+        if ch == "blue":
+            return frame[:, :, 0].copy()
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _detect(self, gray):
+        if self.charuco is not None:
+            adict, board = self.charuco
+            m_corners, m_ids, _ = cv2.aruco.detectMarkers(gray, adict)
+            if m_ids is not None and len(m_ids) >= 4:
+                n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(
+                    m_corners, m_ids, gray, board)
+                # Partial views are the point of ChArUco: 8 corners is enough
+                # to contribute, so edge-of-frame shots still count.
+                if n is not None and n >= 8:
+                    return True, ch_corners
+            return False, None
+        return cv2.findChessboardCorners(
+            gray, self.pattern,
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+            | cv2.CALIB_CB_FAST_CHECK)
+
     def _board_moved_enough(self, corners, frame_shape) -> bool:
         h, w = frame_shape[:2]
         centroid = corners.reshape(-1, 2).mean(axis=0)
@@ -145,23 +178,16 @@ class _Capture(Node):
                 f"Frame is {w}x{h}, expected {EXPECTED_SIZE[0]}x{EXPECTED_SIZE[1]} — "
                 "intrinsics only apply at the resolution they were calibrated at!")
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if self.charuco is not None:
-            adict, board = self.charuco
-            m_corners, m_ids, _ = cv2.aruco.detectMarkers(gray, adict)
-            found, corners = False, None
-            if m_ids is not None and len(m_ids) >= 4:
-                n, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(
-                    m_corners, m_ids, gray, board)
-                # Partial views are the point of ChArUco: 8 corners is enough
-                # to contribute, so edge-of-frame shots still count.
-                if n is not None and n >= 8:
-                    found, corners = True, ch_corners
-        else:
-            found, corners = cv2.findChessboardCorners(
-                gray, self.pattern,
-                cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-                | cv2.CALIB_CB_FAST_CHECK)
+        gray = self._to_gray(frame)
+        found, corners = self._detect(gray)
+        # auto channel fallback: a colored (e.g. blue/white) board may be
+        # invisible to luminance — retry once on the red channel and lock.
+        if (not found and self.args.gray_channel == "auto"
+                and self._auto_channel is None):
+            found, corners = self._detect(frame[:, :, 2].copy())
+            if found:
+                self._auto_channel = "red"
+                print("auto gray-channel: locked to RED (colored board)")
 
         key = -1
         if not self.args.no_preview:
@@ -212,6 +238,11 @@ def main():
                     help="charuco only: ArUco marker side length")
     ap.add_argument("--aruco-dict", default="DICT_4X4_50",
                     help="charuco only: dictionary name")
+    ap.add_argument("--gray-channel",
+                    choices=("auto", "luma", "red", "green", "blue"),
+                    default="auto",
+                    help="grayscale source for detection; BLUE/white boards "
+                         "detect best on red (auto falls back to red and locks)")
     ap.add_argument("--count", type=int, default=40)
     ap.add_argument("--interval-s", type=float, default=1.5)
     ap.add_argument("--manual", action="store_true",
