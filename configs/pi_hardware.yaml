@@ -124,7 +124,14 @@ tracker_node:
     # and run  scripts/ros_wsl.sh env python3 scripts/calibrate_distance.py \
     #   --true-distance-m <m>   — it prints the k (and fat-factor) to set here.
     # k is camera+model specific; re-run after retraining or swapping YOLO.
-    distance_calibration_k: 67.0   # HARDWARE Pi camera 640x480, tape-calibrated 2m+4m 2026-07-05
+    # DETECTOR-SPECIFIC. pi_launch local_detector defaults to 'color' now, so
+    # this k is set for the color detector's tight circle box. Provisional
+    # estimate 2026-07-06: transferred from the YOLO tape-calibration (k=67)
+    # via the simultaneous A/B diameter ratio color/yolo = 24.0/28.5 at 2.5 m
+    # -> 67 * 24.0/28.5 = 56. NOT yet tape-verified for color; run
+    # calibrate_distance.py against the color detections to pin it.
+    # (YOLO value was 67.0, tape-calibrated 2m+4m 2026-07-05.)
+    distance_calibration_k: 56.0   # HARDWARE, COLOR detector (est.); yolo=67.0
     # Ball diameter: sim and the REAL DroneTrack ball are both 8.5 in =
     # 0.2159 m now (models/red_ball.sdf radius 0.10795). Used by the pinhole
     # fallback when k <= 0, and by the calibration tool's fat-factor report.
