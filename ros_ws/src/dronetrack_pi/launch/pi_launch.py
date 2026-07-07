@@ -64,10 +64,17 @@ def generate_launch_description() -> LaunchDescription:
         description='Publish native V4L2 MJPEG directly as CompressedImage; disables raw camera + compressor path.')
     local_yolo_arg = DeclareLaunchArgument(
         'local_yolo', default_value='true',
-        description='Run YOLO (ncnn, CPU) on the Pi itself so perception does not '
-                    'ride the WiFi link. Publishes straight to the tracker input '
-                    '(/drone/vision/detections); the GS yolo_node must NOT run '
-                    'concurrently (see up.sh GS_YOLO).')
+        description='Run onboard perception on the Pi itself so perception does '
+                    'not ride the WiFi link. Publishes straight to the tracker '
+                    'input (/drone/vision/detections); the GS yolo_node must NOT '
+                    'run concurrently (see up.sh GS_YOLO).')
+    local_detector_arg = DeclareLaunchArgument(
+        'local_detector', default_value='color',
+        description="Which onboard detector runs when local_yolo is true: "
+                    "'color' (classic HSV+circularity red-ball CV, cheap, holds "
+                    "confidence at range) or 'yolo' (ncnn). Exactly one runs. "
+                    "NOTE: distance_calibration_k is detector-specific — the "
+                    "hardware config's k is set for whichever is the default here.")
     local_yolo_model_arg = DeclareLaunchArgument(
         'local_yolo_model',
         default_value=os.path.expanduser('~/models/red_ball_ncnn_model'),
@@ -152,7 +159,32 @@ def generate_launch_description() -> LaunchDescription:
             'max_fps': 10.0,
         }],
         output='screen',
-        condition=IfCondition(LaunchConfiguration('local_yolo')))
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('local_yolo'), "'.lower() in ", str(truthy),
+            " and '", LaunchConfiguration('local_detector'), "'.lower() == 'yolo'"])))
+
+    # ---- Pi-local classic-CV detector (HSV red + circularity) -------------
+    # Same onboard rationale as local_yolo (off the WiFi link, publishes
+    # straight to the tracker). Far cheaper than ncnn and holds confidence at
+    # range where the small model collapses. distance_calibration_k must match
+    # this detector's box (color draws a tight circle; k~56 vs yolo's 67).
+    local_color = Node(
+        package='dronetrack_perception', executable='color_detection_node',
+        name='local_color_node',
+        prefix='taskset -c 2,3',
+        parameters=[{
+            'class_name': 'red_ball',
+            'image_transport': 'compressed',
+            'compressed_image_topic': LaunchConfiguration('compressed_image_topic'),
+            'detections_topic': '/drone/vision/detections',
+            'reliable_detections': True,     # tracker subscribes RELIABLE
+            'min_circularity': 0.6,          # margin below the ~0.8 seen at 2.5 m
+            'max_fps': 10.0,
+        }],
+        output='screen',
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('local_yolo'), "'.lower() in ", str(truthy),
+            " and '", LaunchConfiguration('local_detector'), "'.lower() == 'color'"])))
 
     # ---- Reused safety-critical Pi nodes (from dronetrack_pi_ros) ---------
     reused = IfCondition(LaunchConfiguration('reused_pi_nodes'))
@@ -183,7 +215,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         params_file_arg, raw_image_topic_arg, compressed_image_topic_arg,
         connection_url_arg, allow_mavsdk_actions_arg, reused_pi_nodes_arg, compress_arg, native_mjpeg_arg,
-        local_yolo_arg, local_yolo_model_arg,
+        local_yolo_arg, local_detector_arg, local_yolo_model_arg,
         LogInfo(msg='=== DRONETRACK PI (on-drone) — safety-critical stack ==='),
         LogInfo(msg=['local_yolo=', LaunchConfiguration('local_yolo'),
                      ' (true: perception onboard; GS yolo_node must be off)']),
@@ -191,6 +223,7 @@ def generate_launch_description() -> LaunchDescription:
         detection_gate,
         watchdog,
         local_yolo,
+        local_color,
         native_camera,
         compress,
         camera,
