@@ -128,12 +128,13 @@ tracker_node:
     # this k is set for the color detector's tight circle box. Provisional
     # estimate 2026-07-06: transferred from the YOLO tape-calibration (k=67)
     # via the simultaneous A/B diameter ratio color/yolo = 24.0/28.5 at 2.5 m
-    # -> 67 * 24.0/28.5 = 56. Tape-verified 2026-07-07: ball at 2.5 m, 60 fixes
-    # via the running tracker (k=56 read 2.280 m median, 0.9% spread) ->
-    # k = 2.5 * 56 / 2.280 = 61.4. Post-fix the tracker reads 2.48-2.52 m at
-    # the 2.5 m ball. Re-verify at a second distance when convenient.
-    # (YOLO value was 67.0, tape-calibrated 2m+4m 2026-07-05.)
-    distance_calibration_k: 61.4   # HARDWARE, COLOR detector, tape-calibrated 2.5 m 2026-07-07; yolo=67.0
+    # -> 67 * 24.0/28.5 = 56. Tape-calibrated 2026-07-07 at TWO distances via
+    # the running tracker: 2.5 m -> k=61.4 (0.9% spread), 2.0 m -> k=65.0
+    # (tape-confirmed 2.00 m, tracker read 1.890 at k=61.4). The ~6% k drift
+    # across 2.5->2.0 m is detector box-fatness varying with size; set to the
+    # 2.0 m value because the orbit works at ~1.5-2 m standoff (expect ~6%
+    # over-read at 2.5 m). (YOLO value was 67.0, tape-calibrated 2m+4m.)
+    distance_calibration_k: 65.0   # HARDWARE, COLOR detector, tape-calibrated 2.0 m 2026-07-07; yolo=67.0
     # Ball diameter: sim and the REAL DroneTrack ball are both 8.5 in =
     # 0.2159 m now (models/red_ball.sdf radius 0.10795). Used by the pinhole
     # fallback when k <= 0, and by the calibration tool's fat-factor report.
