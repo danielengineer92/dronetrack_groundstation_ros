@@ -41,8 +41,10 @@ STEP_TYPE_TO_STATE: dict[str, str] = {
     "track_center": "TRACK_CENTER",
     "approach": "APPROACH_TARGET",
     "goto": "GOTO",
+    "descend": "DESCEND",
     "orbit": "DO_ORBIT",
     "orbit_fixed": "ORBIT_FIXED",
+    "smart_orbit": "SMART_ORBIT",
     "rtl": "RETURN_TO_LAUNCH",
     "land": "LAND",
     "hold": "HOLD",
@@ -62,7 +64,7 @@ VALID_UNTIL: frozenset[str] = frozenset(
 # these should normally come after a prime_offboard step. `scan` yaw-sweeps in
 # Offboard (position-held), so it belongs here too.
 MOTION_STEP_TYPES: frozenset[str] = frozenset(
-    {"scan", "track_center", "approach", "orbit", "orbit_fixed"}
+    {"scan", "track_center", "approach", "orbit", "orbit_fixed", "smart_orbit", "descend"}
 )
 
 # Verbs that run open-loop or search for a bounded time. A plan author should give
@@ -72,9 +74,9 @@ MOTION_STEP_TYPES: frozenset[str] = frozenset(
 TIMEOUT_RECOMMENDED_STEP_TYPES: frozenset[str] = frozenset(
     {"scan", "approach", "orbit", "goto"}
 )
-# orbit_fixed is excluded: like orbit-with-revolutions, its timeout is derived
-# from radius/speed/revolutions, and its sampling phase has its own
-# sample_timeout_s backstop.
+# orbit_fixed/smart_orbit are excluded: like orbit-with-revolutions, their
+# timeout is derived from radius/speed/revolutions, and their sampling phase
+# has its own sample_timeout_s backstop.
 
 # Allowed sweep directions for a `scan` step (counter-clockwise / clockwise yaw).
 VALID_SCAN_DIRECTIONS: frozenset[str] = frozenset({"ccw", "cw"})
@@ -106,6 +108,11 @@ NUMERIC_STEP_PARAM_RANGES: dict[str, tuple[Optional[float], Optional[float]]] = 
     # vehicle looks/is from a grounded target). Clamped in the executor so the
     # commanded altitude never drops below ~1.2 m estimated AGL.
     "descend_m": (0.0, 30.0),
+    # smart_orbit: how long the target must stay centered while the vehicle
+    # holds before center fixes start accumulating. Sampling from a settled
+    # hover is the point of the verb — fixes taken while still maneuvering
+    # after track_center are what froze flight 1's center off the ball.
+    "settle_s": (0.0, 60.0),
 }
 
 
@@ -270,6 +277,11 @@ def _parse_step(raw: object, index: int, mission_name: str) -> MissionStep:
     if step_type == "goto" and not any(k in params for k in ("north_m", "east_m", "altitude_m")):
         raise MissionPlanError(
             f"{where} (type 'goto') must set at least one of north_m, east_m, altitude_m"
+        )
+
+    if step_type == "descend" and not any(k in params for k in ("descend_m", "altitude_m")):
+        raise MissionPlanError(
+            f"{where} (type 'descend') must set descend_m (relative) or altitude_m (absolute)"
         )
 
     return MissionStep(step_type, params)

@@ -43,7 +43,9 @@ from drone_control.control_math import (
     estimate_turn_rate,
     offset_global,
     project_target_global,
+    descend_target_down,
     project_target_local_offset,
+    settle_gate,
 )
 from drone_control.mission_plan import (
     MissionPlan,
@@ -66,8 +68,10 @@ class MissionState(Enum):
     TRACK_CENTER = "TRACK_CENTER"
     APPROACH_TARGET = "APPROACH_TARGET"
     GOTO = "GOTO"
+    DESCEND = "DESCEND"
     DO_ORBIT = "DO_ORBIT"
     ORBIT_FIXED = "ORBIT_FIXED"
+    SMART_ORBIT = "SMART_ORBIT"
     RETURN_TO_LAUNCH = "RETURN_TO_LAUNCH"
     LAND = "LAND"
     COMPLETE = "COMPLETE"
@@ -82,8 +86,10 @@ STEP_NAMES = {
     MissionState.TRACK_CENTER: "4_track_center_yaw",
     MissionState.APPROACH_TARGET: "5_approach_target",
     MissionState.GOTO: "5b_goto_position",
+    MissionState.DESCEND: "5c_descend",
     MissionState.DO_ORBIT: "6_orbit_target",
     MissionState.ORBIT_FIXED: "6b_orbit_fixed",
+    MissionState.SMART_ORBIT: "6c_smart_orbit",
     MissionState.RETURN_TO_LAUNCH: "7_return_home",
     MissionState.LAND: "8_land",
 }
@@ -162,6 +168,16 @@ class MissionExecutorNode(Node):
         self.declare_parameter("orbit_fixed_min_samples", 5)
         self.declare_parameter("orbit_fixed_sample_timeout_s", 20.0)
         self.declare_parameter("orbit_fixed_max_center_m", 30.0)
+        # smart_orbit: orbit_fixed with a sampling discipline — the vehicle must
+        # hold with the target continuously centered for settle_s before fixes
+        # count, and every fix must itself come from a centered tick.
+        self.declare_parameter("smart_orbit_settle_s", 2.0)
+        self.declare_parameter("smart_orbit_center_samples", 30)
+        # descend step: arrival tolerance on the vertical axis and the default
+        # step timeout. The altitude floor (1.2 m AGL, same as orbit_fixed's
+        # descend_m clamp) is enforced when the target is captured.
+        self.declare_parameter("descend_tolerance_m", 0.3)
+        self.declare_parameter("descend_timeout_s", 20.0)
         # Orbit entry envelope: DO_ORBIT is only sent once the vehicle is within
         # radius * factor + slack of the target. PX4's ORBIT mode captures the
         # ring by flying STRAIGHT AT the centre from wherever the vehicle is, so
@@ -246,6 +262,10 @@ class MissionExecutorNode(Node):
         self.orbit_fixed_min_samples = max(1, int(self.get_parameter("orbit_fixed_min_samples").value))
         self.orbit_fixed_sample_timeout_s = float(self.get_parameter("orbit_fixed_sample_timeout_s").value)
         self.orbit_fixed_max_center_m = float(self.get_parameter("orbit_fixed_max_center_m").value)
+        self.smart_orbit_settle_s = max(0.0, float(self.get_parameter("smart_orbit_settle_s").value))
+        self.smart_orbit_center_samples = max(1, int(self.get_parameter("smart_orbit_center_samples").value))
+        self.descend_tolerance_m = max(0.05, float(self.get_parameter("descend_tolerance_m").value))
+        self.descend_timeout_s = float(self.get_parameter("descend_timeout_s").value)
         self.rtl_wait_s = float(self.get_parameter("rtl_wait_s").value)
         self.land_wait_s = float(self.get_parameter("land_wait_s").value)
         self.goto_timeout_s = float(self.get_parameter("goto_timeout_s").value)
@@ -283,6 +303,9 @@ class MissionExecutorNode(Node):
         self._goto_targets: dict[int, tuple[float, float, float, float, float, float]] = {}
         # Per-step frozen orbit_fixed centers (step_index -> (north, east, down)).
         self._fixed_orbit_centers: dict[int, tuple[float, float, float]] = {}
+        # Per-step descend targets, captured once at step entry with the
+        # altitude floor already applied (step_index -> (north, east, down)).
+        self._descend_targets: dict[int, tuple[float, float, float]] = {}
         self._last_autonomy_request: Optional[bool] = None
         self._last_offboard_request: Optional[bool] = None
         self._last_autonomy_request_publish_time = 0.0
@@ -349,6 +372,8 @@ class MissionExecutorNode(Node):
             "goto": self._step_goto,
             "orbit": self._step_orbit,
             "orbit_fixed": self._step_orbit_fixed,
+            "smart_orbit": self._step_smart_orbit,
+            "descend": self._step_descend,
             "rtl": self._step_rtl,
             "land": self._step_land,
             "hold": self._step_hold,
@@ -521,6 +546,7 @@ class MissionExecutorNode(Node):
             self._orbit_marks.clear()
             self._orbit_center_samples.clear()
             self._fixed_orbit_centers.clear()
+            self._descend_targets.clear()
             self.publish_autonomy_request(True)
             self.publish_offboard_request(False)
             self._start_plan()
@@ -578,6 +604,7 @@ class MissionExecutorNode(Node):
         self._orbit_center_samples.clear()
         self._goto_targets.clear()
         self._fixed_orbit_centers.clear()
+        self._descend_targets.clear()
         detail = (
             f"plan '{plan.name}' staged | {len(plan.steps)} steps: "
             f"{[s.type for s in plan.steps]}"
@@ -1024,8 +1051,10 @@ class MissionExecutorNode(Node):
             MissionState.TRACK_CENTER,
             MissionState.APPROACH_TARGET,
             MissionState.GOTO,
+            MissionState.DESCEND,
             MissionState.DO_ORBIT,
             MissionState.ORBIT_FIXED,
+            MissionState.SMART_ORBIT,
             MissionState.RETURN_TO_LAUNCH,
             MissionState.LAND,
         ]
@@ -1081,6 +1110,7 @@ class MissionExecutorNode(Node):
         self._last_arm_cmd_time = 0.0
         self._goto_targets.clear()
         self._fixed_orbit_centers.clear()
+        self._descend_targets.clear()
         if self.plan.steps:
             self.transition(MissionState[self.plan.steps[0].state_name])
         self.log_event("plan_started", plan=self.plan.name, steps=[s.type for s in self.plan.steps])
@@ -1421,6 +1451,67 @@ class MissionExecutorNode(Node):
             return True
         return age > timeout
 
+    def _step_descend(self, step) -> bool:
+        """Change altitude in place, in OFFBOARD (no MAVSDK action needed).
+
+        Captures the current N/E once at step entry and streams a DESCEND
+        position setpoint at the target down — the control node reuses the
+        ORBIT_FIXED position-setpoint path (same translation double-gate, same
+        EKF fail-safe). descend_m goes down relative to the entry altitude;
+        altitude_m targets an absolute altitude (and may ascend). The target is
+        clamped at capture so it never commands below 1.2 m AGL, and never
+        turns a descend into a climb (descend_target_down in control_math).
+        """
+        if not self._check_airborne_local_or_hold("descend"):
+            self.publish_offboard_request(False)
+            return False
+        self.publish_offboard_request(True)
+
+        target = self._descend_targets.get(self.step_index)
+        if target is None:
+            tel = self.last_telemetry
+            target_down = descend_target_down(
+                float(tel.local_position_down),
+                descend_m=step.get_float("descend_m", 0.0) if "descend_m" in step.params else None,
+                altitude_m=step.get_float("altitude_m", 0.0) if "altitude_m" in step.params else None,
+            )
+            target = (
+                float(tel.local_position_north),
+                float(tel.local_position_east),
+                target_down,
+            )
+            self._descend_targets[self.step_index] = target
+            self.log_event(
+                "descend_target_captured",
+                step_index=self.step_index,
+                from_down=round(float(tel.local_position_down), 2),
+                target_down=round(target_down, 2),
+            )
+            self.get_logger().info(
+                f"descend: from D={float(tel.local_position_down):.2f} to "
+                f"D={target_down:.2f} (alt {-target_down:.2f} m)"
+            )
+
+        self.publish_mission_command(
+            "DESCEND", True,
+            f"descend to alt {-target[2]:.2f} m",
+            orbit_center=target,
+        )
+
+        tolerance_m = step.get_float("tolerance_m", self.descend_tolerance_m)
+        timeout = step.timeout_s if step.timeout_s is not None else self.descend_timeout_s
+        age = self.step_age()
+        error_m = float("nan")
+        if self.local_position_ready() and self.last_telemetry is not None:
+            error_m = abs(float(self.last_telemetry.local_position_down) - target[2])
+        self.publish_state(
+            f"descend in progress, dz={error_m:.2f}/{tolerance_m:.2f}m, age={age:.1f}/{timeout:.1f}s"
+        )
+        # Same grace as goto: don't complete before PX4 has accepted the setpoint.
+        if age > 1.0 and math.isfinite(error_m) and error_m <= tolerance_m:
+            return True
+        return age > timeout
+
     def _step_orbit(self, step) -> bool:
         if not self._check_airborne_local_or_hold("orbit"):
             self.publish_offboard_request(False)
@@ -1588,6 +1679,22 @@ class MissionExecutorNode(Node):
         return age > timeout
 
     def _step_orbit_fixed(self, step) -> bool:
+        return self._run_fixed_center_orbit(step, verb="orbit_fixed")
+
+    def _step_smart_orbit(self, step) -> bool:
+        """orbit_fixed with a sampling discipline ("smart orbit").
+
+        The camera is only trusted for center fixes while the vehicle is
+        actually holding with the nose on the ball — the state track_center
+        leaves it in. Fixes start counting only after the target has stayed
+        centered for settle_s of continuous hold (any un-centered tick restarts
+        the clock), and each fix must itself come from a centered tick. This
+        keeps maneuvering-contaminated projections (stale yaw pairing, KF still
+        converging) out of the median that the ring is then flown on.
+        """
+        return self._run_fixed_center_orbit(step, verb="smart_orbit")
+
+    def _run_fixed_center_orbit(self, step, *, verb: str) -> bool:
         """Fixed-center ("dumb position") orbit.
 
         Phase 1: accumulate local-NED target fixes across lock flickers and
@@ -1596,8 +1703,13 @@ class MissionExecutorNode(Node):
         and stream ORBIT_FIXED — the control node orbits on pure geometry, so
         losing the ball mid-orbit no longer freezes the drone (the 2026-07-06
         field failure this step exists for).
+
+        verb="smart_orbit" adds the settle-then-sample discipline documented on
+        _step_smart_orbit; verb="orbit_fixed" keeps the original permissive
+        sampling (any usable fix from the first tick, lock not required).
         """
-        if not self._check_airborne_local_or_hold("orbit_fixed"):
+        smart = verb == "smart_orbit"
+        if not self._check_airborne_local_or_hold(verb):
             self.publish_offboard_request(False)
             return False
         self.publish_offboard_request(True)
@@ -1610,23 +1722,43 @@ class MissionExecutorNode(Node):
         else:
             timeout = self._orbit_default_timeout(radius_m, speed_m_s, revolutions)
 
-        key = self._step_action_key("orbit_fixed")
+        key = self._step_action_key(verb)
         center = self._fixed_orbit_centers.get(self.step_index)
         if center is None:
-            min_samples = max(1, int(step.get_float("center_samples", float(self.orbit_fixed_min_samples))))
+            default_samples = self.smart_orbit_center_samples if smart else self.orbit_fixed_min_samples
+            min_samples = max(1, int(step.get_float("center_samples", float(default_samples))))
             sample_timeout = step.get_float("sample_timeout_s", self.orbit_fixed_sample_timeout_s)
-            sample = self.estimate_target_local_center()
-            if sample is not None:
-                self._orbit_center_samples.setdefault(key, []).append(sample)
+
+            may_sample = True
+            phase = "sampling center"
+            if smart:
+                settle_s = step.get_float("settle_s", self.smart_orbit_settle_s)
+                settle_key = f"{key}:settle"
+                streak, may_sample = settle_gate(
+                    self._orbit_marks.get(settle_key), self.step_age(),
+                    self.target_centered(), settle_s,
+                )
+                if streak is None:
+                    self._orbit_marks.pop(settle_key, None)
+                else:
+                    self._orbit_marks[settle_key] = streak
+                if not may_sample:
+                    held = 0.0 if streak is None else self.step_age() - streak
+                    phase = f"settling (centered hold {held:.1f}/{settle_s:.1f}s)"
+
+            if may_sample:
+                sample = self.estimate_target_local_center()
+                if sample is not None:
+                    self._orbit_center_samples.setdefault(key, []).append(sample)
             samples = self._orbit_center_samples.get(key, [])
             if len(samples) < min_samples:
                 if self.step_age() > sample_timeout:
                     self.get_logger().warning(
-                        f"orbit_fixed: only {len(samples)}/{min_samples} target fixes "
+                        f"{verb}: only {len(samples)}/{min_samples} target fixes "
                         f"within {sample_timeout:.1f}s; advancing WITHOUT orbiting"
                     )
                     self.log_event(
-                        "orbit_fixed_no_center",
+                        f"{verb}_no_center",
                         samples=len(samples), needed=min_samples,
                         sample_timeout_s=float(sample_timeout),
                     )
@@ -1635,10 +1767,10 @@ class MissionExecutorNode(Node):
                 # up (better fixes); it degrades to position-hold when it isn't.
                 self.publish_mission_command(
                     "TRACK_CENTER", True,
-                    f"orbit_fixed: collecting target fixes ({len(samples)}/{min_samples})",
+                    f"{verb}: collecting target fixes ({len(samples)}/{min_samples})",
                 )
                 self.publish_state(
-                    f"orbit_fixed: sampling center ({len(samples)}/{min_samples}), "
+                    f"{verb}: {phase} ({len(samples)}/{min_samples}), "
                     f"age={self.step_age():.1f}/{sample_timeout:.1f}s"
                 )
                 return False
@@ -1658,19 +1790,19 @@ class MissionExecutorNode(Node):
                 center_down += descend_eff
                 if descend_eff < descend_m:
                     self.get_logger().warning(
-                        f"orbit_fixed: descend_m clamped {descend_m:.2f} -> "
+                        f"{verb}: descend_m clamped {descend_m:.2f} -> "
                         f"{descend_eff:.2f} m (altitude floor 1.2 m AGL)"
                     )
             center = (center_north, center_east, center_down)
             self._fixed_orbit_centers[self.step_index] = center
             self._orbit_marks[key] = self.step_age()
             self.get_logger().warning(
-                f"orbit_fixed: center FROZEN at N={center_north:.2f} E={center_east:.2f} "
+                f"{verb}: center FROZEN at N={center_north:.2f} E={center_east:.2f} "
                 f"D={center_down:.2f} ({len(samples)} fixes) | orbiting r={radius_m:.1f}m "
                 f"v={speed_m_s:.1f}m/s for {timeout:.0f}s — vision no longer required"
             )
             self.log_event(
-                "orbit_fixed_center_frozen",
+                f"{verb}_center_frozen",
                 center_north=round(center_north, 2), center_east=round(center_east, 2),
                 center_down=round(center_down, 2), samples=len(samples),
                 radius_m=float(radius_m), speed_m_s=float(speed_m_s),
@@ -1678,13 +1810,13 @@ class MissionExecutorNode(Node):
             )
 
         self.publish_mission_command(
-            "ORBIT_FIXED", True, "fixed-center orbit (vision-free)",
+            "ORBIT_FIXED", True, f"fixed-center orbit (vision-free, {verb})",
             desired_distance_m=radius_m,
             orbit_radius_m=radius_m, orbit_speed_m_s=speed_m_s,
             orbit_center=center,
         )
         orbit_age = self.step_age() - self._orbit_marks.get(key, 0.0)
-        self.publish_state(f"orbit_fixed: orbiting, age={orbit_age:.1f}/{timeout:.1f}s")
+        self.publish_state(f"{verb}: orbiting, age={orbit_age:.1f}/{timeout:.1f}s")
         return orbit_age > timeout
 
     def _step_rtl(self, step) -> bool:

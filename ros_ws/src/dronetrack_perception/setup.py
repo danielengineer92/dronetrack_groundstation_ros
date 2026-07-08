@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_node = dronetrack_perception.yolo_node:main',
+            'color_detection_node = dronetrack_perception.color_detection_node:main',
             'gz_cam_republisher = dronetrack_perception.gz_cam_republisher:main',
             'target_mover_node = dronetrack_perception.target_mover_node:main',
         ],

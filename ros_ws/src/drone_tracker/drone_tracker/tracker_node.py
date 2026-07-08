@@ -27,6 +27,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from drone_interfaces.msg import Detection, DetectionArray, TargetError
 from drone_diagnostics.node_diagnostics import NodeDiagnostics
+from drone_tracker.camera_geometry import bearing_from_pixel, build_geometry, describe
 
 
 class TrackingState(Enum):
@@ -90,6 +91,16 @@ class TrackerNode(Node):
         self.declare_parameter("vertical_fov_deg", 55.0)
         self.declare_parameter("image_width_px", 640)
         self.declare_parameter("image_height_px", 480)
+        # Measured intrinsics from scripts/calibrate_camera_intrinsics.py.
+        # camera_fx<=0 keeps the legacy FOV pinhole above (sim stays exact).
+        # dist_coeffs length must match the model: 4/5=plumb_bob, 8=rational,
+        # 4=fisheye — build_geometry() rejects mismatches loudly at startup.
+        self.declare_parameter("camera_fx", 0.0)
+        self.declare_parameter("camera_fy", 0.0)
+        self.declare_parameter("camera_cx", 0.0)
+        self.declare_parameter("camera_cy", 0.0)
+        self.declare_parameter("dist_coeffs", [0.0])
+        self.declare_parameter("distortion_model", "rational")
         self.declare_parameter("min_distance_m", 0.25)
         self.declare_parameter("max_distance_m", 12.0)
         self.declare_parameter("distance_filter_alpha", 0.25)
@@ -120,12 +131,39 @@ class TrackerNode(Node):
         self.vertical_fov_deg = float(self.get_parameter("vertical_fov_deg").value)
         self.image_width_px = int(self.get_parameter("image_width_px").value)
         self.image_height_px = int(self.get_parameter("image_height_px").value)
+        self.camera_fx = float(self.get_parameter("camera_fx").value)
+        self.camera_fy = float(self.get_parameter("camera_fy").value)
+        self.camera_cx = float(self.get_parameter("camera_cx").value)
+        self.camera_cy = float(self.get_parameter("camera_cy").value)
+        # ROS array params need a typed default ([0.0]); all-zero coefficients
+        # mean "no distortion" either way, so normalize them to empty.
+        _raw_coeffs = [float(c) for c in (self.get_parameter("dist_coeffs").value or [])]
+        self.dist_coeffs = _raw_coeffs if any(c != 0.0 for c in _raw_coeffs) else []
+        self.distortion_model = str(self.get_parameter("distortion_model").value)
         self.min_distance_m = float(self.get_parameter("min_distance_m").value)
         self.max_distance_m = float(self.get_parameter("max_distance_m").value)
         self.distance_filter_alpha = float(self.get_parameter("distance_filter_alpha").value)
 
         self.detections_topic = str(self.get_parameter("detections_topic").value)
         self.target_error_topic = str(self.get_parameter("target_error_topic").value)
+
+        # Bearing geometry, built once. Raises at startup on a bad intrinsics
+        # paste (wrong coeff count / unknown model) instead of flying with
+        # silently-wrong bearings.
+        legacy_fx, legacy_fy = self.get_focal_lengths_px()
+        self.camera_geometry = build_geometry(
+            image_width=self.image_width_px,
+            image_height=self.image_height_px,
+            fx=self.camera_fx,
+            fy=self.camera_fy,
+            cx=self.camera_cx,
+            cy=self.camera_cy,
+            dist_coeffs=self.dist_coeffs,
+            distortion_model=self.distortion_model,
+            legacy_fx=legacy_fx,
+            legacy_fy=legacy_fy,
+        )
+        self.get_logger().info(f"Camera geometry: {describe(self.camera_geometry)}")
 
         # Keep parameters sane even if launch passes a bad value.
         self.publish_rate = max(self.publish_rate, 1.0)
@@ -510,8 +548,11 @@ class TrackerNode(Node):
             center_y_px = float(detection.center_y) * float(self.image_height_px)
 
         fx, fy = self.get_focal_lengths_px()
-        self.current_bearing_x_rad = math.atan((center_x_px - self.image_width_px / 2.0) / max(fx, 1e-6))
-        self.current_bearing_y_rad = math.atan((center_y_px - self.image_height_px / 2.0) / max(fy, 1e-6))
+        # Calibrated intrinsics (camera_fx>0) undistort the point and honor the
+        # measured principal point; otherwise this is the exact legacy formula.
+        self.current_bearing_x_rad, self.current_bearing_y_rad = bearing_from_pixel(
+            self.camera_geometry, center_x_px, center_y_px
+        )
 
         self.current_distance_valid = False
         self.current_raw_distance_m = 0.0

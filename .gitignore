@@ -37,3 +37,6 @@ __pycache__/
 
 # Top-level colcon build logs (COLCON_IGNORE marker dir)
 /log/
+
+# calibration capture artifacts (regenerate with scripts/capture_calib_frames.py)
+calib_frames*/
